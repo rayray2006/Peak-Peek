@@ -1,0 +1,15 @@
+# Xcode / build output
+build/
+build-rel/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# XcodeGen-generated project (project.yml is the source of truth)
+*.xcodeproj
+
+# Local DEM cache (regenerated at runtime; bundled copy lives in Sources/App/Resources)
+DEMCache/
+
+# macOS
+.DS_Store
