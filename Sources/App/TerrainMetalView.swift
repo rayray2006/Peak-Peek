@@ -170,6 +170,10 @@ struct TerrainMetalView: UIViewRepresentable {
     /// shows and the metal view goes transparent so terrain composites over it.
     final class TerrainContainerView: UIView {
         let previewLayer = AVCaptureVideoPreviewLayer()
+        /// ARKit-path camera display (the preview layer can't show ARKit's
+        /// frames — ARKit owns the capture session). Same slot behind the metal
+        /// view; only one of the two is ever unhidden.
+        let arDisplayLayer = ARCameraDisplayLayer()
         let metalView: MTKView
         let skyArc = SkyArcOverlayView()
         let labelOverlay = PeakLabelOverlayView()
@@ -181,6 +185,9 @@ struct TerrainMetalView: UIViewRepresentable {
             previewLayer.videoGravity = .resizeAspectFill
             previewLayer.isHidden = true
             layer.addSublayer(previewLayer)
+            arDisplayLayer.videoGravity = .resizeAspectFill
+            arDisplayLayer.isHidden = true
+            layer.addSublayer(arDisplayLayer)
             addSubview(metalView)
             addSubview(skyArc)               // sky under the labels
             addSubview(labelOverlay)         // labels on top of the terrain
@@ -223,6 +230,14 @@ struct TerrainMetalView: UIViewRepresentable {
             previewLayer.bounds = devBounds
             previewLayer.position = mid
             previewLayer.setAffineTransform(CGAffineTransform(rotationAngle: counterAngle))
+            // ARKit buffers are LANDSCAPE (no connection to rotate them), so the
+            // display layer gets landscape bounds and an extra 90° on top of the
+            // counter-rotation; aspect-fill then covers the portrait rect.
+            arDisplayLayer.setAffineTransform(.identity)
+            arDisplayLayer.bounds = CGRect(x: 0, y: 0,
+                                           width: devBounds.height, height: devBounds.width)
+            arDisplayLayer.position = mid
+            arDisplayLayer.setAffineTransform(CGAffineTransform(rotationAngle: counterAngle + .pi / 2))
             compassZoom.transform = .identity
             compassZoom.frame = bounds                 // window-following chrome
             if let conn = previewLayer.connection, conn.isVideoRotationAngleSupported(90) {
@@ -333,6 +348,46 @@ struct TerrainMetalView: UIViewRepresentable {
         private var cameraLongFOVDeg: Float = 0
         private var cameraFormatLong: Int = 0
         private var cameraFormatShort: Int = 0
+
+        /// Compile-time switch: ARKit VIO drives attitude + camera frames in the
+        /// AR modes (drift-free rotation while moving). Flip to false to restore
+        /// the AVCapture + CoreMotion path unchanged — everything below keeps
+        /// both wired.
+        static let useARKitCameraTracking = true
+        private var usesARKitCamera: Bool {
+            Self.useARKitCameraTracking && ARAttitudeTracker.isSupported
+        }
+        private lazy var arTracker: ARAttitudeTracker = {
+            let t = ARAttitudeTracker()
+            t.referenceYaw = { [weak self] in
+                // CoreMotion's true-north azimuth, for the one-time yaw anchor.
+                guard let m = self?.motionManager.deviceMotion?.attitude.rotationMatrix
+                else { return nil }
+                let b = DeviceAttitude.cameraBasis(
+                    m11: m.m11, m12: m.m12, m13: m.m13,
+                    m21: m.m21, m22: m.m22, m23: m.m23,
+                    m31: m.m31, m32: m.m32, m33: m.m33)
+                let v = abs(b.forward.z) < 0.95 ? b.forward : b.up
+                let len = simd_length(SIMD2(v.x, v.y))
+                guard len > 1e-4 else { return nil }
+                return atan2(v.x, v.y)
+            }
+            t.onFrame = { [weak self] pb in
+                guard let self else { return }
+                self.pixelBufferLock.lock()
+                self.latestPixelBuffer = pb        // photo capture, same as AVCapture
+                self.pixelBufferLock.unlock()
+                self.container?.arDisplayLayer.enqueue(pixelBuffer: pb)
+                if self.awaitingFirstFrame { self.revealCamera() }
+            }
+            t.onCameraInfo = { [weak self] fovDeg, long, short in
+                self?.cameraLongFOVDeg = fovDeg
+                self?.cameraFormatLong = long
+                self?.cameraFormatShort = short
+            }
+            return t
+        }()
+
         weak var container: TerrainContainerView?
         private var mode: TerrainViewMode = .threeD
         private var manualAlignment = false
@@ -562,11 +617,21 @@ struct TerrainMetalView: UIViewRepresentable {
         /// micro-jitter without lagging: the slerp factor scales with the real frame dt,
         /// so it behaves the same at 60 or 120 Hz and converges in ~2–3 frames.
         private func sampleDeviceBasis() {
-            guard let m = motionManager.deviceMotion?.attitude.rotationMatrix else { return }
-            let basis = DeviceAttitude.cameraBasis(
-                m11: m.m11, m12: m.m12, m13: m.m13,
-                m21: m.m21, m22: m.m22, m23: m.m23,
-                m31: m.m31, m32: m.m32, m33: m.m33)
+            // Camera modes on the ARKit path use the VIO attitude once its yaw
+            // anchor has landed (drift-free while moving); before that — and in
+            // 3D mode, and on the AVCapture path — CoreMotion as ever. The two
+            // agree in yaw at the moment of handoff (see ARAttitudeTracker), so
+            // the swap is invisible and the slerp below smooths any residue.
+            let basis: DeviceAttitude.Basis
+            if mode.usesCamera, usesARKitCamera, let arBasis = arTracker.basis {
+                basis = arBasis
+            } else {
+                guard let m = motionManager.deviceMotion?.attitude.rotationMatrix else { return }
+                basis = DeviceAttitude.cameraBasis(
+                    m11: m.m11, m12: m.m12, m13: m.m13,
+                    m21: m.m21, m22: m.m22, m23: m.m23,
+                    m31: m.m31, m32: m.m32, m33: m.m33)
+            }
 
             // Build a proper (det +1) rotation for slerp: columns (right, up,
             // -forward) are right-handed; forward = -col2 afterwards.
@@ -648,7 +713,9 @@ struct TerrainMetalView: UIViewRepresentable {
             container?.skyArc.isHidden = (newMode == .arLabels)
 
             if usesCamera {
-                container?.previewLayer.isHidden = false      // sits behind the metal view
+                // ARKit path shows its own display layer; AVCapture the preview.
+                (usesARKitCamera ? container?.arDisplayLayer : container?.previewLayer)?
+                    .isHidden = false             // sits behind the metal view
                 if wasCamera {
                     // AR↔AR: camera already streaming + view already transparent.
                     view?.setNeedsDisplay()
@@ -657,7 +724,7 @@ struct TerrainMetalView: UIViewRepresentable {
                     awaitingFirstFrame = true
                     cameraRevealed = false
                     setMetalOpaque(true)
-                    startCamera()
+                    if usesARKitCamera { arTracker.start() } else { startCamera() }
                     // Safety net: reveal even if no frame callback arrives (camera
                     // permission denied, etc.) so AR is never stuck on the 3D view.
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
@@ -670,8 +737,11 @@ struct TerrainMetalView: UIViewRepresentable {
                 awaitingFirstFrame = false
                 cameraRevealed = false
                 container?.previewLayer.isHidden = true
+                container?.arDisplayLayer.isHidden = true
                 setMetalOpaque(true)
-                if wasCamera { stopCamera() }
+                if wasCamera {
+                    if usesARKitCamera { arTracker.stop() } else { stopCamera() }
+                }
                 view?.setNeedsDisplay()
             }
         }
