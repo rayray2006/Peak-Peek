@@ -44,6 +44,8 @@ final class PeakListStore: ObservableObject {
     }
 
     private let defaults: UserDefaults
+    // Historical key from before the PeakPeek rename — changing it would
+    // silently orphan everyone's saved climbed/bookmarked lists.
     private let key = "com.mountainView.peakLists.v1"
 
     init(defaults: UserDefaults = .standard) {

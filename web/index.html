@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PeakPeek — Every peak, named. Every sky, in motion.</title>
+<script>document.documentElement.className="js";</script>
+<meta name="description" content="Stand anywhere on Earth and see the real mountains around you — raymarched live from real elevation data, every summit labeled, the sun, moon, and stars moving across the true sky. No account. No API key. Fully offline." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Ccircle cx='20' cy='20' r='19' fill='%230E2233'/%3E%3Ccircle cx='26.6' cy='13.4' r='4.6' fill='%23FFA028'/%3E%3Cpath d='M-0.8 31.2 L11.2 16.8 Q12.8 13.2 14.4 16.8 L22.4 26.4 L29.6 18.4 Q31 15 32.4 18.4 L40.8 28.8 L40.8 40.8 L-0.8 40.8 Z' fill='%237F99B3' fill-opacity='.55' clip-path='circle(19px at 20px 20px)'/%3E%3Cpath d='M-0.8 36.8 L12.6 20 Q14.6 15.4 16.6 20 L21.8 28 L25.8 22.4 Q27.4 18.2 29 22.4 L40.8 36.8 L40.8 40.8 L-0.8 40.8 Z' fill='%23F7FAFF' clip-path='circle(19px at 20px 20px)'/%3E%3C/svg%3E" />
+<style>
+  :root{
+    /* app-exact palette (TopoStyle.swift) */
+    --teal:#28B6C8;
+    --teal-press:#1f9aab;
+    --teal-bright:#40D6F0;
+    --teal-ink:#06262c;
+    --bg:#0c0d0e;
+    --bg-elev:#161719;
+    --card:#1a1c1e;
+    --card-hi:#212426;
+    --ink:#f3f4f5;
+    --muted:#9aa0a4;
+    --faint:#6b7176;
+    --line:rgba(255,255,255,.07);
+    --line-2:rgba(255,255,255,.05);
+    --pill:rgba(255,255,255,.06);
+    --maxw:1140px;
+    --sans:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Helvetica Neue",system-ui,sans-serif;
+    --r-card:22px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+  body{
+    background:var(--bg);color:var(--ink);font-family:var(--sans);
+    font-weight:400;line-height:1.5;letter-spacing:-.011em;
+    -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;overflow-x:hidden;
+  }
+  a{color:inherit;text-decoration:none}
+  img{max-width:100%;display:block}
+  ::selection{background:var(--teal);color:var(--teal-ink)}
+
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 24px}
+
+  /* contour helper (unused decoration removed) */
+
+  /* labels */
+  .eyebrow{
+    display:inline-block;font-size:13px;font-weight:600;letter-spacing:.01em;
+    color:var(--teal);margin-bottom:14px;
+  }
+
+  /* ---------------- nav ---------------- */
+  header{position:sticky;top:0;z-index:100;
+    backdrop-filter:saturate(160%) blur(20px);-webkit-backdrop-filter:saturate(160%) blur(20px);
+    background:rgba(12,13,14,.72);border-bottom:1px solid var(--line-2)}
+  nav{display:flex;align-items:center;justify-content:space-between;height:60px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:600}
+  .brand .logo{width:30px;height:30px}
+  .brand b{font-weight:600;font-size:18px;letter-spacing:-.02em}
+  .brand b span{color:var(--teal)}
+  .nav-links{display:flex;align-items:center;gap:30px;font-size:15px;color:var(--muted);font-weight:500}
+  .nav-links a{transition:color .15s}
+  .nav-links a:hover{color:var(--ink)}
+  .nav-cta{
+    font-size:14px;font-weight:600;color:var(--teal-ink);background:var(--teal);
+    padding:8px 16px;border-radius:980px;transition:background .15s,transform .12s;
+  }
+  .nav-cta:active{transform:scale(.97)}
+  .nav-cta:hover{background:#37c3d4}
+  @media(max-width:760px){.nav-links{display:none}}
+
+  /* ---------------- buttons (capsule, iOS) ---------------- */
+  .btn-primary{
+    display:inline-flex;align-items:center;gap:9px;
+    background:var(--teal);color:var(--teal-ink);font-weight:600;font-size:16px;
+    padding:14px 24px;border-radius:980px;transition:background .15s,transform .12s;
+  }
+  .btn-primary:hover{background:#37c3d4}
+  .btn-primary:active{transform:scale(.98)}
+  .btn-ghost{
+    display:inline-flex;align-items:center;gap:7px;color:var(--ink);font-weight:500;font-size:15px;
+    padding:14px 20px;border-radius:980px;background:var(--pill);
+    transition:background .15s,transform .12s;
+  }
+  .btn-ghost:hover{background:rgba(255,255,255,.1)}
+  .btn-ghost:active{transform:scale(.98)}
+  .btn-ghost svg{transition:transform .2s}
+  .btn-ghost:hover svg{transform:translateX(2px)}
+
+  /* ---------------- hero ---------------- */
+  .hero{position:relative;padding:clamp(56px,8vw,104px) 0 84px}
+  .hero-bg{position:absolute;inset:0;z-index:0;
+    background:radial-gradient(90% 70% at 82% -10%, rgba(40,182,200,.06), transparent 60%)}
+  .hero-inner{position:relative;z-index:2;display:grid;grid-template-columns:1.05fr .95fr;gap:48px;align-items:center}
+  .hero-inner>*{min-width:0}
+  @media(max-width:900px){.hero-inner{grid-template-columns:1fr;gap:48px}}
+  .hero h1{
+    font-weight:700;font-size:clamp(38px,6vw,64px);line-height:1.04;letter-spacing:-.035em;
+    margin:0 0 20px;
+  }
+  .hero h1 em{font-style:normal;color:var(--teal)}
+  .hero p.lead{font-size:clamp(17px,1.5vw,19px);color:var(--muted);max-width:30em;margin-bottom:30px;font-weight:400}
+  .hero-cta{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+
+  /* phone */
+  .phone-stage{position:relative;display:flex;justify-content:center}
+  .phone{
+    position:relative;width:min(300px,78vw);aspect-ratio:1206/2622;
+    border-radius:46px;padding:7px;background:#1f2123;
+    box-shadow:0 0 0 1px rgba(255,255,255,.06) inset, 0 40px 90px -44px rgba(0,0,0,.9);
+  }
+  .phone .screen{width:100%;height:100%;border-radius:39px;overflow:hidden;background:#000}
+  .phone .screen img{width:100%;height:100%;object-fit:cover}
+
+  /* trust strip */
+  .trust{position:relative;z-index:2;margin-top:64px;padding-top:28px;border-top:1px solid var(--line-2);
+    display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+  .trust .label{font-size:13px;font-weight:600;color:var(--faint);margin-right:6px}
+  .trust ul{display:flex;flex-wrap:wrap;gap:8px;list-style:none}
+  .trust li{font-size:13px;font-weight:500;color:var(--ink);background:var(--pill);
+    border-radius:980px;padding:7px 13px}
+
+  /* ---------------- feature sections ---------------- */
+  section{position:relative}
+  .feature{padding:clamp(64px,8vw,104px) 0}
+  .feature .wrap{display:grid;grid-template-columns:1fr 1fr;gap:clamp(40px,6vw,84px);align-items:center}
+  .feature.flip .wrap{direction:rtl}
+  .feature.flip .wrap>*{direction:ltr}
+  .feature .wrap>*{min-width:0}
+  @media(max-width:880px){.feature .wrap{grid-template-columns:1fr;gap:44px}.feature.flip .wrap{direction:ltr}}
+  .feature h2{font-weight:700;font-size:clamp(28px,3.4vw,42px);line-height:1.08;letter-spacing:-.03em;margin:0 0 18px}
+  .feature h2 em{font-style:normal;color:var(--teal)}
+  .feature p{color:var(--muted);font-size:17px;max-width:34em;margin-bottom:24px}
+
+  .spec-tags{display:flex;flex-wrap:wrap;gap:8px}
+  .spec-tags span{font-size:13px;font-weight:500;color:var(--muted);
+    background:var(--pill);border-radius:980px;padding:7px 13px}
+  .spec-tags span b{color:var(--teal);font-weight:600}
+
+  .mini-list{list-style:none;margin:22px 0 26px;display:grid;gap:12px}
+  .mini-list li{display:flex;gap:12px;align-items:flex-start;font-size:16px;color:var(--ink)}
+  .mini-list li svg{flex:none;margin-top:3px;color:var(--teal)}
+  .mini-list li span{color:var(--muted)}
+  .mini-list li b{color:var(--ink);font-weight:600}
+
+  .feature .phone-stage{justify-content:center}
+  .feature.night{background:linear-gradient(180deg,#0a0c10,var(--bg))}
+
+  /* ---------------- full-width landscape figure (turned, uncropped) ---------------- */
+  .wide{padding:clamp(56px,7vw,96px) 0;background:linear-gradient(180deg,#0a0c10,var(--bg))}
+  .wide .head{max-width:660px;margin-bottom:30px}
+  .wide .head h2{font-weight:700;font-size:clamp(26px,3.2vw,40px);line-height:1.1;letter-spacing:-.03em;margin:0 0 16px}
+  .wide .head h2 em{font-style:normal;color:var(--teal)}
+  .wide .head p{color:var(--muted);font-size:17px;margin:0 0 22px;max-width:52ch}
+  .wide .landscape{border-radius:22px;overflow:hidden;border:1px solid var(--line);line-height:0;
+    box-shadow:0 40px 80px -46px rgba(0,0,0,.9)}
+  .wide .landscape img{width:100%;height:auto;display:block}
+
+  /* ---------------- feature grid ---------------- */
+  .grid-section{padding:clamp(64px,8vw,104px) 0}
+  .grid-head{max-width:620px;margin-bottom:44px}
+  .grid-head h2{font-weight:700;font-size:clamp(26px,3.2vw,40px);letter-spacing:-.03em;line-height:1.1;margin:0 0 14px}
+  .grid-head p{color:var(--muted);font-size:17px}
+  .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+  @media(max-width:980px){.cards{grid-template-columns:repeat(2,1fr)}}
+  @media(max-width:560px){.cards{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r-card);
+    padding:26px 24px 28px;position:relative;transition:background .2s}
+  .card:hover{background:var(--card-hi)}
+  .card .ic{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;margin-bottom:18px;
+    background:rgba(40,182,200,.12);color:var(--teal)}
+  .card h3{font-size:16px;font-weight:600;letter-spacing:-.01em;margin-bottom:7px}
+  .card p{font-size:14px;color:var(--muted);line-height:1.5}
+  .card .idx{position:absolute;top:22px;right:24px;font-size:13px;font-weight:600;color:var(--faint)}
+
+  /* ---------------- keyless band ---------------- */
+  .band{position:relative;padding:clamp(72px,8vw,112px) 0;
+    background:var(--bg-elev);border-top:1px solid var(--line-2);border-bottom:1px solid var(--line-2)}
+  .band .wrap{position:relative;z-index:2}
+  .band h2{font-weight:700;font-size:clamp(30px,4vw,48px);letter-spacing:-.035em;line-height:1.05;max-width:16ch;margin:0 0 20px}
+  .band h2 em{font-style:normal;color:var(--teal)}
+  .band .sub{color:var(--muted);font-size:18px;max-width:48ch;margin-bottom:44px}
+  .pillars{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+  @media(max-width:760px){.pillars{grid-template-columns:1fr;gap:14px}}
+  .pillar{background:var(--card);border:1px solid var(--line);border-radius:var(--r-card);padding:24px 22px}
+  .pillar .n{display:inline-flex;align-items:center;justify-content:center;
+    width:30px;height:30px;border-radius:9px;background:rgba(40,182,200,.12);
+    color:var(--teal);font-size:14px;font-weight:700;margin-bottom:14px}
+  .pillar h4{font-size:17px;font-weight:600;margin:0 0 8px;letter-spacing:-.015em}
+  .pillar p{font-size:15px;color:var(--muted);line-height:1.5}
+
+  /* ---------------- gallery ---------------- */
+  .gallery{padding:clamp(56px,7vw,92px) 0}
+  .gallery .strip{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  @media(max-width:760px){.gallery .strip{grid-template-columns:1fr;max-width:320px;margin:0 auto}}
+  .shot{position:relative;border-radius:24px;overflow:hidden;border:1px solid var(--line);
+    background:#000;aspect-ratio:1206/2622;transition:transform .25s}
+  .shot:hover{transform:translateY(-4px)}
+  .shot img{width:100%;height:100%;object-fit:cover}
+  .shot figcaption{position:absolute;left:0;right:0;bottom:0;padding:40px 16px 16px;
+    font-size:13px;font-weight:500;color:var(--ink);
+    background:linear-gradient(180deg,transparent,rgba(4,5,6,.92))}
+  .shot figcaption b{color:#cfd3d6;display:block;font-size:12px;font-weight:600;margin-bottom:3px}
+
+  /* ---------------- final CTA ---------------- */
+  .final{position:relative;text-align:center;padding:clamp(84px,10vw,140px) 0;
+    background:radial-gradient(70% 100% at 50% 0%, rgba(40,182,200,.06), transparent 55%)}
+  .final h2{font-weight:700;font-size:clamp(32px,5vw,60px);letter-spacing:-.04em;line-height:1.05;margin:18px auto 18px;max-width:18ch}
+  .final h2 em{font-style:normal;color:var(--teal)}
+  .final p{color:var(--muted);font-size:18px;max-width:38ch;margin:0 auto 34px}
+  .final .logo-big{width:60px;height:60px;margin:0 auto}
+
+  /* ---------------- footer ---------------- */
+  footer{border-top:1px solid var(--line-2);padding:44px 0 56px}
+  footer .wrap{display:flex;justify-content:space-between;align-items:flex-start;gap:30px;flex-wrap:wrap}
+  footer .brand b{font-size:16px}
+  footer .tag{color:var(--faint);font-size:14px;margin-top:10px;max-width:30ch}
+  footer .cols{display:flex;gap:60px;flex-wrap:wrap}
+  footer h5{font-size:12px;font-weight:600;letter-spacing:.02em;color:var(--faint);margin-bottom:13px}
+  footer ul{list-style:none;display:grid;gap:9px}
+  footer ul a{font-size:14px;color:var(--muted);transition:color .15s}
+  footer ul a:hover{color:var(--teal)}
+  .copyright{margin-top:42px;padding-top:22px;border-top:1px solid var(--line-2);
+    display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;font-size:13px;color:var(--faint)}
+
+  /* ---------------- reveal ---------------- */
+  .js .reveal{opacity:0;transform:translateY(20px);transition:opacity .7s cubic-bezier(.2,.7,.2,1),transform .7s cubic-bezier(.2,.7,.2,1)}
+  .js .reveal.in{opacity:1;transform:none}
+  .js .stagger>*{opacity:0;transform:translateY(16px);animation:rise .7s cubic-bezier(.2,.7,.2,1) forwards}
+  .js .stagger>*:nth-child(1){animation-delay:.04s}
+  .js .stagger>*:nth-child(2){animation-delay:.12s}
+  .js .stagger>*:nth-child(3){animation-delay:.2s}
+  .js .stagger>*:nth-child(4){animation-delay:.28s}
+  .js .stagger>*:nth-child(5){animation-delay:.36s}
+  @keyframes rise{to{opacity:1;transform:none}}
+  @media(prefers-reduced-motion:reduce){.js .reveal,.js .stagger>*{opacity:1;transform:none;animation:none;transition:none}}
+</style>
+</head>
+<body>
+
+<!-- ===== NAV ===== -->
+<header>
+  <div class="wrap">
+    <nav>
+      <a class="brand" href="#top">
+        <svg class="logo" viewBox="0 0 40 40" aria-hidden="true">
+          <defs>
+            <linearGradient id="ppSky" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#16324B"/><stop offset="1" stop-color="#081320"/>
+            </linearGradient>
+            <radialGradient id="ppHalo">
+              <stop offset="0" stop-color="#FFA028" stop-opacity=".38"/><stop offset="1" stop-color="#FFA028" stop-opacity="0"/>
+            </radialGradient>
+            <clipPath id="ppClip"><circle cx="20" cy="20" r="19"/></clipPath>
+          </defs>
+          <circle cx="20" cy="20" r="19" fill="url(#ppSky)"/>
+          <g clip-path="url(#ppClip)">
+            <circle cx="26.6" cy="13.4" r="12" fill="url(#ppHalo)"/>
+            <circle cx="26.6" cy="13.4" r="4.6" fill="#FFA028"/>
+            <path d="M-0.8 31.2 L11.2 16.8 Q12.8 13.2 14.4 16.8 L22.4 26.4 L29.6 18.4 Q31 15 32.4 18.4 L40.8 28.8 L40.8 40.8 L-0.8 40.8 Z" fill="#7F99B3" fill-opacity=".55"/>
+            <path d="M-0.8 36.8 L12.6 20 Q14.6 15.4 16.6 20 L21.8 28 L25.8 22.4 Q27.4 18.2 29 22.4 L40.8 36.8 L40.8 40.8 L-0.8 40.8 Z" fill="#F7FAFF" fill-opacity=".96"/>
+          </g>
+          <circle cx="20" cy="20" r="19" fill="none" stroke="rgba(255,255,255,.18)" stroke-width="1"/>
+        </svg>
+        <b>Peak<span>Peek</span></b>
+      </a>
+      <div class="nav-links">
+        <a href="#peaks">Peaks</a>
+        <a href="#sky">Sky</a>
+        <a href="#features">Features</a>
+        <a href="#keyless">Why keyless</a>
+      </div>
+      <a class="nav-cta" href="#get">Get the app</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+<!-- ===== HERO ===== -->
+<section class="hero">
+  <div class="hero-bg"></div>
+  <div class="wrap">
+    <div class="hero-inner">
+      <div class="stagger">
+        <span class="eyebrow">360° topographic panorama · iOS</span>
+        <h1>Every peak, named.<br>Every sky, <em>in motion.</em></h1>
+        <p class="lead">Stand anywhere on Earth and see the real mountains around you — raymarched live from real elevation data, every summit labeled, the sun, moon and stars tracing the true sky overhead.</p>
+        <div class="hero-cta">
+          <a class="btn-primary" href="#get">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor"><path d="M16.36 12.6c-.02-2.2 1.8-3.26 1.88-3.31-1.03-1.5-2.62-1.71-3.19-1.73-1.36-.14-2.65.8-3.34.8-.69 0-1.75-.78-2.88-.76-1.48.02-2.85.86-3.61 2.19-1.54 2.67-.39 6.62 1.11 8.79.73 1.06 1.6 2.25 2.74 2.21 1.1-.04 1.52-.71 2.85-.71 1.33 0 1.71.71 2.88.69 1.19-.02 1.94-1.08 2.67-2.15.84-1.23 1.19-2.42 1.21-2.48-.03-.01-2.32-.89-2.34-3.53zM14.13 5.62c.6-.74 1.01-1.75.9-2.77-.87.04-1.94.59-2.57 1.31-.56.64-1.06 1.68-.93 2.67.97.08 1.97-.49 2.6-1.21z"/></svg>
+            Download for iPhone
+          </a>
+          <a class="btn-ghost" href="#peaks">See it in action
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          </a>
+        </div>
+      </div>
+
+      <div class="phone-stage">
+        <div class="phone">
+          <div class="screen"><img src="screenshots/rainier-day.png" alt="PeakPeek rendering Mount Rainier in live 3D terrain, labeled at 14,409 ft with teal peak markers across the horizon under a clear blue sky." loading="eager" /></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="trust reveal">
+      <span class="label">Built on open data</span>
+      <ul>
+        <li>No API key</li>
+        <li>No account</li>
+        <li>Works fully offline</li>
+        <li>SRTM 30&nbsp;m elevation</li>
+        <li>OpenStreetMap peaks</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ===== FEATURE 1 · PEAKS ===== -->
+<section class="feature" id="peaks">
+  <div class="wrap">
+    <div class="reveal">
+      <span class="eyebrow">Identify the horizon</span>
+      <h2>Stand on any summit.<br><em>Name</em> the whole skyline.</h2>
+      <p>Peak labels are projected pixel-accurately onto the real rendered terrain — name and elevation, leader lines, smart decluttering. Tap any summit for its details, or “Stand on this peak” to teleport your eye straight to it.</p>
+      <ul class="mini-list">
+        <li><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span>Millions of named summits from keyless OpenStreetMap queries, cached per region.</span></li>
+        <li><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span>Search the directory — a teal marker points to any off-screen peak with its distance.</span></li>
+        <li><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span>Keep personal <b>Climbed</b> and <b>Bookmarks</b> lists.</span></li>
+      </ul>
+      <div class="spec-tags">
+        <span><b>SRTM1</b> 30&nbsp;m</span>
+        <span><b>OSM</b> Overpass</span>
+        <span>Pixel-accurate projection</span>
+      </div>
+    </div>
+    <div class="phone-stage reveal">
+      <div class="phone">
+        <div class="screen"><img src="screenshots/alchori-sunset.png" alt="Alchori La labeled at 16,404 ft on a Karakoram ridgeline at sunset, with teal peak markers and a peak info panel offering Climbed, Bookmark and Stand here." loading="lazy"/></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== FEATURE 2 · SKY (full-width landscape) ===== -->
+<section class="wide" id="sky">
+  <div class="wrap">
+    <div class="head reveal">
+      <span class="eyebrow">A working sky</span>
+      <h2>The real sky, <em>in motion</em> — computed on your device.</h2>
+      <p>Sun and moon day-path arcs sweep over the terrain and slip behind the ridges, tagged where they cross the skyline. The moon is drawn as its true lit limb; 62 named bright stars, thousands of procedural ones, the planets and the Milky Way all come from astronomical algorithms — no network required.</p>
+      <div class="spec-tags">
+        <span><b>Meeus</b> / NOAA</span>
+        <span><b>JPL</b> Keplerian planets</span>
+        <span>Sun ±0.01°</span>
+        <span>Scrub any date &amp; time</span>
+      </div>
+    </div>
+    <figure class="landscape reveal">
+      <img src="screenshots/ridge-landscape.jpg" alt="A Himalayan range at sunset rendered in PeakPeek, the sun's day-path arc dropping to a 5:34 PM set tag on the horizon, teal peak markers along the skyline beneath a purple-to-orange sky." loading="lazy"/>
+    </figure>
+  </div>
+</section>
+
+<!-- ===== FEATURE GRID ===== -->
+<section class="grid-section" id="features">
+  <div class="wrap">
+    <div class="grid-head reveal">
+      <span class="eyebrow">Everything inside</span>
+      <h2>One quiet, capable window onto the whole horizon.</h2>
+      <p>From live GPU terrain to a pocket planetarium and full offline maps — every feature works without an account, a key, or a connection.</p>
+    </div>
+    <div class="cards reveal">
+      <!-- 1 -->
+      <div class="card">
+        <span class="idx">01</span>
+        <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="m3 17 6-9 4 5 3-4 5 8z"/><circle cx="17" cy="6" r="1.6" fill="currentColor" stroke="none"/></svg></div>
+        <h3>Live GPU terrain</h3>
+        <p>A Metal raymarcher bakes a 16K, 360° equirectangular panorama of real relief, then samples it every frame as you look around.</p>
+      </div>
+      <!-- 2 -->
+      <div class="card">
+        <span class="idx">02</span>
+        <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 21s-7-5.2-7-11a7 7 0 0 1 14 0c0 5.8-7 11-7 11z"/><circle cx="12" cy="10" r="2.4"/></svg></div>
+        <h3>Peak labels &amp; search</h3>
+        <p>Names and elevations pinned to summits, a searchable directory, and a direction marker for anything beyond the frame.</p>
+      </div>
+      <!-- 3 -->
+      <div class="card">
+        <span class="idx">03</span>
+        <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M17.5 13a6 6 0 1 1-6.5-8.5 5 5 0 0 0 6.5 8.5z"/><circle cx="19" cy="5" r="1"/></svg></div>
+        <h3>On-device astronomy</h3>
+        <p>Sun, moon, planets, named stars and the Milky Way — every position computed locally, drawn correctly behind the terrain.</p>
+      </div>
+      <!-- 4 -->
+      <div class="card">
+        <span class="idx">04</span>
+        <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3.5 2"/></svg></div>
+        <h3>Time scrubber</h3>
+        <p>Pick a date and slide through the day to move the whole sky. Terrain stays lit; only the heavens re-light.</p>
+      </div>
+      <!-- 5 -->
+      <div class="card">
+        <span class="idx">05</span>
+        <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M3 9h18M8 5v14"/></svg></div>
+        <h3>AR overlay</h3>
+        <p>Cycle 3D, AR, Edges and Points to drop the terrain, ridge lines or labels straight onto your live camera.</p>
+      </div>
+      <!-- 6 -->
+      <div class="card">
+        <span class="idx">06</span>
+        <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 15a4 4 0 0 0-4-4 6 6 0 0 0-11.6-2A4.5 4.5 0 1 0 6 18h11a4 4 0 0 0 4-3z"/><path d="M8 21l2-3M16 21l-2-3"/></svg></div>
+        <h3>Offline regions</h3>
+        <p>Frame any area on the map and download its tiles. Render whole ranges with zero connection, reference-counted to save space.</p>
+      </div>
+      <!-- 7 -->
+      <div class="card">
+        <span class="idx">07</span>
+        <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M9 3 3 5.5v15L9 18l6 3 6-2.5v-15L15 6 9 3z"/><path d="M9 3v15M15 6v15"/></svg></div>
+        <h3>Teleport anywhere</h3>
+        <p>Drop a viewpoint on a hybrid 3D map to stand on any point on Earth — or snap back to your GPS location instantly.</p>
+      </div>
+      <!-- 8 -->
+      <div class="card">
+        <span class="idx">08</span>
+        <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7h16M4 12h16M4 17h10"/><path d="M19 15.5l1.5 1.5 2.5-3" stroke-width="1.6"/></svg></div>
+        <h3>Your peak lists</h3>
+        <p>Mark summits as climbed, bookmark the ones you want, and they follow you across every viewpoint.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== KEYLESS BAND ===== -->
+<section class="band" id="keyless">
+  <div class="wrap">
+    <div class="reveal">
+      <span class="eyebrow">Why it's different</span>
+      <h2>Keyless <em>by design.</em></h2>
+      <p class="sub">Real global elevation comes from the public AWS SRTM mirror; peak names from OpenStreetMap. There's no key embedded and nothing to rate-limit per user — which is exactly what makes it free to run and genuinely shippable.</p>
+    </div>
+    <div class="pillars reveal">
+      <div class="pillar">
+        <span class="n">// 01</span>
+        <h4>Real 30&nbsp;m topography</h4>
+        <p>SRTM1 elevation with two-tier near/far rendering, plus Earth-curvature drop and atmospheric refraction so distant ridgelines sit exactly where they really do.</p>
+      </div>
+      <div class="pillar">
+        <span class="n">// 02</span>
+        <h4>Nothing to sign up for</h4>
+        <p>No account, no login, no per-user quota. Open the app and the mountains around you are already drawing.</p>
+      </div>
+      <div class="pillar">
+        <span class="n">// 03</span>
+        <h4>Yours, offline</h4>
+        <p>Download any region once and it renders with no connection — and reopens to your last viewpoint the moment you launch.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== FINAL CTA ===== -->
+<section class="final" id="get">
+  <div class="wrap">
+    <svg class="logo-big reveal" viewBox="0 0 40 40" aria-hidden="true">
+      <circle cx="20" cy="20" r="19" fill="url(#ppSky)"/>
+      <g clip-path="url(#ppClip)">
+        <circle cx="26.6" cy="13.4" r="12" fill="url(#ppHalo)"/>
+        <circle cx="26.6" cy="13.4" r="4.6" fill="#FFA028"/>
+        <path d="M-0.8 31.2 L11.2 16.8 Q12.8 13.2 14.4 16.8 L22.4 26.4 L29.6 18.4 Q31 15 32.4 18.4 L40.8 28.8 L40.8 40.8 L-0.8 40.8 Z" fill="#7F99B3" fill-opacity=".55"/>
+        <path d="M-0.8 36.8 L12.6 20 Q14.6 15.4 16.6 20 L21.8 28 L25.8 22.4 Q27.4 18.2 29 22.4 L40.8 36.8 L40.8 40.8 L-0.8 40.8 Z" fill="#F7FAFF" fill-opacity=".96"/>
+      </g>
+      <circle cx="20" cy="20" r="19" fill="none" stroke="rgba(255,255,255,.18)" stroke-width="1"/>
+    </svg>
+    <h2 class="reveal">Point your phone at the range.<br><em>We'll name it.</em></h2>
+    <p class="reveal">A 360° topographic window onto the whole horizon — live, labeled, celestial, and offline. iPhone, iOS&nbsp;17+.</p>
+    <div class="reveal" style="display:flex;gap:16px;justify-content:center;flex-wrap:wrap">
+      <a class="btn-primary" href="#">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor"><path d="M16.36 12.6c-.02-2.2 1.8-3.26 1.88-3.31-1.03-1.5-2.62-1.71-3.19-1.73-1.36-.14-2.65.8-3.34.8-.69 0-1.75-.78-2.88-.76-1.48.02-2.85.86-3.61 2.19-1.54 2.67-.39 6.62 1.11 8.79.73 1.06 1.6 2.25 2.74 2.21 1.1-.04 1.52-.71 2.85-.71 1.33 0 1.71.71 2.88.69 1.19-.02 1.94-1.08 2.67-2.15.84-1.23 1.19-2.42 1.21-2.48-.03-.01-2.32-.89-2.34-3.53zM14.13 5.62c.6-.74 1.01-1.75.9-2.77-.87.04-1.94.59-2.57 1.31-.56.64-1.06 1.68-.93 2.67.97.08 1.97-.49 2.6-1.21z"/></svg>
+        Download on the App&nbsp;Store
+      </a>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<!-- ===== FOOTER ===== -->
+<footer>
+  <div class="wrap">
+    <div>
+      <a class="brand" href="#top">
+        <svg class="logo" viewBox="0 0 40 40" aria-hidden="true">
+          <circle cx="20" cy="20" r="19" fill="url(#ppSky)"/>
+          <g clip-path="url(#ppClip)">
+            <circle cx="26.6" cy="13.4" r="12" fill="url(#ppHalo)"/>
+            <circle cx="26.6" cy="13.4" r="4.6" fill="#FFA028"/>
+            <path d="M-0.8 31.2 L11.2 16.8 Q12.8 13.2 14.4 16.8 L22.4 26.4 L29.6 18.4 Q31 15 32.4 18.4 L40.8 28.8 L40.8 40.8 L-0.8 40.8 Z" fill="#7F99B3" fill-opacity=".55"/>
+            <path d="M-0.8 36.8 L12.6 20 Q14.6 15.4 16.6 20 L21.8 28 L25.8 22.4 Q27.4 18.2 29 22.4 L40.8 36.8 L40.8 40.8 L-0.8 40.8 Z" fill="#F7FAFF" fill-opacity=".96"/>
+          </g>
+          <circle cx="20" cy="20" r="19" fill="none" stroke="rgba(255,255,255,.18)" stroke-width="1"/>
+        </svg>
+        <b>Peak<span style="color:var(--teal)">Peek</span></b>
+      </a>
+      <p class="tag">A 360° topographic window onto the whole horizon.</p>
+    </div>
+    <div class="cols">
+      <div>
+        <h5>Explore</h5>
+        <ul>
+          <li><a href="#peaks">Identify peaks</a></li>
+          <li><a href="#sky">The sky</a></li>
+          <li><a href="#features">Features</a></li>
+          <li><a href="#keyless">Why keyless</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Built on</h5>
+        <ul>
+          <li><a href="https://registry.opendata.aws/terrain-tiles/" target="_blank" rel="noopener">AWS SRTM tiles</a></li>
+          <li><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a></li>
+          <li><a href="https://developer.apple.com/metal/" target="_blank" rel="noopener">Apple Metal</a></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="wrap">
+    <div class="copyright">
+      <span>© 2026 PeakPeek · iOS 17+</span>
+      <span>Made for the mountains.</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // mark JS active so reveal/stagger styles apply (content stays visible if JS fails)
+  document.documentElement.classList.add('js');
+  // safety net: reveal everything after 2.5s even if the observer never fires
+  setTimeout(()=>document.querySelectorAll('.reveal').forEach(el=>el.classList.add('in')),2500);
+  // scroll reveal
+  const io = new IntersectionObserver((entries)=>{
+    entries.forEach(e=>{ if(e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target); } });
+  },{threshold:.14, rootMargin:'0px 0px -8% 0px'});
+  document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
+</script>
+</body>
+</html>

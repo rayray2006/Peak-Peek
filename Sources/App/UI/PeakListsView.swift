@@ -45,11 +45,21 @@ struct PeakListsView: View {
                                     Label("Remove", systemImage: "trash")
                                 }
                             }
+                            // Bookmarks: swipe right to promote straight to Climbed.
+                            .swipeActions(edge: .leading) {
+                                if selection == .wantToClimb {
+                                    Button {
+                                        if !store.contains(row.saved.peak, in: .climbed) {
+                                            store.toggle(row.saved.peak, in: .climbed)
+                                        }
+                                        store.remove(row.saved.peak, from: .wantToClimb)
+                                    } label: {
+                                        Label("Climbed", systemImage: "checkmark.seal.fill")
+                                    }
+                                    .tint(.green)
+                                }
+                            }
                         }
-                    } header: {
-                        Text(selection.title)
-                    } footer: {
-                        Text("Tap a peak to select it. Peaks stay saved offline because mountainView stores the peak snapshot when you add it.")
                     }
                 }
             }
@@ -92,7 +102,7 @@ struct PeakListsView: View {
                 .foregroundStyle(selection == .climbed ? .green : .orange)
             Text("No peaks yet")
                 .font(.headline)
-            Text("Open Peaks, select a summit, then add it to \(selection.title.lowercased()).")
+            Text("Open Search, select a summit, then add it to \(selection.title.lowercased()).")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

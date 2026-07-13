@@ -4,11 +4,14 @@ import SwiftUI
 
 /// Full-screen teleport map — tap anywhere to drop a pin, confirm to move the eye
 /// there and look around (PeakFinder's viewpoint picker). (Ported from RidgeLine.)
+///
+/// A plain maps view with its own default labels (mountains, lakes, towns) — no
+/// custom peak markers. Tap anywhere to drop a pin at that exact point; the pin's
+/// friendly name is reverse-geocoded on confirm.
 struct TeleportMapView: View {
     let currentViewpoint: PanoramaViewModel.Viewpoint?
     let onPick: (PanoramaViewModel.Viewpoint) -> Void
 
-    @StateObject private var location = MapLocationModel()
     @State private var pin: CLLocationCoordinate2D?
     @State private var resolving = false
     @Environment(\.dismiss) private var dismiss
@@ -17,11 +20,7 @@ struct TeleportMapView: View {
         NavigationStack {
             MapReader { proxy in
                 Map(initialPosition: startPosition) {
-                    if let coordinate = location.coordinate {
-                        Annotation("You", coordinate: coordinate, anchor: .center) {
-                            HeadingDot(headingDeg: location.headingDeg)
-                        }
-                    }
+                    UserAnnotation()
                     if let currentViewpoint {
                         Annotation(currentViewpoint.name, coordinate: currentCoordinate, anchor: .center) {
                             ViewpointMarkerDot()
@@ -51,13 +50,12 @@ struct TeleportMapView: View {
                         Text(String(format: "Selected %.4f°, %.4f°", pin.latitude, pin.longitude))
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Button {
-                            go(to: pin)
-                        } label: {
+                        Button { go(to: pin) } label: {
                             HStack {
                                 if resolving { ProgressView().tint(.white) }
                                 Text(resolving ? "Naming location..." : "Stand here")
                                     .font(.callout.weight(.semibold))
+                                    .lineLimit(1)
                                 Spacer()
                                 Image(systemName: "eye.fill")
                             }
@@ -69,6 +67,10 @@ struct TeleportMapView: View {
                         }
                         .disabled(resolving)
                     }
+                    // Landscape: don't stretch the confirm button across the whole
+                    // (wide) screen — cap the content and center it in the bar.
+                    .frame(maxWidth: 560)
+                    .frame(maxWidth: .infinity)
                     .padding()
                     .background(.regularMaterial)
                 } else {
@@ -83,8 +85,6 @@ struct TeleportMapView: View {
                     .background(.regularMaterial)
                 }
             }
-            .task { location.start() }
-            .onDisappear { location.stop() }
         }
     }
 
@@ -103,21 +103,49 @@ struct TeleportMapView: View {
         return CLLocationCoordinate2D(latitude: currentViewpoint.latitude, longitude: currentViewpoint.longitude)
     }
 
-    /// Resolve a friendly name (best effort, ~a second), then teleport.
+    /// Resolve a friendly name for the pin (best effort, ~a second), then teleport.
+    /// The name NEVER gates the move: offline, reverseGeocodeLocation can hang for
+    /// minutes, which left "Naming location..." spinning forever — so the lookup
+    /// races a short deadline and loses gracefully to the coordinate string.
     private func go(to coordinate: CLLocationCoordinate2D) {
         resolving = true
         Task {
-            var name = String(format: "%.3f°, %.3f°", coordinate.latitude, coordinate.longitude)
-            let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
-            if let placemark = try? await CLGeocoder().reverseGeocodeLocation(location).first,
-               let friendly = placemark.name ?? placemark.locality ?? placemark.administrativeArea {
-                name = friendly
-            }
+            let fallback = String(format: "%.3f°, %.3f°", coordinate.latitude, coordinate.longitude)
+            let loc = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
+            let name = await Self.friendlyName(for: loc, deadlineSeconds: 2.5) ?? fallback
             onPick(PanoramaViewModel.Viewpoint(
                 name: name, latitude: coordinate.latitude, longitude: coordinate.longitude
             ))
             resolving = false
             dismiss()
+        }
+    }
+
+    /// First of: reverse-geocoded name, or nil at the deadline. Resume-once guard
+    /// because the loser still finishes eventually (the geocoder ignores task
+    /// cancellation, so a task group would keep waiting on it — hence the manual race).
+    private static func friendlyName(for loc: CLLocation, deadlineSeconds: Double) async -> String? {
+        final class Once: @unchecked Sendable {
+            private let lock = NSLock()
+            private var done = false
+            func run(_ body: () -> Void) {
+                lock.lock(); defer { lock.unlock() }
+                if !done { done = true; body() }
+            }
+        }
+        return await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+            let once = Once()
+            Task {
+                let placemark = try? await CLGeocoder().reverseGeocodeLocation(loc).first
+                let friendly = placemark.flatMap {
+                    $0.name ?? $0.areasOfInterest?.first ?? $0.locality ?? $0.administrativeArea
+                }
+                once.run { cont.resume(returning: friendly) }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(deadlineSeconds * 1_000_000_000))
+                once.run { cont.resume(returning: nil) }
+            }
         }
     }
 }
@@ -128,9 +156,20 @@ struct MiniMapView: View {
     let viewpoint: PanoramaViewModel.Viewpoint
     let onTap: () -> Void
     @StateObject private var location = MapLocationModel()
+    /// Held in @State and updated ONLY when the viewpoint moves — so the map keeps a
+    /// stable camera across the parent's re-renders instead of getting a freshly built
+    /// `.constant(.region(...))` binding every time (which can reset the camera and
+    /// interrupt tile loading).
+    @State private var position: MapCameraPosition
+
+    init(viewpoint: PanoramaViewModel.Viewpoint, onTap: @escaping () -> Void) {
+        self.viewpoint = viewpoint
+        self.onTap = onTap
+        _position = State(initialValue: .region(Self.region(for: viewpoint)))
+    }
 
     var body: some View {
-        Map(position: .constant(.region(region)), interactionModes: []) {
+        Map(position: $position, interactionModes: []) {
             if let coordinate = location.coordinate {
                 Annotation("You", coordinate: coordinate, anchor: .center) {
                     MiniMapLocationDot()
@@ -157,6 +196,9 @@ struct MiniMapView: View {
         .onTapGesture(perform: onTap)
         .task { location.start() }
         .onDisappear { location.stop() }
+        // Follow the eye only when it actually moves (not on every parent re-render).
+        .onChange(of: viewpoint.latitude) { position = .region(Self.region(for: viewpoint)) }
+        .onChange(of: viewpoint.longitude) { position = .region(Self.region(for: viewpoint)) }
         .accessibilityLabel("Map — tap to choose a viewpoint")
     }
 
@@ -164,9 +206,9 @@ struct MiniMapView: View {
         CLLocationCoordinate2D(latitude: viewpoint.latitude, longitude: viewpoint.longitude)
     }
 
-    private var region: MKCoordinateRegion {
+    private static func region(for viewpoint: PanoramaViewModel.Viewpoint) -> MKCoordinateRegion {
         MKCoordinateRegion(
-            center: center,
+            center: CLLocationCoordinate2D(latitude: viewpoint.latitude, longitude: viewpoint.longitude),
             span: MKCoordinateSpan(latitudeDelta: 0.6, longitudeDelta: 0.6)
         )
     }
@@ -191,42 +233,5 @@ private struct ViewpointMarkerDot: View {
             .overlay(Circle().stroke(.white, lineWidth: 2.5))
             .shadow(radius: 2)
             .allowsHitTesting(false)
-    }
-}
-
-struct HeadingDot: View {
-    let headingDeg: Double?
-
-    var body: some View {
-        ZStack {
-            if let headingDeg {
-                HeadingCone()
-                    .fill(.blue.opacity(0.22))
-                    .frame(width: 54, height: 54)
-                    .rotationEffect(.degrees(headingDeg))
-            }
-            Circle()
-                .fill(.blue)
-                .frame(width: 16, height: 16)
-                .overlay(Circle().stroke(.white, lineWidth: 3))
-                .shadow(radius: 2)
-        }
-        .frame(width: 58, height: 58)
-        .allowsHitTesting(false)
-    }
-}
-
-private struct HeadingCone: Shape {
-    func path(in rect: CGRect) -> Path {
-        let center = CGPoint(x: rect.midX, y: rect.midY)
-        var path = Path()
-        path.move(to: center)
-        path.addLine(to: CGPoint(x: rect.midX - rect.width * 0.22, y: rect.minY + rect.height * 0.08))
-        path.addQuadCurve(
-            to: CGPoint(x: rect.midX + rect.width * 0.22, y: rect.minY + rect.height * 0.08),
-            control: CGPoint(x: rect.midX, y: rect.minY - rect.height * 0.05)
-        )
-        path.closeSubpath()
-        return path
     }
 }

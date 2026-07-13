@@ -96,7 +96,7 @@ enum OSMPeakService {
         let urls = (try? FileManager.default.contentsOfDirectory(
             at: dir, includingPropertiesForKeys: nil
         )) ?? []
-        var merged: [Peak] = []
+        var merge = LinearPeakMerge()
         for url in urls where url.pathExtension == "json" {
             guard let entry = cacheEntry(for: url),
                   GeoMath.distanceMeters(
@@ -109,11 +109,11 @@ enum OSMPeakService {
             for peak in peaks where GeoMath.distanceMeters(
                 fromLatitude: lat, fromLongitude: lon,
                 toLatitude: peak.latitude, toLongitude: peak.longitude
-            ) <= radiusKm * 1000 && !merged.contains(where: { samePeak($0, peak) }) {
-                merged.append(peak)
+            ) <= radiusKm * 1000 {
+                merge.insert(peak)
             }
         }
-        return merged.isEmpty ? nil : merged
+        return merge.peaks.isEmpty ? nil : merge.peaks
     }
 
     static func allCachedPeaks() -> [Peak] {
@@ -121,15 +121,49 @@ enum OSMPeakService {
         let urls = (try? FileManager.default.contentsOfDirectory(
             at: dir, includingPropertiesForKeys: nil
         )) ?? []
-        var merged: [Peak] = []
+        var merge = LinearPeakMerge()
         for url in urls where url.pathExtension == "json" {
             guard let data = try? Data(contentsOf: url),
                   let peaks = try? JSONDecoder().decode([Peak].self, from: data) else { continue }
-            for peak in peaks where !merged.contains(where: { samePeak($0, peak) }) {
-                merged.append(peak)
-            }
+            for peak in peaks { merge.insert(peak) }
         }
-        return merged
+        return merge.peaks
+    }
+
+    /// Linear-time replacement for the old `merged.contains(where: samePeak)`
+    /// dedup, which was O(n²) — with the multi-megabyte tile caches a device
+    /// accumulates, that quadratic scan (name compare + haversine per pair) took
+    /// SECONDS and delayed labels long after the terrain was up. Same semantics:
+    /// drop exact-id duplicates and same-name peaks within 200 m (tile overlap),
+    /// via an id set + a ~550 m grid bucketed by normalized name.
+    struct LinearPeakMerge {
+        private(set) var peaks: [Peak] = []
+        private var ids = Set<String>()
+        private var nameBuckets: [String: [Peak]] = [:]
+
+        private static func bucketKey(_ name: String, _ latCell: Int, _ lonCell: Int) -> String {
+            "\(latCell):\(lonCell):\(name)"
+        }
+
+        mutating func insert(_ peak: Peak) {
+            guard ids.insert(peak.id).inserted else { return }
+            let name = peak.name.lowercased()
+            let latCell = Int((peak.latitude * 200).rounded())
+            let lonCell = Int((peak.longitude * 200).rounded())
+            for dy in -1...1 {
+                for dx in -1...1 {
+                    let key = Self.bucketKey(name, latCell + dy, lonCell + dx)
+                    if nameBuckets[key]?.contains(where: {
+                        GeoMath.distanceMeters(
+                            fromLatitude: $0.latitude, fromLongitude: $0.longitude,
+                            toLatitude: peak.latitude, toLongitude: peak.longitude
+                        ) < 200
+                    }) == true { return }
+                }
+            }
+            peaks.append(peak)
+            nameBuckets[Self.bucketKey(name, latCell, lonCell), default: []].append(peak)
+        }
     }
 
     @discardableResult
@@ -174,7 +208,7 @@ enum OSMPeakService {
         allowed.insert(charactersIn: "-._~")
         let encoded = query.addingPercentEncoding(withAllowedCharacters: allowed) ?? query
         request.httpBody = ("data=" + encoded).data(using: .utf8)
-        request.setValue("mountainView/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
+        request.setValue("PeakPeek/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 30
         let (data, response) = try await URLSession.shared.data(for: request)
         guard (response as? HTTPURLResponse).map({ 200..<300 ~= $0.statusCode }) ?? false else {
@@ -203,7 +237,8 @@ enum OSMPeakService {
                 id: "osm-\(element.id)", name: name,
                 latitude: lat, longitude: lon,
                 elevationMeters: elevation ?? 0,
-                prominenceMeters: tags["prominence"].flatMap(parseElevationMeters)
+                prominenceMeters: tags["prominence"].flatMap(parseElevationMeters),
+                isSaddle: tags["natural"] == "saddle"
             )
         }
     }

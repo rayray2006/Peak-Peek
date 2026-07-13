@@ -2,7 +2,7 @@ import UIKit
 
 /// Top-center compass tape + zoom readout, ported pixel-for-pixel from RidgeLine's
 /// `PanoramaCanvasView` (`setupCompass` / `setupZoomIndicator` and their updates).
-/// Driven by mountainView's live heading (deg, 0 = N) and zoom factor (×).
+/// Driven by PeakPeek's live heading (deg, 0 = N) and zoom factor (×).
 final class CompassZoomOverlayView: UIView {
 
     private static let noAnim: [String: CAAction] = [

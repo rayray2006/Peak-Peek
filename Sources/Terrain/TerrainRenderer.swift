@@ -14,6 +14,7 @@ final class TerrainRenderer {
     private let raymarchPipeline: MTLRenderPipelineState
     private let downsamplePipeline: MTLRenderPipelineState
     private let panoramaBakePipeline: MTLRenderPipelineState
+    private let panoramaDepthPipeline: MTLRenderPipelineState
     private let panoramaViewPipeline: MTLRenderPipelineState
     private let panoramaViewARPipeline: MTLRenderPipelineState
     private let panoramaViewEdgesPipeline: MTLRenderPipelineState
@@ -28,6 +29,9 @@ final class TerrainRenderer {
 
     /// Optional sampled DEM height texture (R32Float, value = meters).
     var heightTexture: MTLTexture?
+    /// Coarse, wide-coverage far-field DEM, bound at texture(1). Sampled only where
+    /// the near `heightTexture` has no data. nil → far tier disabled.
+    var farHeightTexture: MTLTexture?
 
     /// Supersampling factor (1 = off). 2 = render at 2x, downsample (4x cost).
     var supersample: Int = 2
@@ -85,6 +89,16 @@ final class TerrainRenderer {
         pb.fragmentFunction = panoBake
         pb.colorAttachments[0].pixelFormat = Self.colorFormat
         self.panoramaBakePipeline = try device.makeRenderPipelineState(descriptor: pb)
+
+        // Panorama hit-distance map for label occlusion — r32Float target.
+        guard let panoDepth = library.makeFunction(name: "panoramaDepthFragment") else {
+            throw RendererError.missingFunctions
+        }
+        let pd = MTLRenderPipelineDescriptor()
+        pd.vertexFunction = vfn
+        pd.fragmentFunction = panoDepth
+        pd.colorAttachments[0].pixelFormat = .r32Float
+        self.panoramaDepthPipeline = try device.makeRenderPipelineState(descriptor: pd)
 
         let pv = MTLRenderPipelineDescriptor()
         pv.vertexFunction = vfn
@@ -145,10 +159,102 @@ final class TerrainRenderer {
             enc.setRenderPipelineState(panoramaBakePipeline)
             enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
             if let tex = heightTexture { enc.setFragmentTexture(tex, index: 0) }
+            // Far tier at index 1 (fall back to near so a texture is always bound).
+            enc.setFragmentTexture(farHeightTexture ?? heightTexture, index: 1)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             enc.endEncoding()
         }
         return (cb, bakeColor)
+    }
+
+    /// Render a SMALL equirectangular bake and return its per-texel terrain/sky alpha
+    /// (≈255 = terrain, 0 = sky). Uses the SAME bake shader and per-direction rays as
+    /// the full panorama, so the terrain/sky verdict at any (az, el) matches the real
+    /// bake exactly regardless of resolution — used to cull peak labels whose summit
+    /// lands on sky the bake draws above the (coarsely-rendered) terrain. CPU-readable.
+    func terrainSkyMask(uniforms: Uniforms, width: Int = 1024) -> (width: Int, height: Int, alpha: [UInt8])? {
+        let w = max(8, width)
+        let h = max(1, Int(Double(w) * Double(uniforms.panoElevMax) / Double.pi))
+        let d = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: Self.colorFormat, width: w, height: h, mipmapped: false)
+        d.usage = [.renderTarget, .shaderRead]
+        d.storageMode = .shared                  // CPU-readable via getBytes
+        guard let tex = device.makeTexture(descriptor: d),
+              let cb = commandQueue.makeCommandBuffer() else { return nil }
+        var u = uniforms
+        let pa = MTLRenderPassDescriptor()
+        pa.colorAttachments[0].texture = tex
+        pa.colorAttachments[0].loadAction = .clear
+        pa.colorAttachments[0].storeAction = .store
+        guard let enc = cb.makeRenderCommandEncoder(descriptor: pa) else { return nil }
+        enc.setRenderPipelineState(panoramaBakePipeline)
+        enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+        if let t = heightTexture { enc.setFragmentTexture(t, index: 0) }
+        enc.setFragmentTexture(farHeightTexture ?? heightTexture, index: 1)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        var rgba = [UInt8](repeating: 0, count: w * h * 4)
+        rgba.withUnsafeMutableBytes { ptr in
+            tex.getBytes(ptr.baseAddress!, bytesPerRow: w * 4,
+                         from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+        }
+        var alpha = [UInt8](repeating: 0, count: w * h)
+        for i in 0..<(w * h) { alpha[i] = rgba[i * 4 + 3] }   // rgba8: alpha is byte 3
+        return (w, h, alpha)
+    }
+
+    /// Per-texel hit-distance panorama for label occlusion (blocking; ~50–150 ms
+    /// at the 4096 default — one-time per viewpoint, called off-main). Sky/miss
+    /// texels carry the FAR sentinel (≥ maxDistance×4). Rendered with the SAME
+    /// march/eye/DEM as the visible panorama, so a label visibility decision made
+    /// against it always agrees with the picture on screen.
+    ///
+    /// 4096 (0.088°/texel) instead of 2048: the visible bake is 8–16 K wide, and
+    /// the coarser the depth map, the wider the quantization band at silhouettes
+    /// where near-grazing peaks flip between shown/hidden. ~22 MB transient.
+    func terrainDepthMap(uniforms: Uniforms, width: Int = 4096)
+        -> (width: Int, height: Int, depth: [Float])? {
+        let w = max(8, width)
+        let h = max(1, Int(Double(w) * Double(uniforms.panoElevMax) / Double.pi))
+        let d = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r32Float, width: w, height: h, mipmapped: false)
+        d.usage = [.renderTarget, .shaderRead]
+        d.storageMode = .shared                  // CPU-readable via getBytes
+        guard let tex = device.makeTexture(descriptor: d) else { return nil }
+        var u = uniforms
+        // Sliced into azimuth bands like the bake (see bakePanoramaAsync): this
+        // runs while the app is LIVE, and one 4k unpreemptible raymarch pass froze
+        // the display for its whole duration. 512-texel bands keep each GPU chunk
+        // around a frame; the caller already blocks a utility thread, so waiting
+        // per band costs nothing extra.
+        let bands = max(1, (w + 511) / 512)
+        let bandW = (w + bands - 1) / bands
+        for i in 0..<bands {
+            guard let cb = commandQueue.makeCommandBuffer() else { return nil }
+            let pa = MTLRenderPassDescriptor()
+            pa.colorAttachments[0].texture = tex
+            pa.colorAttachments[0].loadAction = i == 0 ? .clear : .load
+            pa.colorAttachments[0].storeAction = .store
+            guard let enc = cb.makeRenderCommandEncoder(descriptor: pa) else { return nil }
+            enc.setRenderPipelineState(panoramaDepthPipeline)
+            enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+            if let t = heightTexture { enc.setFragmentTexture(t, index: 0) }
+            enc.setFragmentTexture(farHeightTexture ?? heightTexture, index: 1)
+            let x = i * bandW
+            enc.setScissorRect(MTLScissorRect(x: x, y: 0, width: min(bandW, w - x), height: h))
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            enc.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+        }
+        var depth = [Float](repeating: 0, count: w * h)
+        depth.withUnsafeMutableBytes { ptr in
+            tex.getBytes(ptr.baseAddress!, bytesPerRow: w * 4,
+                         from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+        }
+        return (w, h, depth)
     }
 
     /// One-time edge AA of a baked panorama, in its OWN command buffer. Run after
@@ -194,24 +300,96 @@ final class TerrainRenderer {
     /// `completion` is called on the main queue with the finished panorama once
     /// ready. The caller decides whether to `installPanorama` it (so a stale
     /// background bake can be discarded). Lets launch / reload stay responsive.
-    func bakePanoramaAsync(uniforms: Uniforms, completion: @escaping (MTLTexture?) -> Void) {
-        guard let (cb, bakeColor) = encodeBake(uniforms: uniforms) else {
+    ///
+    /// The raymarch is SLICED into azimuth bands, one command buffer each, chained
+    /// via completion handlers. A single monolithic pass owned the GPU for its full
+    /// duration (hundreds of ms at 16k) and a render pass can't be preempted — the
+    /// live view AND all UIKit/CoreAnimation compositing froze while it ran. Bands
+    /// give the display a scheduling gap between buffers, so the app stays fluid
+    /// while the bake streams in behind it.
+    /// `onProgress` (main queue) ticks once per completed band with 0…1 — the
+    /// bands give the readout a genuinely continuous signal during the bake
+    /// (the readout used to freeze at a constant until the whole bake landed).
+    func bakePanoramaAsync(uniforms: Uniforms,
+                           onProgress: ((Double) -> Void)? = nil,
+                           completion: @escaping (MTLTexture?) -> Void) {
+        let panoW = panoramaWidth
+        let panoH = max(1, Int(Double(panoW) * Double(uniforms.panoElevMax) / Double.pi))
+        let d = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: Self.colorFormat, width: panoW, height: panoH, mipmapped: false)
+        d.usage = [.renderTarget, .shaderRead]
+        d.storageMode = .private
+        guard let bakeColor = device.makeTexture(descriptor: d) else {
             DispatchQueue.main.async { completion(nil) }; return
         }
-        // AA runs in a second command buffer, kicked off only once the bake has
-        // completed — reading the just-rendered panorama inside the same command
-        // buffer races the write and yields garbage.
-        cb.addCompletedHandler { [weak self] _ in
-            guard let self, let (cb2, aa) = self.encodeAA(src: bakeColor) else {
-                DispatchQueue.main.async { completion(bakeColor) }   // fallback: un-AA'd
-                return
+        // The quick bake (≤2048) stays one slice — the loading screen is up, nothing
+        // can jitter, and latency to first image matters most. The full-res rebake
+        // runs while the user is ALREADY looking around, so its bands are 256 texels:
+        // ~10 ms of GPU each, under a display frame, which keeps the live pan smooth
+        // instead of stuttering for the bake's whole duration. Per-band encode/commit
+        // overhead is well under a millisecond.
+        let bands = panoW <= 2048 ? 1 : (panoW + 255) / 256
+        let bandW = (panoW + bands - 1) / bands
+        var u = uniforms
+
+        func encodeBand(_ i: Int) {
+            guard let cb = commandQueue.makeCommandBuffer() else {
+                DispatchQueue.main.async { completion(nil) }; return
             }
-            cb2.addCompletedHandler { _ in
-                DispatchQueue.main.async { completion(aa) }
+            let pa = MTLRenderPassDescriptor()
+            pa.colorAttachments[0].texture = bakeColor
+            // First band clears the whole target; later bands write their scissored
+            // slice over what's already there.
+            pa.colorAttachments[0].loadAction = i == 0 ? .clear : .load
+            pa.colorAttachments[0].storeAction = .store
+            if let enc = cb.makeRenderCommandEncoder(descriptor: pa) {
+                enc.setRenderPipelineState(panoramaBakePipeline)
+                enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+                if let tex = heightTexture { enc.setFragmentTexture(tex, index: 0) }
+                enc.setFragmentTexture(farHeightTexture ?? heightTexture, index: 1)
+                let x = i * bandW
+                enc.setScissorRect(MTLScissorRect(
+                    x: x, y: 0, width: min(bandW, panoW - x), height: panoH))
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                enc.endEncoding()
             }
-            cb2.commit()
+            cb.addCompletedHandler { [weak self] buf in
+                // GPU work aborted (classic case: the app was backgrounded mid-bake
+                // — iOS forbids background GPU execution). The target texture is
+                // partly or wholly unwritten; zero alpha reads as "sky", so
+                // installing it paints the whole view blue. Report failure instead
+                // and let the caller retry when the app is active again.
+                if buf.error != nil {
+                    NSLog("Panorama bake aborted at band %d: %@", i,
+                          String(describing: buf.error))
+                    DispatchQueue.main.async { completion(nil) }
+                    return
+                }
+                if let onProgress {
+                    let f = Double(i + 1) / Double(bands)
+                    DispatchQueue.main.async { onProgress(f) }
+                }
+                if i + 1 < bands {
+                    encodeBand(i + 1)
+                    return
+                }
+                // AA runs in its own command buffer, kicked off only once the bake
+                // has completed — reading the just-rendered panorama inside the same
+                // command buffer races the write and yields garbage.
+                guard let self, let (cb2, aa) = self.encodeAA(src: bakeColor) else {
+                    DispatchQueue.main.async { completion(bakeColor) }   // fallback: un-AA'd
+                    return
+                }
+                cb2.addCompletedHandler { buf2 in
+                    // AA aborted (backgrounded): the bake itself finished — ship
+                    // the un-AA'd panorama rather than a garbage AA target.
+                    DispatchQueue.main.async { completion(buf2.error == nil ? aa : bakeColor) }
+                }
+                cb2.commit()
+            }
+            cb.commit()
         }
-        cb.commit()
+        encodeBand(0)
     }
 
     /// Install a baked panorama as the current one. Call on the main thread
@@ -253,6 +431,18 @@ final class TerrainRenderer {
     func encodeViewEdges(uniforms: Uniforms, into target: MTLTexture, commandBuffer: MTLCommandBuffer) {
         encodeTransparent(pipeline: panoramaViewEdgesPipeline, uniforms: uniforms,
                           into: target, commandBuffer: commandBuffer)
+    }
+
+    /// Labels-only AR: clear the drawable to fully transparent and draw NO terrain,
+    /// so only the CALayer peak overlay shows over the live camera. CoreAnimation
+    /// composites the (empty) drawable over the camera preview.
+    func encodeClearTransparent(into target: MTLTexture, commandBuffer: MTLCommandBuffer) {
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = target
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].storeAction = .store
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        commandBuffer.makeRenderCommandEncoder(descriptor: pass)?.endEncoding()
     }
 
     /// Shared transparent-overlay pass: clears to fully transparent, runs the given
@@ -316,6 +506,7 @@ final class TerrainRenderer {
             enc.setRenderPipelineState(raymarchPipeline)
             enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
             if let tex = heightTexture { enc.setFragmentTexture(tex, index: 0) }
+            enc.setFragmentTexture(farHeightTexture ?? heightTexture, index: 1)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             enc.endEncoding()
         }

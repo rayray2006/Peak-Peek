@@ -22,7 +22,7 @@ struct PanoramaCamera {
     /// Direction towards the sun (ENU). Default: afternoon sun from the SW, fairly high.
     var sunDirection: SIMD3<Float> = normalize(SIMD3<Float>(-0.5, -0.35, 0.8))
 
-    var maxDistance: Float = 80_000
+    var maxDistance: Float = 135_000
     var heightScale: Float = 1
 
     /// Earth radius (m) used for curvature drop.

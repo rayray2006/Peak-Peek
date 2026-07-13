@@ -1,7 +1,7 @@
 import Foundation
 
 /// Peak search/label reach (meters). In RidgeLine this is `SilhouetteEngine`'s
-/// label range; mountainView keeps the same radius for directory queries.
+/// label range; PeakPeek keeps the same radius for directory queries.
 enum PeakSearch {
     static let maxRangeMeters: Double = 500_000
 }
@@ -15,10 +15,14 @@ struct Peak: Identifiable, Codable, Hashable, Sendable {
     let longitude: Double
     let elevationMeters: Double
     let prominenceMeters: Double?
+    /// A saddle/gap/pass (OSM `natural=saddle`) — a LOW point between summits,
+    /// not a mountain. Label anchors and "Stand here" must NOT summit-snap these
+    /// (the snap would drag them uphill onto the neighboring peak).
+    var isSaddle: Bool = false
 
     init(
         id: String, name: String, latitude: Double, longitude: Double,
-        elevationMeters: Double, prominenceMeters: Double?
+        elevationMeters: Double, prominenceMeters: Double?, isSaddle: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -26,10 +30,11 @@ struct Peak: Identifiable, Codable, Hashable, Sendable {
         self.longitude = longitude
         self.elevationMeters = elevationMeters
         self.prominenceMeters = prominenceMeters
+        self.isSaddle = isSaddle
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, latitude, longitude, elevationMeters, prominenceMeters
+        case id, name, latitude, longitude, elevationMeters, prominenceMeters, isSaddle
     }
 
     init(from decoder: Decoder) throws {
@@ -40,6 +45,7 @@ struct Peak: Identifiable, Codable, Hashable, Sendable {
         longitude = try c.decode(Double.self, forKey: .longitude)
         elevationMeters = try c.decodeIfPresent(Double.self, forKey: .elevationMeters) ?? 0
         prominenceMeters = try c.decodeIfPresent(Double.self, forKey: .prominenceMeters)
+        isSaddle = try c.decodeIfPresent(Bool.self, forKey: .isSaddle) ?? false
     }
 
     /// Label priority: prominent peaks win declutter fights.
@@ -79,7 +85,7 @@ struct PeakStore: Sendable {
 
 /// A peak resolved against a viewpoint: its compass azimuth, apparent elevation
 /// angle, and distance from the eye. (In RidgeLine this lives on
-/// `SilhouetteEngine`; mountainView computes it directly from `GeoMath` since the
+/// `SilhouetteEngine`; PeakPeek computes it directly from `GeoMath` since the
 /// live raymarch view has no precomputed skyline.)
 struct AnnotatedPeak: Identifiable, Equatable {
     let peak: Peak

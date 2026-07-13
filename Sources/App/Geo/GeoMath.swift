@@ -25,16 +25,20 @@ enum GeoMath {
         (ground - eye) * exaggeration - curvatureDrop(distanceMeters: d)
     }
 
-    /// Fast local destination point: `distanceMeters` along compass `bearingRad`.
-    /// Equirectangular — exact enough for a 300 km march (error ≪ one DEM cell).
+    /// Destination point `distanceMeters` along the initial compass `bearingRad` —
+    /// exact spherical geodesic. The old equirectangular shortcut (fixed 111,000
+    /// m/deg, no meridian convergence along the path) drifted ~0.3–0.5° off the
+    /// true sightline at 120 km, so the horizon profile it fed disagreed with both
+    /// the real skyline and the (meridian-corrected) renderer.
     static func destination(
         latitude: Double, longitude: Double, bearingRad: Double, distanceMeters: Double
     ) -> (latitude: Double, longitude: Double) {
-        let dNorth = distanceMeters * cos(bearingRad)
-        let dEast = distanceMeters * sin(bearingRad)
-        let lat = latitude + dNorth / 111_000.0
-        let lon = longitude + dEast / (111_000.0 * max(cos(latitude * .pi / 180), 0.001))
-        return (lat, lon)
+        let d = distanceMeters / earthRadiusMeters
+        let lat1 = latitude * .pi / 180
+        let sinLat2 = sin(lat1) * cos(d) + cos(lat1) * sin(d) * cos(bearingRad)
+        let lat2 = asin(max(-1, min(1, sinLat2)))
+        let dLon = atan2(sin(bearingRad) * sin(d) * cos(lat1), cos(d) - sin(lat1) * sinLat2)
+        return (lat2 * 180 / .pi, longitude + dLon * 180 / .pi)
     }
 
     /// Initial compass bearing (radians, 0 = north, clockwise) between coordinates.

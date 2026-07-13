@@ -1,4 +1,4 @@
-name: mountainView
+name: PeakPeek
 options:
   bundleIdPrefix: com.example
   deploymentTarget:
@@ -13,7 +13,7 @@ settings:
     DEVELOPMENT_TEAM: ""
     GENERATE_INFOPLIST_FILE: true
 targets:
-  mountainView:
+  PeakPeek:
     type: application
     platform: iOS
     sources:
@@ -26,16 +26,22 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleDisplayName: mountainView
+        CFBundleDisplayName: PeakPeek
         UILaunchScreen: {}
-        NSCameraUsageDescription: "mountainView overlays the terrain on the live camera in AR mode."
-        NSLocationWhenInUseUsageDescription: "mountainView uses your location to render the terrain panorama around you."
-        NSMotionUsageDescription: "mountainView uses motion sensors so you can look around by turning the phone."
+        NSCameraUsageDescription: "PeakPeek overlays the terrain on the live camera in AR mode."
+        NSLocationWhenInUseUsageDescription: "PeakPeek uses your location to render the terrain panorama around you."
+        NSMotionUsageDescription: "PeakPeek uses motion sensors so you can look around by turning the phone."
+        NSPhotoLibraryAddUsageDescription: "PeakPeek saves your captured panorama photos to your library."
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
     settings:
       base:
         GENERATE_INFOPLIST_FILE: false
+        # Deliberately still the original identifier: changing it would give the
+        # installed app a fresh container (DEM caches, saved lists, viewpoint all
+        # lost) and break the simulator tooling recipes.
         PRODUCT_BUNDLE_IDENTIFIER: com.example.mountainView
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
@@ -49,26 +55,26 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.ReliefRender
         SWIFT_VERSION: "5.0"
-  mountainViewTests:
+  PeakPeekTests:
     type: bundle.unit-test
     platform: iOS
     sources:
       - Tests
     dependencies:
-      - target: mountainView
+      - target: PeakPeek
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.mountainViewTests
         GENERATE_INFOPLIST_FILE: true
 schemes:
-  mountainView:
+  PeakPeek:
     build:
       targets:
-        mountainView: all
-        mountainViewTests: [test]
+        PeakPeek: all
+        PeakPeekTests: [test]
     test:
       targets:
-        - mountainViewTests
+        - PeakPeekTests
   ReliefRender:
     build:
       targets:

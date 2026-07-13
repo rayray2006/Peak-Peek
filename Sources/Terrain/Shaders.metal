@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Layout MUST match `struct Uniforms` in Uniforms.swift (160-byte stride).
+// Layout MUST match `struct Uniforms` in Uniforms.swift (208-byte stride).
 struct Uniforms {
     float4 cameraPos;   // xyz = ENU meters
     float4 forward;
@@ -22,10 +22,55 @@ struct Uniforms {
     float  useDEM;
     float  globalMaxHeight;
     float  panoElevMax;   // half-height of panorama vertical band (radians)
-    float  _pad2;
-    float  _pad3;
-    float  _pad4;
+    // Far (coarse) DEM tier, bound at texture(1).
+    float  useFar;
+    float2 gridMinENU2;
+    float2 cellSizeENU2;
+    float2 gridDims2;
+    float4 skySunDir;     // real sun ENU direction → dynamic sky colour (.w unused)
+    // ENU projection correction (identity when 0/1/0 — see Uniforms.swift).
+    float  refLatRad;     // ENU reference latitude, radians
+    float  cosRefLat;     // cos(refLatRad)
+    float  geoK;          // tan(refLatRad) / (2 R_enu): m northing per (m easting)²
 };
+
+// Guard the byte-for-byte layout contract with the Swift struct (stride 208,
+// verified: skySunDir @176, refLatRad @192, geoK @200).
+static_assert(sizeof(Uniforms) == 208, "Uniforms layout must match Uniforms.swift");
+
+// Radians of latitude per meter of northing (1 / (111,320 m/deg · 180/π)).
+// Must match `Uniforms.metersPerDegree` in Uniforms.swift.
+constant float kRadPerMeterNorth = M_PI_F / (180.0f * 111320.0f);
+
+// Realistic sky colour for a view ray, given the real sun direction (ENU). Night is
+// dark, twilight glows orange near the sun + horizon, day is blue (paler at the
+// horizon). Blended by the sun's altitude so it tracks sunrise→day→sunset→night.
+static float3 skyColorFor(float3 rd, float3 sunDir) {
+    float sunEl = asin(clamp(sunDir.z, -1.0, 1.0)) * 57.2957795;   // degrees
+    float h = clamp(rd.z, 0.0, 1.0);                               // 0 horizon → 1 zenith
+    float alt = pow(h, 0.55);
+
+    float3 dayZen = float3(0.16, 0.38, 0.78);
+    float3 dayHor = float3(0.58, 0.72, 0.92);
+    float3 twiZen = float3(0.09, 0.11, 0.30);
+    float3 twiHor = float3(0.42, 0.26, 0.40);     // muted purple base; orange added below
+    float3 ngtZen = float3(0.015, 0.020, 0.045);
+    float3 ngtHor = float3(0.035, 0.045, 0.085);
+
+    float f1 = smoothstep(-16.0, -2.0, sunEl);    // night → twilight
+    float f2 = smoothstep(0.0, 12.0, sunEl);      // twilight → day
+    float3 zen = mix(mix(ngtZen, twiZen, f1), dayZen, f2);
+    float3 hor = mix(mix(ngtHor, twiHor, f1), dayHor, f2);
+    float3 col = mix(hor, zen, alt);
+
+    // Warm sunrise/sunset glow, strongest toward the sun + near the horizon.
+    float twi = (1.0 - smoothstep(2.0, 14.0, sunEl)) * smoothstep(-12.0, -2.0, sunEl);
+    float sunDot = max(0.0, dot(normalize(rd), sunDir));
+    float horizonBand = 1.0 - smoothstep(0.0, 0.45, h);
+    float glow = twi * pow(sunDot, 3.0) * (0.4 + 0.6 * horizonBand);
+    col = mix(col, float3(1.0, 0.45, 0.16), clamp(glow, 0.0, 0.85));
+    return col;
+}
 
 struct VSOut {
     float4 position [[position]];
@@ -73,33 +118,56 @@ static float proceduralHeight(float2 xy, constant Uniforms& u) {
 // ---------------------------------------------------------------------------
 constexpr sampler demSampler(filter::linear, address::clamp_to_edge, coord::normalized);
 
-// Returns elevation in meters, or a large negative sentinel when outside the grid.
-static float sampleDEM(float2 xy, constant Uniforms& u, texture2d<float> dem) {
-    float colf = (xy.x - u.gridMinENU.x) / u.cellSizeENU.x;
-    float rowFromBottom = (xy.y - u.gridMinENU.y) / u.cellSizeENU.y;
-    float uu = colf / u.gridDims.x;
-    float vv = 1.0 - rowFromBottom / u.gridDims.y;   // row 0 = north (top)
+// Sample one grid (normalized linear). Returns raw meters, or a large negative
+// sentinel when the point is outside this grid's footprint.
+static float sampleGrid(float2 xy, float2 gridMin, float2 cellSize, float2 dims,
+                        texture2d<float> tex) {
+    float colf = (xy.x - gridMin.x) / cellSize.x;
+    float rowFromBottom = (xy.y - gridMin.y) / cellSize.y;
+    float uu = colf / dims.x;
+    float vv = 1.0 - rowFromBottom / dims.y;          // row 0 = north (top)
     if (uu < 0.0 || uu > 1.0 || vv < 0.0 || vv > 1.0) return -10000.0;
-    float h = dem.sample(demSampler, float2(uu, vv)).r;
+    return tex.sample(demSampler, float2(uu, vv)).r;
+}
+
+// Two-tier DEM: the high-res near grid where it covers the point, else the coarse
+// far grid. Returns meters (post heightScale), or the sentinel where neither has data.
+static float terrainHeight(float2 xy, constant Uniforms& u,
+                           texture2d<float> dem, texture2d<float> demFar) {
+    if (u.useDEM <= 0.5) return proceduralHeight(xy, u);
+    // Undo the flat plate-carrée ENU mapping before sampling the lat/lon grid:
+    // (1) subtract the poleward geodesic bulge from the northing — a target due
+    // east is SEEN slightly poleward of east because sightlines follow great
+    // circles; (2) scale the easting by cos(refLat)/cos(lat) so meridian
+    // convergence tracks the sample's own latitude, not the origin's. Together
+    // these put distant rendered azimuths on true compass bearings (the flat
+    // mapping was off by ~0.5–1°+ at 120 km). Label anchors apply the identical
+    // forward mapping (TerrainMetalView.buildAnchors), so labels stay glued.
+    float yg = xy.y - xy.x * xy.x * u.geoK;
+    float latRad = u.refLatRad + yg * kRadPerMeterNorth;
+    float2 xyg = float2(xy.x * u.cosRefLat / max(cos(latRad), 1e-4f), yg);
+    float h = sampleGrid(xyg, u.gridMinENU, u.cellSizeENU, u.gridDims, dem);
+    if (h <= -9000.0 && u.useFar > 0.5) {
+        h = sampleGrid(xyg, u.gridMinENU2, u.cellSizeENU2, u.gridDims2, demFar);
+    }
+    if (h <= -9000.0) return -10000.0;
     return h * u.heightScale;
 }
 
-static float terrainHeight(float2 xy, constant Uniforms& u, texture2d<float> dem) {
-    return (u.useDEM > 0.5) ? sampleDEM(xy, u, dem) : proceduralHeight(xy, u);
-}
-
-static float3 terrainNormal(float2 xy, constant Uniforms& u, texture2d<float> dem) {
+static float3 terrainNormal(float2 xy, constant Uniforms& u,
+                            texture2d<float> dem, texture2d<float> demFar) {
     float ex = max(8.0, u.cellSizeENU.x);
     float ey = max(8.0, u.cellSizeENU.y);
-    float hL = terrainHeight(xy - float2(ex, 0), u, dem);
-    float hR = terrainHeight(xy + float2(ex, 0), u, dem);
-    float hD = terrainHeight(xy - float2(0, ey), u, dem);
-    float hU = terrainHeight(xy + float2(0, ey), u, dem);
+    float hL = terrainHeight(xy - float2(ex, 0), u, dem, demFar);
+    float hR = terrainHeight(xy + float2(ex, 0), u, dem, demFar);
+    float hD = terrainHeight(xy - float2(0, ey), u, dem, demFar);
+    float hU = terrainHeight(xy + float2(0, ey), u, dem, demFar);
     return normalize(float3(hL - hR, hD - hU, ex + ey));
 }
 
-static float surfaceZ(float2 xy, float t, constant Uniforms& u, texture2d<float> dem) {
-    return terrainHeight(xy, u, dem) - u.curvatureK * t * t;
+static float surfaceZ(float2 xy, float t, constant Uniforms& u,
+                      texture2d<float> dem, texture2d<float> demFar) {
+    return terrainHeight(xy, u, dem, demFar) - u.curvatureK * t * t;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,13 +184,18 @@ struct GBuffer {
 // linear eye depth (meters; FAR for sky/miss) to `outDepth`. Shared by the
 // perspective raymarch and the 360° panorama bake.
 static float4 marchAndShade(float3 ro, float3 rd, constant Uniforms& u,
-                            texture2d<float> dem, thread float& outDepth) {
+                            texture2d<float> dem, texture2d<float> demFar,
+                            thread float& outDepth) {
     const float tNear = 5.0;
     float tMax  = u.maxDistance;
     const float FAR = u.maxDistance * 4.0;       // sky/miss depth sentinel
 
-    float3 skyTop = float3(0.05, 0.06, 0.08);
-    float3 skyHorizon = float3(0.14, 0.16, 0.19);
+    // Baked sky RGB is discarded in the view passes (sky alpha 0 → recoloured live
+    // / transparent); it only shows where the panorama resample blends a fractional
+    // edge texel at the skyline. Keeping it PALE (near the haze colour below) makes
+    // that silhouette blend seamless instead of fringing the horizon dark grey.
+    float3 skyTop = float3(0.45, 0.52, 0.64);
+    float3 skyHorizon = float3(0.74, 0.80, 0.88);
 
     // Bound the march window using the curvature envelope: terrain can only
     // exist where the ray is below (globalMaxHeight - curvatureK*t^2). Outside
@@ -154,7 +227,7 @@ static float4 marchAndShade(float3 ro, float3 rd, constant Uniforms& u,
     for (int i = 0; i < 2048; i++) {
         if (t > tMax) break;
         float3 p = ro + rd * t;
-        float diff = p.z - surfaceZ(p.xy, t, u, dem);
+        float diff = p.z - surfaceZ(p.xy, t, u, dem, demFar);
         if (diff < 0.0) { hit = true; break; }
         prevT = t;
         float step = clamp(t * 0.0035, 12.0, cell * 4.0);
@@ -172,13 +245,13 @@ static float4 marchAndShade(float3 ro, float3 rd, constant Uniforms& u,
     for (int i = 0; i < 24; i++) {
         float tm = 0.5 * (tLo + tHi);
         float3 pm = ro + rd * tm;
-        float diff = pm.z - surfaceZ(pm.xy, tm, u, dem);
+        float diff = pm.z - surfaceZ(pm.xy, tm, u, dem, demFar);
         if (diff < 0.0) tHi = tm; else tLo = tm;
     }
     float tHit = 0.5 * (tLo + tHi);
     float3 hitP = ro + rd * tHit;
 
-    float3 n = terrainNormal(hitP.xy, u, dem);
+    float3 n = terrainNormal(hitP.xy, u, dem, demFar);
     float3 sun = normalize(u.sunDir.xyz);
     float diffuse = max(0.0, dot(n, sun));
     float sky = 0.5 + 0.5 * n.z;                 // sky/ambient occlusion proxy
@@ -195,6 +268,16 @@ static float4 marchAndShade(float3 ro, float3 rd, constant Uniforms& u,
     float shade = pow(light, kGamma);
     float3 color = float3(shade);
 
+    // Aerial perspective: real distance reads as a pale, low-contrast haze, so far
+    // ridges recede instead of standing as a flat grey wall at the horizon.
+    // Exponential extinction by range (Beer-Lambert), capped so terrain never fully
+    // dissolves. The haze tint is a faint cool grey that sits naturally under the
+    // live sky; terrainBright in the view pass dims it at night with the rest.
+    const float hazeDist     = 50000.0;          // ~e-folding range (m)
+    const float hazeStrength = 0.70;             // max blend toward haze at far range
+    const float3 hazeColor   = float3(0.80, 0.83, 0.88);
+    float haze = (1.0 - exp(-tHit / hazeDist)) * hazeStrength;
+    color = mix(color, hazeColor, haze);
 
     outDepth = tHit;
     return float4(color, 1.0);
@@ -203,14 +286,15 @@ static float4 marchAndShade(float3 ro, float3 rd, constant Uniforms& u,
 // Perspective raymarch: ray from camera basis + screen NDC.
 fragment GBuffer raymarchFragment(VSOut in [[stage_in]],
                                   constant Uniforms& u [[buffer(0)]],
-                                  texture2d<float> dem [[texture(0)]]) {
+                                  texture2d<float> dem [[texture(0)]],
+                                  texture2d<float> demFar [[texture(1)]]) {
     float2 ndc = float2(in.uv.x * 2.0 - 1.0, in.uv.y * 2.0 - 1.0);
     float3 rd = normalize(u.forward.xyz
                           + ndc.x * u.aspect * u.tanHalfFovY * u.right.xyz
                           + ndc.y * u.tanHalfFovY * u.up.xyz);
     GBuffer o;
     float depth;
-    o.color = marchAndShade(u.cameraPos.xyz, rd, u, dem, depth);
+    o.color = marchAndShade(u.cameraPos.xyz, rd, u, dem, demFar, depth);
     o.depth = depth;
     return o;
 }
@@ -222,7 +306,8 @@ fragment GBuffer raymarchFragment(VSOut in [[stage_in]],
 // what lets the panorama be baked at higher resolution.
 fragment float4 panoramaBakeFragment(VSOut in [[stage_in]],
                                      constant Uniforms& u [[buffer(0)]],
-                                     texture2d<float> dem [[texture(0)]]) {
+                                     texture2d<float> dem [[texture(0)]],
+                                     texture2d<float> demFar [[texture(1)]]) {
     float az = in.uv.x * 2.0 * M_PI_F;
     // uv.y maps to texture rows so that sampling v=0 (top) => +panoElevMax.
     // The view pass uses v = 0.5 - 0.5*el/panoElevMax, so match it here.
@@ -230,12 +315,30 @@ fragment float4 panoramaBakeFragment(VSOut in [[stage_in]],
     float ce = cos(el);
     float3 rd = float3(sin(az) * ce, cos(az) * ce, sin(el));  // ENU, az cw from north
     float depth;
-    float4 c = marchAndShade(u.cameraPos.xyz, rd, u, dem, depth);
+    float4 c = marchAndShade(u.cameraPos.xyz, rd, u, dem, demFar, depth);
     // Encode a sky/terrain mask in alpha: terrain = 1, sky/miss = 0. The 3D view
     // pass forces alpha to 1, so this is invisible to 3D mode; the AR view pass
     // uses it to make the sky transparent over the live camera.
     c.a = (depth >= u.maxDistance * 3.9) ? 0.0 : 1.0;
     return c;
+}
+
+// Per-texel HIT DISTANCE panorama (r32Float target; sky/miss = the FAR sentinel,
+// maxDistance*4). The label pipeline reads this back once per viewpoint and asks,
+// per peak: does the RENDER's ray toward it reach the peak's distance? Occlusion
+// judged this way can never disagree with the picture on screen — same march,
+// same eye, same DEM tiers, same curvature as the visible panorama.
+fragment float4 panoramaDepthFragment(VSOut in [[stage_in]],
+                                      constant Uniforms& u [[buffer(0)]],
+                                      texture2d<float> dem [[texture(0)]],
+                                      texture2d<float> demFar [[texture(1)]]) {
+    float az = in.uv.x * 2.0 * M_PI_F;
+    float el = u.panoElevMax * (2.0 * in.uv.y - 1.0);   // same row mapping as the bake
+    float ce = cos(el);
+    float3 rd = float3(sin(az) * ce, cos(az) * ce, sin(el));
+    float depth;
+    marchAndShade(u.cameraPos.xyz, rd, u, dem, demFar, depth);
+    return float4(depth, 0.0, 0.0, 1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +392,17 @@ fragment float4 panoramaViewFragment(VSOut in [[stage_in]],
 
     float uu = az / (2.0 * M_PI_F);
     float vv = 0.5 - 0.5 * el / u.panoElevMax;   // +panoElevMax -> top (v=0)
-    return float4(pano.sample(panoSampler, float2(uu, vv)).rgb, 1.0);
+    float4 c = pano.sample(panoSampler, float2(uu, vv));
+    // Sky (baked alpha 0) is recoloured live from the sun; terrain (alpha 1) keeps its
+    // baked shading but is dimmed by the sun's altitude so it isn't fully daylit under
+    // a night sky (full by day → a dim "moonlit" floor at night). The anti-aliased
+    // alpha gives a clean silhouette blend.
+    float sunEl = asin(clamp(u.skySunDir.z, -1.0, 1.0)) * 57.2957795;
+    // Night floor 0.34 (was 0.20): moonlit-bright terrain keeps visible relief
+    // and reads clearly against the near-black night sky.
+    float terrainBright = mix(0.34, 1.0, smoothstep(-7.0, 5.0, sunEl));
+    float3 sky = skyColorFor(rd, u.skySunDir.xyz);
+    return float4(mix(sky, c.rgb * terrainBright, c.a), 1.0);
 }
 
 // AR view: same panorama resample as `panoramaViewFragment`, but keeps the baked
@@ -351,9 +464,22 @@ fragment float4 panoramaViewEdgesFragment(VSOut in [[stage_in]],
     float gy = (bl + 2.0 * bc + br) - (tl + 2.0 * tc + tr);
     float g = length(float2(gx, gy));
 
-    // Thresholds tuned for the shaded-relief panorama; raise lo to thin the
-    // strokes, lower it to catch fainter internal ridges.
-    float e = smoothstep(0.08, 0.22, g);
+    // Two-tier edges so the overlay doesn't bury the real mountains: the
+    // SKYLINE (any neighbour is sky — the -0.5 sentinel) keeps the original
+    // sensitive threshold and full brightness, because it's the line you align
+    // against; INTERNAL shading creases need a much stronger gradient and draw
+    // slightly dimmer, which clears the dense hatching on busy rocky faces.
+    float minS = min(min(min(tl, tc), min(tr, ml)), min(min(mr, bl), min(bc, br)));
+    float e;
+    if (minS < 0.0) {
+        e = smoothstep(0.08, 0.22, g);                       // skyline: crisp
+    } else {
+        // Interior creases: stricter than the skyline so rocky faces don't
+        // hatch solid, but loose enough that secondary ridges still read.
+        // (0.17/0.42 left mid-ground ridges too faint; picked from a
+        // side-by-side of six densities on the Mt Hood west view.)
+        e = smoothstep(0.13, 0.34, g) * 0.8;
+    }
     return float4(e, e, e, e);                   // premultiplied white
 }
 

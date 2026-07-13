@@ -2,9 +2,16 @@ import SwiftUI
 
 /// The selected-peak card: name, elevation, distance, bearing, list actions, and
 /// "Stand here" to view the panorama from the summit. (Ported from RidgeLine;
-/// retargeted to mountainView's `AnnotatedPeak`.)
+/// retargeted to PeakPeek's `AnnotatedPeak`.)
 struct PeakInfoPanel: View {
     let peak: AnnotatedPeak
+    /// Line-of-sight verdict from the renderer's occlusion pass: true = a sightline
+    /// from the eye reaches the summit, false = terrain hides it. nil while the
+    /// pass for the current viewpoint hasn't finished (no badge shown).
+    let isVisible: Bool?
+    /// Water feature (lake/reservoir): hides the Climbed/Bookmark list chips —
+    /// you don't climb a lake, and the peak lists are summit lists.
+    let isWater: Bool
     let isClimbed: Bool
     let isBookmarked: Bool
     let onToggleClimbed: () -> Void
@@ -21,11 +28,13 @@ struct PeakInfoPanel: View {
             .padding(.trailing, 28)
 
             HStack(spacing: 8) {
-                listChip("Climbed", systemImage: "checkmark.seal.fill", active: isClimbed, tint: .green) {
-                    onToggleClimbed()
-                }
-                listChip("Bookmark", systemImage: "bookmark.fill", active: isBookmarked, tint: .orange) {
-                    onToggleBookmark()
+                if !isWater {
+                    listChip("Climbed", systemImage: "checkmark.seal.fill", active: isClimbed, tint: .green) {
+                        onToggleClimbed()
+                    }
+                    listChip("Bookmark", systemImage: "bookmark.fill", active: isBookmarked, tint: .orange) {
+                        onToggleBookmark()
+                    }
                 }
                 Button(action: onVisit) {
                     actionLabel("Stand here", systemImage: "figure.stand")
@@ -48,22 +57,49 @@ struct PeakInfoPanel: View {
     }
 
     private var titleBlock: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 8) {
             Text(peak.peak.name)
                 .font(.headline)
-            HStack(spacing: 10) {
+            // Elevation, distance, bearing — small accent-tinted icons on each.
+            HStack(spacing: 14) {
                 if peak.peak.elevationMeters > 0 {
-                    label(UnitText.elevation(meters: peak.peak.elevationMeters))
+                    stat("mountain.2.fill", UnitText.elevation(meters: peak.peak.elevationMeters))
                 }
-                label(distanceText)
-                label(compassText)
+                stat("ruler.fill", distanceText)
+                stat("safari.fill", compassText)
+                if let isVisible {
+                    visibilityBadge(isVisible)
+                }
             }
-            .font(.caption)
-            .opacity(0.8)
         }
     }
 
-    private func label(_ text: String) -> some View { Text(text) }
+    /// Green "Visible" / red "Hidden": whether the summit has a clear sightline
+    /// from the eye or terrain blocks it (renderer's occlusion verdict).
+    private func visibilityBadge(_ visible: Bool) -> some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(visible ? Color.green : Color.red)
+                .frame(width: 7, height: 7)
+            Text(visible ? "Visible" : "Hidden")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.85))
+        }
+        .fixedSize()
+    }
+
+    /// A small stat: an accent-tinted SF Symbol + its value.
+    private func stat(_ systemImage: String, _ value: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: systemImage)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(Color(TopoStyle.accent))
+            Text(value)
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.85))
+        }
+        .fixedSize()
+    }
 
     private func actionLabel(_ text: String, systemImage: String) -> some View {
         Label(text, systemImage: systemImage)

@@ -3,8 +3,12 @@ import Foundation
 /// Local sun and moon ephemeris (Jean Meeus' "Astronomical Algorithms"). No network.
 ///   - Sun: NOAA's low-accuracy algorithm (±0.01°).
 ///   - Moon: truncated Meeus ch. 47 series (±0.3°) + topocentric parallax.
-/// Azimuth is compass convention (0 = north, clockwise); elevation geometric.
-/// (Ported verbatim from RidgeLine.)
+/// Azimuth is compass convention (0 = north, clockwise); elevation APPARENT
+/// (atmospheric refraction included). The terrain is rendered with refraction
+/// folded in (the 0.87 curvature factor), so sky positions must be apparent too
+/// — geometric ones sat up to a solar diameter below the real sun at the
+/// horizon and mis-timed rise/set against the rendered ridge by ~2 minutes.
+/// (Ported from RidgeLine; refraction added.)
 enum Ephemeris {
 
     enum Body: Sendable {
@@ -34,8 +38,26 @@ enum Ephemeris {
         let ageDays: Double
     }
 
-    /// Standard rise/set altitude: −0.567° refraction − ~0.27° semidiameter.
-    static let riseSetAltitudeDeg: Double = -0.833
+    /// Rise/set target altitude for APPARENT positions (refraction is already in
+    /// the elevations): −0.27° ≈ the semidiameter, i.e. upper limb on the horizon.
+    static let riseSetAltitudeDeg: Double = -0.27
+
+    /// Atmospheric refraction (degrees) lifting a body at TRUE altitude `h`
+    /// (degrees): Sæmundsson's standard-atmosphere formula (Meeus ch. 16),
+    /// ~0.48° at the true horizon falling to ~0.02° at 45°. Below −1°, where the
+    /// formula diverges, the −1° value is held — such objects are culled or far
+    /// below any skyline anyway, and a smooth constant keeps windowPath's
+    /// culmination scan and crossing interpolation well-behaved.
+    static func refractionDeg(trueAltitudeDeg: Double) -> Double {
+        let h = max(trueAltitudeDeg, -1.0)
+        return 1.02 / tan((h + 10.3 / (h + 5.11)) * .pi / 180) / 60.0
+    }
+
+    /// Apply refraction: geometric → apparent position.
+    private static func apparent(_ p: SkyPosition) -> SkyPosition {
+        SkyPosition(azimuthDeg: p.azimuthDeg,
+                    elevationDeg: p.elevationDeg + refractionDeg(trueAltitudeDeg: p.elevationDeg))
+    }
 
     static func position(of body: Body, date: Date, latitude: Double, longitude: Double) -> SkyPosition {
         switch body {
@@ -57,7 +79,7 @@ enum Ephemeris {
         let eps = obliquityRad(T) + 0.00256 * cos(omega) * .pi / 180
         let dec = asin(sin(eps) * sin(lambda))
         let ra = atan2(cos(eps) * sin(lambda), cos(lambda))
-        return horizontal(raRad: ra, decRad: dec, jd: jd, latitude: latitude, longitude: longitude)
+        return apparent(horizontal(raRad: ra, decRad: dec, jd: jd, latitude: latitude, longitude: longitude))
     }
 
     static func moonPosition(date: Date, latitude: Double, longitude: Double) -> SkyPosition {
@@ -84,9 +106,12 @@ enum Ephemeris {
         let ra = atan2(sin(lambda) * cos(eps) - tan(beta) * sin(eps), cos(lambda))
         let geocentric = horizontal(raRad: ra, decRad: dec, jd: jd, latitude: latitude, longitude: longitude)
         let parallax = 0.95 * cos(geocentric.elevationDeg * .pi / 180)
+        // Order matters: parallax lowers the TRUE altitude first, refraction then
+        // lifts the topocentric result.
+        let el = geocentric.elevationDeg - parallax
         return SkyPosition(
             azimuthDeg: geocentric.azimuthDeg,
-            elevationDeg: geocentric.elevationDeg - parallax
+            elevationDeg: el + refractionDeg(trueAltitudeDeg: el)
         )
     }
 
@@ -107,18 +132,25 @@ enum Ephemeris {
         return MoonPhase(name: names[index], illuminatedFraction: illuminated, ageDays: age)
     }
 
-    /// One full diurnal lap containing `date`, anchored at the body's LOWER
-    /// CULMINATION so the open seam sits at the bottom of the sky.
+    /// One full diurnal lap for the CALENDAR DAY of `date`, anchored at the body's
+    /// LOWER CULMINATION so the open seam sits at the bottom of the sky.
+    ///
+    /// The lap is anchored to the day (via local noon), NOT to the exact `date`, so
+    /// scrubbing the time of day leaves the arc fixed in the sky — only the disc moves
+    /// along it. (Anchoring to `date` made the discrete back-scan re-pick the lower
+    /// culmination as you scrubbed, so the whole arc drifted up and jumped back.)
     static func windowPath(
         of body: Body, centeredOn date: Date, latitude: Double, longitude: Double,
         stepMinutes: Int = 10
     ) -> Path {
         let totalMinutes = body == .moon ? 1_490 : 1_440
-        var start = date
+        // Stable per-day anchor: local noon of the day containing `date`.
+        let anchor = Calendar.current.startOfDay(for: date).addingTimeInterval(12 * 3600)
+        var start = anchor
         var lowest = Double.infinity
         var scan = -totalMinutes
         while scan <= 0 {
-            let d = date.addingTimeInterval(TimeInterval(scan * 60))
+            let d = anchor.addingTimeInterval(TimeInterval(scan * 60))
             let el = position(of: body, date: d, latitude: latitude, longitude: longitude).elevationDeg
             if el < lowest {
                 lowest = el

@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct mountainViewApp: App {
+struct PeakPeekApp: App {
     var body: some Scene {
         WindowGroup {
             RootScreen()

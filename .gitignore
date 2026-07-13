@@ -13,3 +13,12 @@ DEMCache/
 
 # macOS
 .DS_Store
+Tools/PeakDB/cache/
+Tools/PeakDB/fetch.log
+Tools/PeakDB/cache_water/
+Tools/PeakDB/fetchwater.log
+
+# Raw source-data downloads (regenerable; the packed outputs live in Sources/App/Resources)
+Tools/PeakDB/geonames/
+Tools/PeakDB/geonames.log
+Tools/StarCatalog/hygdata_v41.csv

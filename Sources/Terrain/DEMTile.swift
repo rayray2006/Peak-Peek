@@ -243,6 +243,33 @@ struct DEMTile {
         u.gridDims = SIMD2<Float>(Float(ncols), Float(nrows))
         u.useDEM = 1
         u.globalMaxHeight = maxElevation * u.heightScale
+        Self.applyProjectionCorrection(to: &u, refLat: refLat)
+    }
+
+    /// ENU projection correction shared by both tiers: lets the shader undo the
+    /// single-cos(refLat) flattening per sample (meridian convergence + geodesic
+    /// bulge) so distant rendered azimuths land on true compass bearings.
+    static func applyProjectionCorrection(to u: inout Uniforms, refLat: Double) {
+        let refLatRad = refLat * .pi / 180
+        u.refLatRad = Float(refLatRad)
+        u.cosRefLat = Float(max(cos(refLatRad), 1e-4))
+        u.geoK = Float(tan(refLatRad) / (2 * Uniforms.enuEarthRadiusMeters))
+    }
+
+    /// Fill the FAR (coarse, wide-coverage) DEM tier — sampled by the shader only
+    /// where the near grid has no data. Also sets `globalMaxHeight` from this tile
+    /// (the far tile spans the whole scene, so it holds the true max for the
+    /// curvature march bound).
+    func applyFarDEMUniforms(to u: inout Uniforms, refLat: Double, refLon: Double) {
+        let (mLon, mLat) = metersPerDegree(atLat: refLat)
+        let minX = (xllcorner - refLon) * mLon
+        let minY = (yllcorner - refLat) * mLat
+        u.gridMinENU2 = SIMD2<Float>(Float(minX), Float(minY))
+        u.cellSizeENU2 = SIMD2<Float>(Float(cellsize * mLon), Float(cellsize * mLat))
+        u.gridDims2 = SIMD2<Float>(Float(ncols), Float(nrows))
+        u.useFar = 1
+        u.globalMaxHeight = maxElevation * u.heightScale
+        Self.applyProjectionCorrection(to: &u, refLat: refLat)
     }
 
     /// Bilinear elevation lookup (meters) at a geographic coordinate, for CPU

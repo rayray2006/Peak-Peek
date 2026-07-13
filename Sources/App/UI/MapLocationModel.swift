@@ -17,6 +17,9 @@ final class MapLocationModel: NSObject, ObservableObject {
     }
 
     func start() {
+        // Debug: -noLocationPrompt keeps simulator screenshot runs free of the
+        // permission dialog (same flag as the motion heading feed).
+        guard !ProcessInfo.processInfo.arguments.contains("-noLocationPrompt") else { return }
         manager.requestWhenInUseAuthorization()
         manager.startUpdatingLocation()
         if CLLocationManager.headingAvailable() {

@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>mountainView</string>
+	<string>PeakPeek</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -21,16 +21,20 @@
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>NSCameraUsageDescription</key>
-	<string>mountainView overlays the terrain on the live camera in AR mode.</string>
+	<string>PeakPeek overlays the terrain on the live camera in AR mode.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>mountainView uses your location to render the terrain panorama around you.</string>
+	<string>PeakPeek uses your location to render the terrain panorama around you.</string>
 	<key>NSMotionUsageDescription</key>
-	<string>mountainView uses motion sensors so you can look around by turning the phone.</string>
+	<string>PeakPeek uses motion sensors so you can look around by turning the phone.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>PeakPeek saves your captured panorama photos to your library.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 </dict>
 </plist>
