@@ -1164,15 +1164,17 @@ struct TerrainMetalView: UIViewRepresentable {
                 let radius = min(250, max(40, nearestOther * 0.45))
                 return tile.highestNear(lat: lat, lon: lon, radiusMeters: radius)
             }
-            // Never spawn the camera inside the hillside. The coordinate's BILINEAR
-            // height can sit many meters below the DEM cells right next to it
-            // (catalog/GPS coords vs AW3D30 misregistration — routine on summits
-            // and steep faces); the raymarch then hits rock at zero distance in
-            // every direction and the whole view (sky included) renders one flat
-            // grey. Keep the position but lift the eye to the local crest within
-            // ~1.5 cells — a real observer standing there sees over that relief.
-            let crest = tile.highestNear(lat: lat, lon: lon, radiusMeters: 45).elev
-            return (lat, lon, max(tile.elevation(lat: lat, lon: lon), crest))
+            // The eye stands EXACTLY on the DEM surface here (eye height is
+            // added in recomputeCamElev): the CPU `elevation(lat:lon:)` and the
+            // shader's `sampleGrid` resolve the same bilinear surface — both
+            // map index i to (i+0.5)·cell from the corner — so ground+eye can
+            // never start inside the rendered hillside. The old "lift to the
+            // 45 m crest" guard traded accuracy for that fear: in AR it pushed
+            // the render eye above the real one, which sank close ridges below
+            // their true elevation and erased their silhouettes; on lakes it
+            // climbed the shoreline bank. A nearby bump that legitimately
+            // blocks the view now blocks it, exactly as it does in reality.
+            return (lat, lon, tile.elevation(lat: lat, lon: lon))
         }
 
         /// Change the vertical exaggeration: rescale the eye to sit above the
