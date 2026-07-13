@@ -304,10 +304,18 @@ fragment GBuffer raymarchFragment(VSOut in [[stage_in]],
 // Single color output (no depth attachment): nothing downstream reads the bake's
 // depth, so emitting only color halves the bake's render-target memory — which is
 // what lets the panorama be baked at higher resolution.
+// Far-horizon ring (see FarHorizon.swift): terrain BEYOND the raymarched tiers,
+// reduced to (tan elevation, distance-km) per azimuth. Baking it in here means
+// every view mode, the edges Sobel, and the depth-map occlusion inherit distant
+// mountains for one 1D texture sample. An "empty" 1-texel ring (tan = -10) is
+// bound when the profile isn't ready, so there is no uniform flag.
+constexpr sampler ringSampler(filter::linear, address::repeat, coord::normalized);
+
 fragment float4 panoramaBakeFragment(VSOut in [[stage_in]],
                                      constant Uniforms& u [[buffer(0)]],
                                      texture2d<float> dem [[texture(0)]],
-                                     texture2d<float> demFar [[texture(1)]]) {
+                                     texture2d<float> demFar [[texture(1)]],
+                                     texture1d<float> ring [[texture(2)]]) {
     float az = in.uv.x * 2.0 * M_PI_F;
     // uv.y maps to texture rows so that sampling v=0 (top) => +panoElevMax.
     // The view pass uses v = 0.5 - 0.5*el/panoElevMax, so match it here.
@@ -320,6 +328,15 @@ fragment float4 panoramaBakeFragment(VSOut in [[stage_in]],
     // pass forces alpha to 1, so this is invisible to 3D mode; the AR view pass
     // uses it to make the sky transparent over the live camera.
     c.a = (depth >= u.maxDistance * 3.9) ? 0.0 : 1.0;
+    if (c.a < 0.5) {
+        float2 r = ring.sample(ringSampler, az / (2.0 * M_PI_F)).rg;
+        if (tan(el) < r.x) {
+            // A flat pale silhouette, fading toward the sky-horizon tint with
+            // distance — how a range genuinely reads from 120+ km out.
+            float t = clamp((r.y - 120.0) / 480.0, 0.0, 1.0);
+            c = float4(mix(float3(0.80, 0.83, 0.88), float3(0.74, 0.80, 0.88), t), 1.0);
+        }
+    }
     return c;
 }
 
@@ -331,13 +348,21 @@ fragment float4 panoramaBakeFragment(VSOut in [[stage_in]],
 fragment float4 panoramaDepthFragment(VSOut in [[stage_in]],
                                       constant Uniforms& u [[buffer(0)]],
                                       texture2d<float> dem [[texture(0)]],
-                                      texture2d<float> demFar [[texture(1)]]) {
+                                      texture2d<float> demFar [[texture(1)]],
+                                      texture1d<float> ring [[texture(2)]]) {
     float az = in.uv.x * 2.0 * M_PI_F;
     float el = u.panoElevMax * (2.0 * in.uv.y - 1.0);   // same row mapping as the bake
     float ce = cos(el);
     float3 rd = float3(sin(az) * ce, cos(az) * ce, sin(el));
     float depth;
     marchAndShade(u.cameraPos.xyz, rd, u, dem, demFar, depth);
+    if (depth >= u.maxDistance * 3.9) {
+        // Sky by the tiers — but the far-horizon ring may stand here; give it
+        // real depth so beyond-tier peaks occlude/reveal correctly in the label
+        // pipeline with no special cases.
+        float2 r = ring.sample(ringSampler, az / (2.0 * M_PI_F)).rg;
+        if (tan(el) < r.x) depth = r.y * 1000.0;        // km -> m
+    }
     return float4(depth, 0.0, 0.0, 1.0);
 }
 

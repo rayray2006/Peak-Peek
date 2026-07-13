@@ -436,6 +436,11 @@ struct TerrainMetalView: UIViewRepresentable {
             if let q = queuedRequest {
                 queuedRequest = nil
                 requestViewpoint(lat: q.lat, lon: q.lon, snapToSummit: q.snap)
+            } else if ringLandedMidBake {
+                // The far-horizon ring arrived after this bake's bands encoded:
+                // top the panorama up quietly so distant silhouettes appear.
+                ringLandedMidBake = false
+                bakeProgressive(progressFrom: 0) { self.report(.ready) }
             }
         }
         /// DEM-tile download progress for the "Loading tiles X of Y" readout. Touched
@@ -1038,6 +1043,7 @@ struct TerrainMetalView: UIViewRepresentable {
                 // Labels rebuild when the new panorama installs (bakeProgressive) —
                 // rebuilding here floated new-ref anchors over the still-old image.
                 rebuildSky()
+                updateFarHorizon()
                 NSLog("Viewpoint reused current tile (no fetch)")
                 bakeProgressive(progressFrom: 0) {
                     self.report(.ready)
@@ -1135,6 +1141,7 @@ struct TerrainMetalView: UIViewRepresentable {
                     self.recomputeCamElev()
                     // Labels rebuild on panorama install (see bakeProgressive).
                     self.rebuildSky()
+                    self.updateFarHorizon()
                     self.bakeProgressive(progressFrom: Self.loadShare) {
                         self.report(.ready)
                         self.onEyeElevation(Double(ground) + 1.6)
@@ -1175,6 +1182,60 @@ struct TerrainMetalView: UIViewRepresentable {
             // climbed the shoreline bank. A nearby bump that legitimately
             // blocks the view now blocks it, exactly as it does in reality.
             return (lat, lon, tile.elevation(lat: lat, lon: lon))
+        }
+
+        // MARK: Far-horizon ring
+
+        private var ringGeneration = 0
+        /// Set when the ring profile landed while a bake was already in flight
+        /// (the bands encoded without it); finishReload tops the panorama up.
+        var ringLandedMidBake = false
+
+        /// Compute the beyond-tier silhouette profile (FarHorizon) for the
+        /// current eye off-main and hand it to the renderer. Usually lands
+        /// before the full bake's bands encode; when it doesn't, a quiet
+        /// top-up bake runs after the reload settles.
+        func updateFarHorizon() {
+            guard FarHorizon.isAvailable else { return }
+            ringGeneration &+= 1
+            let gen = ringGeneration
+            let lat = refLat, lon = refLon
+            let eye = Double(groundElev) + 1.6
+            renderer?.ringTexture = nil            // stale viewpoint's ring must not leak in
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let profile = FarHorizon.profile(
+                    latitude: lat, longitude: lon, eyeElevation: eye) else { return }
+                DispatchQueue.main.async {
+                    guard let self, gen == self.ringGeneration,
+                          let renderer = self.renderer else { return }
+                    renderer.ringTexture = Self.makeRingTexture(profile, device: renderer.device)
+                    if self.isReloading {
+                        self.ringLandedMidBake = true
+                    } else {
+                        self.bakeProgressive(progressFrom: 0) { self.report(.ready) }
+                    }
+                }
+            }
+        }
+
+        private static func makeRingTexture(_ p: FarHorizon.Profile,
+                                            device: MTLDevice) -> MTLTexture? {
+            let d = MTLTextureDescriptor()
+            d.textureType = .type1D
+            d.pixelFormat = .rg16Float                     // filterable; km fits half
+            d.width = FarHorizon.bins
+            d.usage = .shaderRead
+            guard let t = device.makeTexture(descriptor: d) else { return nil }
+            var texels = [Float16](repeating: 0, count: FarHorizon.bins * 2)
+            for i in 0..<FarHorizon.bins {
+                texels[2 * i] = Float16(max(FarHorizon.emptyTanEl, min(10, p.tanEl[i])))
+                texels[2 * i + 1] = Float16(p.distance[i] / 1000)
+            }
+            texels.withUnsafeBytes {
+                t.replace(region: MTLRegionMake1D(0, FarHorizon.bins), mipmapLevel: 0,
+                          withBytes: $0.baseAddress!, bytesPerRow: FarHorizon.bins * 4)
+            }
+            return t
         }
 
         /// Change the vertical exaggeration: rescale the eye to sit above the

@@ -29,6 +29,22 @@ final class TerrainRenderer {
 
     /// Optional sampled DEM height texture (R32Float, value = meters).
     var heightTexture: MTLTexture?
+    /// Far-horizon ring profile (FarHorizon.swift): rg16Float 1D texture of
+    /// (tan elevation, distance km) per azimuth. Nil binds `emptyRing` so the
+    /// bake shaders need no flag.
+    var ringTexture: MTLTexture?
+    private lazy var emptyRing: MTLTexture? = {
+        let d = MTLTextureDescriptor()
+        d.textureType = .type1D
+        d.pixelFormat = .rg16Float
+        d.width = 1
+        d.usage = .shaderRead
+        guard let t = device.makeTexture(descriptor: d) else { return nil }
+        var texel: [Float16] = [-10, 0]           // far below every ray: never drawn
+        t.replace(region: MTLRegionMake1D(0, 1), mipmapLevel: 0,
+                  withBytes: &texel, bytesPerRow: 4)
+        return t
+    }()
     /// Coarse, wide-coverage far-field DEM, bound at texture(1). Sampled only where
     /// the near `heightTexture` has no data. nil → far tier disabled.
     var farHeightTexture: MTLTexture?
@@ -161,6 +177,7 @@ final class TerrainRenderer {
             if let tex = heightTexture { enc.setFragmentTexture(tex, index: 0) }
             // Far tier at index 1 (fall back to near so a texture is always bound).
             enc.setFragmentTexture(farHeightTexture ?? heightTexture, index: 1)
+        if let ring = ringTexture ?? emptyRing { enc.setFragmentTexture(ring, index: 2) }
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             enc.endEncoding()
         }
@@ -191,6 +208,7 @@ final class TerrainRenderer {
         enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
         if let t = heightTexture { enc.setFragmentTexture(t, index: 0) }
         enc.setFragmentTexture(farHeightTexture ?? heightTexture, index: 1)
+        if let ring = ringTexture ?? emptyRing { enc.setFragmentTexture(ring, index: 2) }
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
         cb.commit()
@@ -242,6 +260,7 @@ final class TerrainRenderer {
             enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
             if let t = heightTexture { enc.setFragmentTexture(t, index: 0) }
             enc.setFragmentTexture(farHeightTexture ?? heightTexture, index: 1)
+        if let ring = ringTexture ?? emptyRing { enc.setFragmentTexture(ring, index: 2) }
             let x = i * bandW
             enc.setScissorRect(MTLScissorRect(x: x, y: 0, width: min(bandW, w - x), height: h))
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
@@ -347,6 +366,7 @@ final class TerrainRenderer {
                 enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
                 if let tex = heightTexture { enc.setFragmentTexture(tex, index: 0) }
                 enc.setFragmentTexture(farHeightTexture ?? heightTexture, index: 1)
+        if let ring = ringTexture ?? emptyRing { enc.setFragmentTexture(ring, index: 2) }
                 let x = i * bandW
                 enc.setScissorRect(MTLScissorRect(
                     x: x, y: 0, width: min(bandW, panoW - x), height: panoH))
@@ -507,6 +527,7 @@ final class TerrainRenderer {
             enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
             if let tex = heightTexture { enc.setFragmentTexture(tex, index: 0) }
             enc.setFragmentTexture(farHeightTexture ?? heightTexture, index: 1)
+        if let ring = ringTexture ?? emptyRing { enc.setFragmentTexture(ring, index: 2) }
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             enc.endEncoding()
         }
