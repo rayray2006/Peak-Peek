@@ -1706,19 +1706,32 @@ struct TerrainMetalView: UIViewRepresentable {
                         // Coverage is the union of both tiers (far spans the whole scene).
                         let inNear = dem.contains(lat: peak.latitude, lon: peak.longitude)
                         let snapTile = inNear ? dem : (far ?? dem)
-                        guard snapTile.contains(lat: peak.latitude, lon: peak.longitude) else { return }
+                        // Beyond-tier GIANTS: the far-horizon ring renders (and
+                        // depth-tests) terrain out to FarHorizon.endMeters, so
+                        // ultra-prominent peaks — the only things visible at that
+                        // range — stay anchorable past the far tile.
+                        let isRingGiant = !isWater && !peak.isSaddle
+                            && (peak.prominenceMeters ?? 0) >= 1500 && peak.elevationMeters > 0
+                        let onTile = snapTile.contains(lat: peak.latitude, lon: peak.longitude)
+                        guard onTile || isRingGiant else { return }
+                        let reach = isRingGiant ? FarHorizon.endMeters : maxDist
                         // Cheap range gate on the CATALOG coord before the (costly) summit
                         // snap; the snap moves ≤300 m so the slack keeps boundary peaks.
                         let approxHoriz = hypot((peak.longitude - refLon) * mLon,
                                                 (peak.latitude - refLat) * mLat)
-                        guard approxHoriz <= maxDist + 500 else { return }
+                        guard approxHoriz <= reach + 500 else { return }
                         // Snap to the highest DEM cell near the catalog coord, and use the DEM
                         // elevation — so the label sits on the rendered summit, not the (often
                         // offset) catalog point/height. Near peaks snap on the high-res tile.
                         // Lakes AND saddles/gaps anchor at the DEM elevation of the point
                         // itself, no snap: a saddle is a LOW point between summits, and the
                         // summit snap dragged its label uphill onto the neighboring peak.
-                        let hi = isWater || peak.isSaddle
+                        // No DEM past the far tile: ring giants anchor at the
+                        // catalog coord + catalog elevation instead of snapping.
+                        let hi = !onTile
+                            ? (lat: peak.latitude, lon: peak.longitude,
+                               elev: Float(peak.elevationMeters))
+                            : isWater || peak.isSaddle
                             ? (lat: peak.latitude, lon: peak.longitude,
                                elev: snapTile.elevation(lat: peak.latitude, lon: peak.longitude))
                             : snapTile.highestNear(lat: peak.latitude, lon: peak.longitude,
@@ -1731,7 +1744,7 @@ struct TerrainMetalView: UIViewRepresentable {
                         let east = (hi.lon - refLon) * 111_320.0 * max(cos(hi.lat * .pi / 180), 0.01)
                         let north = (hi.lat - refLat) * mLat + east * east * tanRefOver2R
                         let horiz = (east * east + north * north).squareRoot()
-                        if horiz < 80 || horiz > maxDist { return }
+                        if horiz < 80 || horiz > reach { return }
                         let apparentUp = Double(hi.elev) * heightScale - curvatureK * horiz * horiz - camElevMeters
                         let sightAngle = atan2(apparentUp, horiz) * 180 / .pi
                         // Depth-map azimuth = the anchor's own rendered azimuth (NOT a
