@@ -1,6 +1,8 @@
 import Foundation
 
-/// Persisted "Climbed" / "Bookmarks" peak lists. (Ported from RidgeLine.)
+/// Persisted "Been" / "Saved" feature lists. (Ported from RidgeLine.)
+/// The case names are the persisted rawValues (regions.json-era manifests) —
+/// they keep their historical spelling; only the TITLES say Been/Saved.
 enum PeakListKind: String, CaseIterable, Codable, Identifiable {
     case climbed
     case wantToClimb
@@ -9,8 +11,8 @@ enum PeakListKind: String, CaseIterable, Codable, Identifiable {
 
     var title: String {
         switch self {
-        case .climbed: return "Climbed"
-        case .wantToClimb: return "Bookmarks"
+        case .climbed: return "Been"
+        case .wantToClimb: return "Saved"
         }
     }
 
@@ -40,7 +42,21 @@ struct SavedPeak: Identifiable, Codable, Hashable {
 @MainActor
 final class PeakListStore: ObservableObject {
     @Published private var saved: [String: SavedPeak] = [:] {
-        didSet { persist() }
+        didSet {
+            persist()
+            recomputeIDSets()
+        }
+    }
+
+    /// Memoized membership sets for the render path: RootScreen hands these to
+    /// the Metal view on every body evaluation, so rebuilding them from a full
+    /// list scan per render was pure churn.
+    private(set) var climbedIDs: Set<String> = []
+    private(set) var bookmarkedIDs: Set<String> = []
+
+    private func recomputeIDSets() {
+        climbedIDs = Set(saved.values.compactMap { $0.climbedAt != nil ? $0.id : nil })
+        bookmarkedIDs = Set(saved.values.compactMap { $0.wantToClimbAt != nil ? $0.id : nil })
     }
 
     private let defaults: UserDefaults
@@ -54,6 +70,7 @@ final class PeakListStore: ObservableObject {
            let decoded = try? JSONDecoder().decode([String: SavedPeak].self, from: data) {
             saved = decoded
         }
+        recomputeIDSets()
     }
 
     func contains(_ peak: Peak, in kind: PeakListKind) -> Bool {
@@ -97,7 +114,10 @@ final class PeakListStore: ObservableObject {
     }
 
     func count(in kind: PeakListKind) -> Int {
-        peaks(in: kind).count
+        switch kind {
+        case .climbed: return climbedIDs.count
+        case .wantToClimb: return bookmarkedIDs.count
+        }
     }
 
     private func persist() {

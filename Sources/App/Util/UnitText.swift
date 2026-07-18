@@ -17,6 +17,15 @@ enum UnitText {
         return digits + (usesFeet ? " ft" : " m")
     }
 
+    /// Nearest 8-point compass direction ("N", "NE", …) for a bearing in degrees.
+    /// One home for the table — it was copy-pasted in three views.
+    static func compassDirection(bearingDeg: Double) -> String {
+        let dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+        var h = bearingDeg.truncatingRemainder(dividingBy: 360)
+        if h < 0 { h += 360 }
+        return dirs[Int((h / 45).rounded()) % 8]
+    }
+
     /// Distance in mi (US) or km, with one decimal under 10 and meters under ~1 km.
     static func distance(meters: Double) -> String {
         if usesFeet {

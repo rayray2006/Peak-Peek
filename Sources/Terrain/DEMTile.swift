@@ -166,16 +166,25 @@ struct DEMTile {
     func saveBinary(to path: String) throws { try writeBinary(path: path) }
 
     private func writeBinary(path: String) throws {
-        var out = Data()
-        var m = Self.magic; out.append(Data(bytes: &m, count: 4))
-        var c = Int32(ncols); out.append(Data(bytes: &c, count: 4))
-        var r = Int32(nrows); out.append(Data(bytes: &r, count: 4))
-        var x = xllcorner; out.append(Data(bytes: &x, count: 8))
-        var y = yllcorner; out.append(Data(bytes: &y, count: 8))
-        var cs = cellsize; out.append(Data(bytes: &cs, count: 8))
-        var nd = nodata; out.append(Data(bytes: &nd, count: 4))
-        elevations.withUnsafeBytes { out.append(contentsOf: $0) }
-        try out.write(to: URL(fileURLWithPath: path))
+        // Header (40 bytes), then the raw Float32 grid streamed straight from the
+        // elevations buffer — assembling one contiguous Data first doubled the
+        // ~64 MB grid's footprint for the duration of every snapshot save.
+        var header = Data(capacity: 40)
+        var m = Self.magic; header.append(Data(bytes: &m, count: 4))
+        var c = Int32(ncols); header.append(Data(bytes: &c, count: 4))
+        var r = Int32(nrows); header.append(Data(bytes: &r, count: 4))
+        var x = xllcorner; header.append(Data(bytes: &x, count: 8))
+        var y = yllcorner; header.append(Data(bytes: &y, count: 8))
+        var cs = cellsize; header.append(Data(bytes: &cs, count: 8))
+        var nd = nodata; header.append(Data(bytes: &nd, count: 4))
+        FileManager.default.createFile(atPath: path, contents: nil)
+        let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+        defer { try? handle.close() }
+        try handle.write(contentsOf: header)
+        try elevations.withUnsafeBytes { raw in
+            try handle.write(contentsOf: Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
+                                              count: raw.count, deallocator: .none))
+        }
     }
 
     /// Public entry to load a prebuilt `.dembin` (e.g. bundled in the app).
@@ -184,7 +193,10 @@ struct DEMTile {
     }
 
     private static func loadBinary(path: String) throws -> DEMTile {
-        let d = try Data(contentsOf: URL(fileURLWithPath: path))
+        // Mapped, not read: the copy into `elev` below then streams from the
+        // mapping instead of first materializing a second ~64 MB Data buffer
+        // (which made the launch fast path spike to ~2× the grid size).
+        let d = try Data(contentsOf: URL(fileURLWithPath: path), options: .alwaysMapped)
         guard d.count >= 36 else { throw DEMError.parse("bin too small") }
         func read<T>(_ off: Int, _ t: T.Type) -> T { d.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: off, as: T.self) } }
         guard read(0, UInt32.self) == magic else { throw DEMError.parse("bad magic") }

@@ -18,8 +18,13 @@ struct Uniforms {
     /// Normalized direction *towards* the sun. `.w` unused.
     var sunDir: SIMD4<Float> = .zero
 
-    /// Render target size in pixels.
-    var resolution: SIMD2<Float> = .zero
+    /// Sun elevation in DEGREES derived from `skySunDir` — hoisted to the CPU so
+    /// the per-frame view pass doesn't recompute asin() per pixel. Default 90
+    /// (overhead) keeps headless/tool renders fully daylit.
+    var skySunElDeg: Float = 90
+    /// Terrain brightness for the view pass (1 by day → 0.34 moonlit floor at
+    /// night), derived from `skySunElDeg` alongside it.
+    var terrainBright: Float = 1
     /// tan(verticalFOV / 2).
     var tanHalfFovY: Float = 0
     /// width / height.
@@ -32,8 +37,8 @@ struct Uniforms {
     var curvatureK: Float = 0
     /// Vertical exaggeration applied to sampled heights (1.0 = true scale).
     var heightScale: Float = 1
-    /// Misc/animation parameter (procedural mode only).
-    var time: Float = 0
+    /// Unused; keeps the 208-byte layout (was the procedural `time` parameter).
+    var pad0: Float = 0
 
     // --- DEM sampling (Phase 1+) ---
     /// ENU (east,north) meters of the grid's south-west corner (lower-left).
@@ -86,7 +91,7 @@ struct Uniforms {
 
 extension Uniforms {
     /// Meters per degree of latitude (and of longitude at the equator) used by the
-    /// ENU mapping everywhere — must match `kMetersPerDegLat` in `Shaders.metal`.
+    /// ENU mapping everywhere — must match `kRadPerMeterNorth` in `Shaders.metal`.
     static let metersPerDegree = 111_320.0
     /// Sphere radius implied by that scale (111_320 · 180/π ≈ 6,378,100 m); the
     /// geodesic-bulge term `geoK` is derived from it on both CPU and GPU.

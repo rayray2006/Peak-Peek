@@ -1,6 +1,7 @@
 # Xcode / build output
 build/
 build-rel/
+build-rr/
 DerivedData/
 *.xcuserstate
 xcuserdata/
@@ -22,3 +23,6 @@ Tools/PeakDB/fetchwater.log
 Tools/PeakDB/geonames/
 Tools/PeakDB/geonames.log
 Tools/StarCatalog/hygdata_v41.csv
+
+# Regenerable website bundle (web/ is the source of truth)
+mountainView-website.zip

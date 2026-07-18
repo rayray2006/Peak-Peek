@@ -28,6 +28,15 @@
 	<string>PeakPeek uses motion sensors so you can look around by turning the phone.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>PeakPeek saves your captured panorama photos to your library.</string>
+	<key>UIAppFonts</key>
+	<array>
+		<string>SpaceGrotesk-Regular.ttf</string>
+		<string>SpaceGrotesk-Medium.ttf</string>
+		<string>SpaceGrotesk-SemiBold.ttf</string>
+		<string>SpaceGrotesk-Bold.ttf</string>
+		<string>IBMPlexMono-Regular.ttf</string>
+		<string>IBMPlexMono-Medium.ttf</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

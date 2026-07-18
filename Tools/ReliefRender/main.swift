@@ -21,6 +21,15 @@ func argInt(_ name: String, _ def: Int) -> Int {
     }
     return def
 }
+// Geographic coordinates must not round-trip through Float (~7 significant
+// digits ≈ 1 m of error at 121° W).
+func argDouble(_ name: String, _ def: Double) -> Double {
+    let args = CommandLine.arguments
+    if let i = args.firstIndex(of: name), i + 1 < args.count, let v = Double(args[i + 1]) {
+        return v
+    }
+    return def
+}
 func argStr(_ name: String, _ def: String) -> String {
     let args = CommandLine.arguments
     if let i = args.firstIndex(of: name), i + 1 < args.count {
@@ -38,8 +47,8 @@ let heightScale = argValue("--exaggeration", 1)
 let outPath = argStr("--out", "/tmp/relief.png")
 
 // Camera geographic location (default: Buckner Mountain summit, North Cascades).
-let camLat  = Double(argValue("--lat", 48.4631))
-let camLon  = Double(argValue("--lon", -121.0686))
+let camLat  = argDouble("--lat", 48.4631)
+let camLon  = argDouble("--lon", -121.0686)
 let eyeHeight = argValue("--eye", 2)
 let demPath = argStr("--dem", "DEMCache/cascades.asc")
 

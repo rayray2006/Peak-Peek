@@ -56,7 +56,6 @@ struct PanoramaCamera {
         u.up = SIMD4<Float>(camUp, 0)
         u.sunDir = SIMD4<Float>(normalize(sunDirection), 0)
 
-        u.resolution = SIMD2<Float>(Float(width), Float(height))
         u.tanHalfFovY = tanf((verticalFovDegrees * .pi / 180) / 2)
         u.aspect = Float(width) / Float(height)
 
@@ -64,7 +63,6 @@ struct PanoramaCamera {
         let effectiveRadius = earthRadius / (1 - refractionCoefficient)
         u.curvatureK = 1 / (2 * effectiveRadius)
         u.heightScale = heightScale
-        u.time = 0
         u.panoElevMax = panoElevMaxDegrees * .pi / 180
 
         return u

@@ -8,13 +8,14 @@ struct Uniforms {
     float4 right;
     float4 up;
     float4 sunDir;
-    float2 resolution;
+    float  skySunElDeg;   // sun elevation (deg) from skySunDir, CPU-hoisted
+    float  terrainBright; // view-pass terrain dimming (1 day … 0.34 night)
     float  tanHalfFovY;
     float  aspect;
     float  maxDistance;
     float  curvatureK;
     float  heightScale;
-    float  time;
+    float  pad0;          // unused; keeps the 208-byte layout
     // DEM sampling
     float2 gridMinENU;    // ENU of SW corner
     float2 cellSizeENU;   // meters per col, per row
@@ -42,11 +43,12 @@ static_assert(sizeof(Uniforms) == 208, "Uniforms layout must match Uniforms.swif
 // Must match `Uniforms.metersPerDegree` in Uniforms.swift.
 constant float kRadPerMeterNorth = M_PI_F / (180.0f * 111320.0f);
 
-// Realistic sky colour for a view ray, given the real sun direction (ENU). Night is
-// dark, twilight glows orange near the sun + horizon, day is blue (paler at the
-// horizon). Blended by the sun's altitude so it tracks sunrise→day→sunset→night.
-static float3 skyColorFor(float3 rd, float3 sunDir) {
-    float sunEl = asin(clamp(sunDir.z, -1.0, 1.0)) * 57.2957795;   // degrees
+// Realistic sky colour for a view ray, given the real sun direction (ENU) and its
+// elevation in degrees (CPU-hoisted — uniform-only, so computing asin() per pixel
+// was pure waste). Night is dark, twilight glows orange near the sun + horizon,
+// day is blue (paler at the horizon). Blended by the sun's altitude so it tracks
+// sunrise→day→sunset→night.
+static float3 skyColorFor(float3 rd, float3 sunDir, float sunEl) {
     float h = clamp(rd.z, 0.0, 1.0);                               // 0 horizon → 1 zenith
     float alt = pow(h, 0.55);
 
@@ -64,8 +66,9 @@ static float3 skyColorFor(float3 rd, float3 sunDir) {
     float3 col = mix(hor, zen, alt);
 
     // Warm sunrise/sunset glow, strongest toward the sun + near the horizon.
+    // `rd` arrives normalized from every caller.
     float twi = (1.0 - smoothstep(2.0, 14.0, sunEl)) * smoothstep(-12.0, -2.0, sunEl);
-    float sunDot = max(0.0, dot(normalize(rd), sunDir));
+    float sunDot = max(0.0, dot(rd, sunDir));
     float horizonBand = 1.0 - smoothstep(0.0, 0.45, h);
     float glow = twi * pow(sunDot, 3.0) * (0.4 + 0.6 * horizonBand);
     col = mix(col, float3(1.0, 0.45, 0.16), clamp(glow, 0.0, 0.85));
@@ -118,16 +121,40 @@ static float proceduralHeight(float2 xy, constant Uniforms& u) {
 // ---------------------------------------------------------------------------
 constexpr sampler demSampler(filter::linear, address::clamp_to_edge, coord::normalized);
 
-// Sample one grid (normalized linear). Returns raw meters, or a large negative
+// Apple GPU families before 9 (pre-A17/M3) cannot linear-filter 32-bit float
+// textures — a filter::linear sampler silently degrades to NEAREST there, so
+// every ~30 m DEM cell rendered as a flat step on most iPhones. The host sets
+// this from MTLDevice.supports32BitFloatFiltering at pipeline build; false
+// selects the manual-bilinear path below (compile-time branch, no per-sample
+// cost on capable GPUs). Defaults to the hardware path when a host doesn't
+// set it (Mac-only tools).
+constant bool kHWFilterF32 [[function_constant(0)]];
+constant bool useHWFilterF32 = is_function_constant_defined(kHWFilterF32) ? kHWFilterF32 : true;
+
+// Sample one grid (bilinear). Returns raw meters, or a large negative
 // sentinel when the point is outside this grid's footprint.
 static float sampleGrid(float2 xy, float2 gridMin, float2 cellSize, float2 dims,
                         texture2d<float> tex) {
-    float colf = (xy.x - gridMin.x) / cellSize.x;
-    float rowFromBottom = (xy.y - gridMin.y) / cellSize.y;
-    float uu = colf / dims.x;
-    float vv = 1.0 - rowFromBottom / dims.y;          // row 0 = north (top)
-    if (uu < 0.0 || uu > 1.0 || vv < 0.0 || vv > 1.0) return -10000.0;
-    return tex.sample(demSampler, float2(uu, vv)).r;
+    float colf = (xy.x - gridMin.x) / cellSize.x;     // texel units (dims = texture size)
+    float rowf = dims.y - (xy.y - gridMin.y) / cellSize.y;   // row 0 = north (top)
+    if (colf < 0.0 || colf > dims.x || rowf < 0.0 || rowf > dims.y) return -10000.0;
+    if (useHWFilterF32) {
+        return tex.sample(demSampler, float2(colf / dims.x, rowf / dims.y)).r;
+    }
+    // Manual bilinear, exact same texel math as the hardware sampler (sample
+    // point minus the half-texel center offset, clamp_to_edge).
+    float tx = colf - 0.5;
+    float ty = rowf - 0.5;
+    float fx = fract(tx), fy = fract(ty);
+    int x0 = int(floor(tx)), y0 = int(floor(ty));
+    int xMax = int(dims.x) - 1, yMax = int(dims.y) - 1;
+    uint x0c = uint(clamp(x0, 0, xMax)), x1c = uint(clamp(x0 + 1, 0, xMax));
+    uint y0c = uint(clamp(y0, 0, yMax)), y1c = uint(clamp(y0 + 1, 0, yMax));
+    float v00 = tex.read(uint2(x0c, y0c)).r;
+    float v10 = tex.read(uint2(x1c, y0c)).r;
+    float v01 = tex.read(uint2(x0c, y1c)).r;
+    float v11 = tex.read(uint2(x1c, y1c)).r;
+    return mix(mix(v00, v10, fx), mix(v01, v11, fx), fy);
 }
 
 // Two-tier DEM: the high-res near grid where it covers the point, else the coarse
@@ -173,12 +200,20 @@ static float surfaceZ(float2 xy, float t, constant Uniforms& u,
 // ---------------------------------------------------------------------------
 // Raymarcher
 // ---------------------------------------------------------------------------
-// Pass 1 output: shaded color + linear eye depth (meters). Depth is retained as
-// the bake/raymarch pipelines are MRT, though nothing consumes it downstream now.
-struct GBuffer {
-    float4 color [[color(0)]];
-    float  depth [[color(1)]];
-};
+
+// Baked sky RGB is discarded in the view passes (sky alpha 0 → recoloured live
+// / transparent); it only shows where the panorama resample blends a fractional
+// edge texel at the skyline. Keeping it PALE (near the haze colour in
+// marchAndShade) makes that silhouette blend seamless instead of fringing the
+// horizon dark grey.
+constant float3 kBakedSkyTop = float3(0.45, 0.52, 0.64);
+constant float3 kBakedSkyHorizon = float3(0.74, 0.80, 0.88);
+
+static float4 bakedSky(float3 rd, thread float& outDepth, float FAR) {
+    float k = clamp(rd.z * 1.5 + 0.2, 0.0, 1.0);
+    outDepth = FAR;
+    return float4(mix(kBakedSkyHorizon, kBakedSkyTop, k), 1.0);
+}
 
 // March a single ray from `ro` along `rd`, returning shaded color and writing
 // linear eye depth (meters; FAR for sky/miss) to `outDepth`. Shared by the
@@ -190,13 +225,6 @@ static float4 marchAndShade(float3 ro, float3 rd, constant Uniforms& u,
     float tMax  = u.maxDistance;
     const float FAR = u.maxDistance * 4.0;       // sky/miss depth sentinel
 
-    // Baked sky RGB is discarded in the view passes (sky alpha 0 → recoloured live
-    // / transparent); it only shows where the panorama resample blends a fractional
-    // edge texel at the skyline. Keeping it PALE (near the haze colour below) makes
-    // that silhouette blend seamless instead of fringing the horizon dark grey.
-    float3 skyTop = float3(0.45, 0.52, 0.64);
-    float3 skyHorizon = float3(0.74, 0.80, 0.88);
-
     // Bound the march window using the curvature envelope: terrain can only
     // exist where the ray is below (globalMaxHeight - curvatureK*t^2). Outside
     // the [t1,t2] interval no hit is possible, so sky rays exit quickly.
@@ -206,9 +234,7 @@ static float4 marchAndShade(float3 ro, float3 rd, constant Uniforms& u,
         float c = ro.z - u.globalMaxHeight;
         float disc = b * b - 4.0 * a * c;
         if (disc <= 0.0) {                       // never below envelope -> sky
-            float k = clamp(rd.z * 1.5 + 0.2, 0.0, 1.0);
-            outDepth = FAR;
-            return float4(mix(skyHorizon, skyTop, k), 1.0);
+            return bakedSky(rd, outDepth, FAR);
         }
         float t2 = (-b + sqrt(disc)) / (2.0 * a);
         tMax = min(tMax, max(tNear, t2));
@@ -223,26 +249,41 @@ static float4 marchAndShade(float3 ro, float3 rd, constant Uniforms& u,
     // "overhangs". Now the step stays near one cell out to mid range, then grows,
     // capped at a few cells so the far field is still reachable within the loop
     // budget. The binary refine below recovers the per-pixel silhouette.
-    float cell = clamp(min(u.cellSizeENU.x, u.cellSizeENU.y), 8.0, 90.0);
+    float cellNear = clamp(min(u.cellSizeENU.x, u.cellSizeENU.y), 8.0, 90.0);
+    // Beyond the near grid's reach only the COARSE far tile answers, so keeping
+    // the near-grid step cap there just burned the iteration budget: a ~10 m DEM
+    // (cap 40 m) exhausted 2048 steps around 68 km and silently rendered the
+    // rest of the 135 km range as sky. Past the near grid's half-extent, cap by
+    // the far tile's own cell size instead.
+    float cellFar = (u.useFar > 0.5)
+        ? clamp(min(u.cellSizeENU2.x, u.cellSizeENU2.y), cellNear, 400.0)
+        : cellNear;
+    // Half-DIAGONAL, not half-extent: diagonal rays stay inside the near grid
+    // past the half-extent, and coarsening the step while the fine DEM still
+    // answers could skip a thin ridge there. Overshooting costs only a few
+    // hundred iterations, comfortably inside the 2048 budget.
+    float nearReach = 0.5 * length(float2(u.gridDims.x * u.cellSizeENU.x,
+                                          u.gridDims.y * u.cellSizeENU.y));
     for (int i = 0; i < 2048; i++) {
         if (t > tMax) break;
         float3 p = ro + rd * t;
         float diff = p.z - surfaceZ(p.xy, t, u, dem, demFar);
         if (diff < 0.0) { hit = true; break; }
         prevT = t;
-        float step = clamp(t * 0.0035, 12.0, cell * 4.0);
+        float cap = (t < nearReach) ? cellNear : cellFar;
+        float step = clamp(t * 0.0035, 12.0, cap * 4.0);
         t += step;
     }
 
     if (!hit) {
-        float k = clamp(rd.z * 1.5 + 0.2, 0.0, 1.0);
-        outDepth = FAR;
-        return float4(mix(skyHorizon, skyTop, k), 1.0);
+        return bakedSky(rd, outDepth, FAR);
     }
 
-    // Binary refine for a crisp per-pixel silhouette.
+    // Binary refine for a crisp per-pixel silhouette. 14 bisections of a ≤1-step
+    // interval land well under 0.1 m — already invisible at any pixel scale (the
+    // previous 24 refined to ~2e-5 m, pure waste at a full terrain sample each).
     float tLo = prevT, tHi = t;
-    for (int i = 0; i < 24; i++) {
+    for (int i = 0; i < 14; i++) {
         float tm = 0.5 * (tLo + tHi);
         float3 pm = ro + rd * tm;
         float diff = pm.z - surfaceZ(pm.xy, tm, u, dem, demFar);
@@ -283,20 +324,35 @@ static float4 marchAndShade(float3 ro, float3 rd, constant Uniforms& u,
     return float4(color, 1.0);
 }
 
-// Perspective raymarch: ray from camera basis + screen NDC.
-fragment GBuffer raymarchFragment(VSOut in [[stage_in]],
-                                  constant Uniforms& u [[buffer(0)]],
-                                  texture2d<float> dem [[texture(0)]],
-                                  texture2d<float> demFar [[texture(1)]]) {
-    float2 ndc = float2(in.uv.x * 2.0 - 1.0, in.uv.y * 2.0 - 1.0);
-    float3 rd = normalize(u.forward.xyz
-                          + ndc.x * u.aspect * u.tanHalfFovY * u.right.xyz
-                          + ndc.y * u.tanHalfFovY * u.up.xyz);
-    GBuffer o;
+// View ray for a screen uv from the camera basis (shared by the perspective
+// raymarch and every panorama view pass).
+static float3 viewRay(float2 uv, constant Uniforms& u) {
+    float2 ndc = uv * 2.0 - 1.0;
+    return normalize(u.forward.xyz
+                     + ndc.x * u.aspect * u.tanHalfFovY * u.right.xyz
+                     + ndc.y * u.tanHalfFovY * u.up.xyz);
+}
+
+// Equirectangular texcoord for a view ray: azimuth (clockwise from north,
+// wrapping) → u, elevation → v with +panoElevMax at the top (v = 0). The
+// single home of the ray→panorama mapping contract; the bake writes rows to
+// match (see panoramaBakeFragment).
+static float2 panoUV(float3 rd, constant Uniforms& u) {
+    float az = atan2(rd.x, rd.y);
+    if (az < 0.0) az += 2.0 * M_PI_F;
+    float el = asin(clamp(rd.z, -1.0, 1.0));
+    return float2(az / (2.0 * M_PI_F), 0.5 - 0.5 * el / u.panoElevMax);
+}
+
+// Perspective raymarch: ray from camera basis + screen NDC. Color only — the
+// old MRT depth attachment was cleared, written, and stored every frame at the
+// supersampled resolution (~48 MB resident) with no downstream reader.
+fragment float4 raymarchFragment(VSOut in [[stage_in]],
+                                 constant Uniforms& u [[buffer(0)]],
+                                 texture2d<float> dem [[texture(0)]],
+                                 texture2d<float> demFar [[texture(1)]]) {
     float depth;
-    o.color = marchAndShade(u.cameraPos.xyz, rd, u, dem, demFar, depth);
-    o.depth = depth;
-    return o;
+    return marchAndShade(u.cameraPos.xyz, viewRay(in.uv, u), u, dem, demFar, depth);
 }
 
 // 360° panorama bake: equirectangular mapping. uv.x -> azimuth [0,2pi),
@@ -304,18 +360,30 @@ fragment GBuffer raymarchFragment(VSOut in [[stage_in]],
 // Single color output (no depth attachment): nothing downstream reads the bake's
 // depth, so emitting only color halves the bake's render-target memory — which is
 // what lets the panorama be baked at higher resolution.
-// Far-horizon ring (see FarHorizon.swift): terrain BEYOND the raymarched tiers,
-// reduced to (tan elevation, distance-km) per azimuth. Baking it in here means
-// every view mode, the edges Sobel, and the depth-map occlusion inherit distant
-// mountains for one 1D texture sample. An "empty" 1-texel ring (tan = -10) is
-// bound when the profile isn't ready, so there is no uniform flag.
-constexpr sampler ringSampler(filter::linear, address::repeat, coord::normalized);
+// Far-horizon strip (see FarHorizon.swift): terrain BEYOND the raymarched
+// tiers as a small az x elevation panorama of nearest-hit distances (km,
+// 0 = sky; rows span tan(el) in [-0.08, +0.08], row 0 = top). Baking it in
+// means every view mode and the edges Sobel inherit LAYERED distant ranges
+// for one texture sample. The LABEL depth pass deliberately ignores it —
+// ring terrain is unlabeled and must stay neutral sky to that pipeline. An
+// "empty" 1-texel strip (0 = sky) is bound when the profile isn't ready, so
+// there is no uniform flag.
+constexpr sampler ringSampler(filter::linear, s_address::repeat,
+                              t_address::clamp_to_edge, coord::normalized);
+
+// Nearest beyond-tier hit distance (km) for a ray, or 0 for sky.
+static float ringHitKm(texture2d<float> ring, float az, float el) {
+    float tanEl = tan(el);
+    if (tanEl >= 0.08) return 0.0;
+    float v = clamp((0.08 - tanEl) / 0.16, 0.0, 1.0);
+    return ring.sample(ringSampler, float2(az / (2.0 * M_PI_F), v)).r;
+}
 
 fragment float4 panoramaBakeFragment(VSOut in [[stage_in]],
                                      constant Uniforms& u [[buffer(0)]],
                                      texture2d<float> dem [[texture(0)]],
                                      texture2d<float> demFar [[texture(1)]],
-                                     texture1d<float> ring [[texture(2)]]) {
+                                     texture2d<float> ring [[texture(2)]]) {
     float az = in.uv.x * 2.0 * M_PI_F;
     // uv.y maps to texture rows so that sampling v=0 (top) => +panoElevMax.
     // The view pass uses v = 0.5 - 0.5*el/panoElevMax, so match it here.
@@ -329,12 +397,16 @@ fragment float4 panoramaBakeFragment(VSOut in [[stage_in]],
     // uses it to make the sky transparent over the live camera.
     c.a = (depth >= u.maxDistance * 3.9) ? 0.0 : 1.0;
     if (c.a < 0.5) {
-        float2 r = ring.sample(ringSampler, az / (2.0 * M_PI_F)).rg;
-        if (tan(el) < r.x) {
-            // A flat pale silhouette, fading toward the sky-horizon tint with
-            // distance — how a range genuinely reads from 120+ km out.
-            float t = clamp((r.y - 120.0) / 480.0, 0.0, 1.0);
-            c = float4(mix(float3(0.80, 0.83, 0.88), float3(0.74, 0.80, 0.88), t), 1.0);
+        float dk = ringHitKm(ring, az, el);
+        if (dk > 1.0) {
+            // Layered ranges, depth-graded: nearer masses a touch darker, the
+            // farthest melting into the sky-horizon tint. The NEAR end matches
+            // what tile terrain looks like at the tier boundary (base grays
+            // under ~70% haze), so ring and raymarched terrain meet without a
+            // visible color seam — the ring reads as more mountains, not a
+            // different material.
+            float t = clamp((dk - 150.0) / 450.0, 0.0, 1.0);
+            c = float4(mix(float3(0.72, 0.745, 0.785), float3(0.76, 0.80, 0.862), t), 1.0);
         }
     }
     return c;
@@ -348,21 +420,17 @@ fragment float4 panoramaBakeFragment(VSOut in [[stage_in]],
 fragment float4 panoramaDepthFragment(VSOut in [[stage_in]],
                                       constant Uniforms& u [[buffer(0)]],
                                       texture2d<float> dem [[texture(0)]],
-                                      texture2d<float> demFar [[texture(1)]],
-                                      texture1d<float> ring [[texture(2)]]) {
+                                      texture2d<float> demFar [[texture(1)]]) {
     float az = in.uv.x * 2.0 * M_PI_F;
     float el = u.panoElevMax * (2.0 * in.uv.y - 1.0);   // same row mapping as the bake
     float ce = cos(el);
     float3 rd = float3(sin(az) * ce, cos(az) * ce, sin(el));
     float depth;
     marchAndShade(u.cameraPos.xyz, rd, u, dem, demFar, depth);
-    if (depth >= u.maxDistance * 3.9) {
-        // Sky by the tiers — but the far-horizon ring may stand here; give it
-        // real depth so beyond-tier peaks occlude/reveal correctly in the label
-        // pipeline with no special cases.
-        float2 r = ring.sample(ringSampler, az / (2.0 * M_PI_F)).rg;
-        if (tan(el) < r.x) depth = r.y * 1000.0;        // km -> m
-    }
+    // Where only the far-horizon ring stands (beyond-tier haze), depth stays
+    // the FAR sentinel: ring terrain is deliberately UNLABELED, and to the
+    // label pipeline its texels must read as neutral sky — a hazy silhouette
+    // must never vouch for (or occlude) a within-tier feature.
     return float4(depth, 0.0, 0.0, 1.0);
 }
 
@@ -378,15 +446,13 @@ fragment float4 downsampleFragment(VSOut in [[stage_in]],
     uint h = src.get_height();
     uint2 base = uint2(in.position.xy) * ss;
     float3 acc = float3(0.0);
-    float n = 0.0;
     for (uint j = 0; j < ss; j++) {
         for (uint i = 0; i < ss; i++) {
             uint2 c = min(base + uint2(i, j), uint2(w - 1, h - 1));
             acc += src.read(c).rgb;
-            n += 1.0;
         }
     }
-    return float4(acc / n, 1.0);
+    return float4(acc / float(ss * ss), 1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -403,31 +469,32 @@ fragment float4 downsampleFragment(VSOut in [[stage_in]],
 constexpr sampler panoSampler(filter::linear, s_address::repeat,
                               t_address::clamp_to_edge, mag_filter::linear);
 
+// Silhouette reconstruction at VIEW rate. Zoomed in, one pano texel spans many
+// screen pixels, so the baked alpha's bilinear ramp (and with it the skyline)
+// smears into soft texel-scale stairs — "chunky" edges. Treating the alpha as
+// a coverage field and re-sharpening it to ~1 screen pixel (the SDF-
+// magnification trick: fwidth gives alpha-change-per-pixel, so 1.25·fwidth of
+// alpha ≈ 2.5 px of transition) keeps the terrain/sky edge crisp at any zoom.
+// Away from the silhouette alpha is flat 0 or 1 → untouched: no general blur.
+// Unzoomed, the ramp is already ~1 px wide → the smoothstep degenerates to a
+// near-identity, so this is a no-op exactly when the edge was already fine.
+static float silhouetteAlpha(float a) {
+    float f = min(1.25 * fwidth(a), 0.5);
+    return f < 1e-5 ? a : smoothstep(0.5 - f, 0.5 + f, a);
+}
+
 fragment float4 panoramaViewFragment(VSOut in [[stage_in]],
                                      constant Uniforms& u [[buffer(0)]],
                                      texture2d<float> pano [[texture(0)]]) {
-    float2 ndc = float2(in.uv.x * 2.0 - 1.0, in.uv.y * 2.0 - 1.0);
-    float3 rd = normalize(u.forward.xyz
-                          + ndc.x * u.aspect * u.tanHalfFovY * u.right.xyz
-                          + ndc.y * u.tanHalfFovY * u.up.xyz);
-
-    float az = atan2(rd.x, rd.y);                // clockwise from north
-    if (az < 0.0) az += 2.0 * M_PI_F;
-    float el = asin(clamp(rd.z, -1.0, 1.0));
-
-    float uu = az / (2.0 * M_PI_F);
-    float vv = 0.5 - 0.5 * el / u.panoElevMax;   // +panoElevMax -> top (v=0)
-    float4 c = pano.sample(panoSampler, float2(uu, vv));
-    // Sky (baked alpha 0) is recoloured live from the sun; terrain (alpha 1) keeps its
-    // baked shading but is dimmed by the sun's altitude so it isn't fully daylit under
-    // a night sky (full by day → a dim "moonlit" floor at night). The anti-aliased
+    float3 rd = viewRay(in.uv, u);
+    float4 c = pano.sample(panoSampler, panoUV(rd, u));
+    // Sky (baked alpha 0) is recoloured live from the sun; terrain (alpha 1) keeps
+    // its baked shading but is dimmed by the sun's altitude (u.terrainBright: full
+    // by day → a 0.34 "moonlit" floor at night, computed CPU-side with the sun
+    // elevation) so it isn't fully daylit under a night sky. The anti-aliased
     // alpha gives a clean silhouette blend.
-    float sunEl = asin(clamp(u.skySunDir.z, -1.0, 1.0)) * 57.2957795;
-    // Night floor 0.34 (was 0.20): moonlit-bright terrain keeps visible relief
-    // and reads clearly against the near-black night sky.
-    float terrainBright = mix(0.34, 1.0, smoothstep(-7.0, 5.0, sunEl));
-    float3 sky = skyColorFor(rd, u.skySunDir.xyz);
-    return float4(mix(sky, c.rgb * terrainBright, c.a), 1.0);
+    float3 sky = skyColorFor(rd, u.skySunDir.xyz, u.skySunElDeg);
+    return float4(mix(sky, c.rgb * u.terrainBright, silhouetteAlpha(c.a)), 1.0);
 }
 
 // AR view: same panorama resample as `panoramaViewFragment`, but keeps the baked
@@ -437,19 +504,9 @@ fragment float4 panoramaViewFragment(VSOut in [[stage_in]],
 fragment float4 panoramaViewARFragment(VSOut in [[stage_in]],
                                        constant Uniforms& u [[buffer(0)]],
                                        texture2d<float> pano [[texture(0)]]) {
-    float2 ndc = float2(in.uv.x * 2.0 - 1.0, in.uv.y * 2.0 - 1.0);
-    float3 rd = normalize(u.forward.xyz
-                          + ndc.x * u.aspect * u.tanHalfFovY * u.right.xyz
-                          + ndc.y * u.tanHalfFovY * u.up.xyz);
-
-    float az = atan2(rd.x, rd.y);                // clockwise from north
-    if (az < 0.0) az += 2.0 * M_PI_F;
-    float el = asin(clamp(rd.z, -1.0, 1.0));
-
-    float uu = az / (2.0 * M_PI_F);
-    float vv = 0.5 - 0.5 * el / u.panoElevMax;
-    float4 c = pano.sample(panoSampler, float2(uu, vv));
-    return float4(c.rgb * c.a, c.a);             // premultiplied; sky transparent
+    float4 c = pano.sample(panoSampler, panoUV(viewRay(in.uv, u), u));
+    float a = silhouetteAlpha(c.a);
+    return float4(c.rgb * a, a);                 // premultiplied; sky transparent
 }
 
 // Per-texel signal for edge detection: terrain luminance, or a low sentinel for
@@ -466,15 +523,7 @@ static float edgeSignal(texture2d<float> pano, float2 uv) {
 fragment float4 panoramaViewEdgesFragment(VSOut in [[stage_in]],
                                           constant Uniforms& u [[buffer(0)]],
                                           texture2d<float> pano [[texture(0)]]) {
-    float2 ndc = float2(in.uv.x * 2.0 - 1.0, in.uv.y * 2.0 - 1.0);
-    float3 rd = normalize(u.forward.xyz
-                          + ndc.x * u.aspect * u.tanHalfFovY * u.right.xyz
-                          + ndc.y * u.tanHalfFovY * u.up.xyz);
-
-    float az = atan2(rd.x, rd.y);
-    if (az < 0.0) az += 2.0 * M_PI_F;
-    float el = asin(clamp(rd.z, -1.0, 1.0));
-    float2 uv = float2(az / (2.0 * M_PI_F), 0.5 - 0.5 * el / u.panoElevMax);
+    float2 uv = panoUV(viewRay(in.uv, u), u);
     float2 t = 1.0 / float2(pano.get_width(), pano.get_height());
 
     float tl = edgeSignal(pano, uv + t * float2(-1, -1));

@@ -2,30 +2,62 @@ import SwiftUI
 
 /// Scrub the date + time of day to drive the sun, moon, stars and Milky Way.
 /// Terrain shading is fixed/baked, so this re-lights only the sky overlay.
-/// (Adapted from RidgeLine's TimePanel.)
+///
+/// Faithful to the template's Time sheet: a bordered date button that folds a
+/// mono calendar grid open, "6:42 PM / now" readout, a 1 px hairline scrubber
+/// with a white circle thumb over "12 AM · Noon · 11 PM" ticks, and the
+/// sunrise/sunset facts as a HORIZON / VISIBLE grid table. One layout for
+/// both orientations (the template's landscape card is the same stack,
+/// narrower); the hosting PanelCard supplies the sheet chrome + title.
 struct TimeControlsView: View {
     @ObservedObject var model: PanoramaViewModel
+    /// Landscape: identical content in a narrower, height-capped scroll.
+    var compact = false
     @Environment(\.dismiss) private var dismiss
 
     /// Everything here is expressed in the VIEWED location's timezone (offline, from
     /// its longitude), so "noon" on the slider is noon where you're standing and the
     /// clock matches the rise/set tags — not the device's zone.
+    ///
+    /// The formatters and calendar are SHARED statics (main-thread only, like all
+    /// of SwiftUI body): constructing a DateFormatter is one of the classically
+    /// expensive Foundation inits, and body re-evaluates on every scrub tick —
+    /// only the timezone ever differs.
+    private static let gregorian = Calendar(identifier: .gregorian)
+    private static let sharedTimeFormatter: DateFormatter = {
+        let f = DateFormatter(); f.timeStyle = .short; f.dateStyle = .none
+        return f
+    }()
+    private static let sharedDateFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "EEE, MMM d"
+        return f
+    }()
+    private static let sharedMonthFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "MMMM yyyy"
+        return f
+    }()
+
     private var calendar: Calendar {
-        var c = Calendar(identifier: .gregorian)
+        var c = Self.gregorian
         c.timeZone = model.displayTimeZone
         return c
     }
     private var timeFormatter: DateFormatter {
-        let f = DateFormatter(); f.timeStyle = .short; f.dateStyle = .none
+        let f = Self.sharedTimeFormatter
+        f.timeZone = model.displayTimeZone
+        return f
+    }
+    private var dateFormatter: DateFormatter {
+        let f = Self.sharedDateFormatter
+        f.timeZone = model.displayTimeZone
+        return f
+    }
+    private var monthFormatter: DateFormatter {
+        let f = Self.sharedMonthFormatter
         f.timeZone = model.displayTimeZone
         return f
     }
 
-    /// DatePicker (.date) preserves the time component, so passing it straight
-    /// through only changes the day.
-    private var dateBinding: Binding<Date> {
-        Binding(get: { model.displayDate }, set: { model.setDisplayDate($0) })
-    }
     /// Slider drives seconds-into-day on the currently selected day.
     private var secondsBinding: Binding<Double> {
         Binding(
@@ -34,83 +66,268 @@ struct TimeControlsView: View {
         )
     }
 
+    /// The template's date button expands the calendar grid underneath.
+    @State private var calendarOpen = false
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            header
-            datePickerCard
-            timeSlider
-        }
-        .padding(20)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        // Size the sheet to just the content (no empty space) so it covers as little
-        // of the sky as possible while scrubbing.
-        .presentationDetents([.height(280)])
-        .presentationDragIndicator(.visible)
-        // Colour the WHOLE sheet (incl. the safe-area strips + rounded corners); a
-        // plain `.background` only tints the content and leaves the sheet's default
-        // black chrome showing as bars top & bottom.
-        .presentationBackground(Color(TopoStyle.background))
-        // Don't dim the sky behind the menu — let the live sky stay bright (and
-        // interactive) while scrubbing time.
-        .presentationBackgroundInteraction(.enabled(upThrough: .height(280)))
-    }
-
-    private var header: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "clock")
-                .font(.system(size: 20, weight: .semibold))
-                .foregroundStyle(model.usesSimulatedTime ? Color.orange : .white.opacity(0.9))
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Time").font(.system(size: 18, weight: .semibold)).foregroundStyle(.white)
-                Text(model.usesSimulatedTime ? "Simulated sky" : "Live sky")
-                    .font(.system(size: 12)).foregroundStyle(.white.opacity(0.6))
+        let stack = VStack(alignment: .leading, spacing: 12) {
+            dateButton
+            if calendarOpen {
+                // Fade while the (transaction-animated) layout makes room /
+                // reclaims it — see the dateButton action for why the
+                // animation lives on the toggle, not here.
+                calendarGrid
+                    .transition(.opacity)
             }
-            Spacer()
-            // (Reset-to-now lives in the fixed top-left controls, next to
-            // Use GPS / Realign — not in this sheet.)
-        }
-    }
-
-    private var datePickerCard: some View {
-        HStack {
-            Text("Date").font(.system(size: 14, weight: .medium)).foregroundStyle(.white.opacity(0.85))
-            Spacer()
-            DatePicker("", selection: dateBinding, displayedComponents: .date)
-                .labelsHidden()
-                .datePickerStyle(.compact)
-                .environment(\.timeZone, model.displayTimeZone)
-                .tint(Color(TopoStyle.accent))
-        }
-        .padding(.horizontal, 14).padding(.vertical, 12)
-        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    private var timeSlider: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Time of day").font(.system(size: 14, weight: .medium)).foregroundStyle(.white.opacity(0.85))
-                Spacer()
-                Text(timeFormatter.string(from: model.displayDate))
-                    .font(.system(size: 14, weight: .semibold).monospacedDigit())
-                    .foregroundStyle(.white)
-            }
-            Slider(value: secondsBinding, in: 0...86_399, step: 60)
-                .tint(Color(TopoStyle.accent))
+            timeReadout
+            scrubber
             tickLabels
+            sunGrid
+                .padding(.top, 6)
         }
-        .padding(.horizontal, 14).padding(.vertical, 12)
-        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+        .padding(.horizontal, 20)
+        .padding(.top, 2)
+        .padding(.bottom, compact ? 14 : 22)
+
+        Group {
+            if compact {
+                ScrollView { stack }
+                    .frame(maxHeight: 300)
+            } else {
+                stack
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        // (No presentation modifiers: this view is hosted only inside the inline
+        // PanelCard, never as a sheet.)
+    }
+
+    // MARK: - Date button + calendar
+
+    /// Bordered, centered "📅 Wed, Jul 16" field, exactly the template's.
+    private var dateButton: some View {
+        Button {
+            // withAnimation (not .animation(value:) on the stack): the sheet's
+            // HEIGHT lives in the hosting PanelCard, outside this view — a
+            // local animation modifier can't reach it, so the card snapped
+            // shut while the grid faded (the jerky collapse). A transaction
+            // animates every layout affected by the toggle, card included.
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                calendarOpen.toggle()
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "calendar")
+                    .font(.system(size: 14, weight: .regular))
+                Text(dateFormatter.string(from: model.displayDate))
+                    .font(PPFont.ui(15, .semibold))
+            }
+            .foregroundStyle(TopoStyle.inkColor)
+            .frame(maxWidth: .infinity)
+            .frame(height: compact ? 38 : 40)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .strokeBorder(TopoStyle.hairline(0.18), lineWidth: 1)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// The template's calendar: mono month label, S M T W T F S header,
+    /// 26 pt circle days — selected day inverts to ink. Small chevrons page
+    /// months (the mock's grid shows a single month).
+    private var calendarGrid: some View {
+        let cal = calendar
+        let monthStart = cal.dateInterval(of: .month, for: model.displayDate)?.start ?? model.displayDate
+        let dayCount = cal.range(of: .day, in: .month, for: model.displayDate)?.count ?? 30
+        let leadingBlanks = (cal.component(.weekday, from: monthStart) - cal.firstWeekday + 7) % 7
+        let selectedDay = cal.component(.day, from: model.displayDate)
+        let columns = Array(repeating: GridItem(.flexible(), spacing: 2), count: 7)
+
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(monthFormatter.string(from: model.displayDate).uppercased())
+                    .font(PPFont.mono(11))
+                    .tracking(1.5)
+                    .foregroundStyle(TopoStyle.inkColor.opacity(0.55))
+                Spacer()
+                monthChevron("chevron.left", by: -1)
+                monthChevron("chevron.right", by: 1)
+            }
+            LazyVGrid(columns: columns, spacing: 2) {
+                ForEach(Array("SMTWTFS".enumerated()), id: \.offset) { _, c in
+                    Text(String(c))
+                        .font(PPFont.mono(9))
+                        .foregroundStyle(TopoStyle.inkColor.opacity(0.4))
+                }
+                ForEach(0..<leadingBlanks, id: \.self) { _ in
+                    Color.clear.frame(height: 26)
+                }
+                ForEach(1...dayCount, id: \.self) { day in
+                    let selected = day == selectedDay
+                    Button {
+                        selectDay(day)
+                    } label: {
+                        Text("\(day)")
+                            .font(PPFont.mono(11))
+                            .foregroundStyle(selected ? TopoStyle.paperColor : TopoStyle.inkColor)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 26)
+                            .background {
+                                if selected { Circle().fill(TopoStyle.inkColor) }
+                            }
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(TopoStyle.hairline(0.10), lineWidth: 1)
+        )
+    }
+
+    private func monthChevron(_ systemName: String, by months: Int) -> some View {
+        Button {
+            if let d = calendar.date(byAdding: .month, value: months, to: model.displayDate) {
+                model.setDisplayDate(d)
+            }
+        } label: {
+            Image(systemName: systemName)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(TopoStyle.inkColor.opacity(0.55))
+                .frame(width: 26, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Same month + time of day, new day number.
+    private func selectDay(_ day: Int) {
+        let cal = calendar
+        var comps = cal.dateComponents([.year, .month], from: model.displayDate)
+        comps.day = day
+        guard let dayStart = cal.date(from: comps) else { return }
+        model.setDisplayDate(dayStart.addingTimeInterval(secondsIntoDay(model.displayDate)))
+    }
+
+    // MARK: - Time readout + scrubber
+
+    /// "6:42 PM        now" — the current scrub position, baseline-aligned.
+    private var timeReadout: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(timeFormatter.string(from: model.displayDate))
+                .font(PPFont.ui(15, .semibold))
+                .foregroundStyle(TopoStyle.inkColor)
+            Spacer()
+            Text(model.usesSimulatedTime ? "simulated" : "now")
+                .font(PPFont.mono(11))
+                .foregroundStyle(TopoStyle.inkColor.opacity(0.5))
+        }
+    }
+
+    /// The template's scrubber: a full-width 1 px hairline with a 16 pt white
+    /// circle thumb (1.5 px ink ring) riding it. No fill, no system slider.
+    private var scrubber: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let frac = CGFloat(min(1, max(0, secondsBinding.wrappedValue / 86_399)))
+            ZStack(alignment: .leading) {
+                Rectangle()
+                    .fill(TopoStyle.hairline(0.14))
+                    .frame(height: 1)
+                Circle()
+                    .fill(.white)
+                    .overlay(Circle().strokeBorder(TopoStyle.inkColor, lineWidth: 1.5))
+                    .frame(width: 16, height: 16)
+                    .offset(x: frac * max(0, w - 16))
+            }
+            .frame(maxHeight: .infinity, alignment: .center)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        let f = min(1, max(0, (g.location.x - 8) / max(1, w - 16)))
+                        // Snap to whole minutes, like the old slider's step.
+                        let seconds = (f * 86_399 / 60).rounded() * 60
+                        secondsBinding.wrappedValue = Double(seconds)
+                    }
+            )
+        }
+        .frame(height: 24)
     }
 
     private var tickLabels: some View {
-        HStack(spacing: 0) {
-            ForEach(Array(["12 AM", "6 AM", "Noon", "6 PM", "12 AM"].enumerated()), id: \.offset) { idx, label in
-                Text(label)
-                if idx < 4 { Spacer() }
+        HStack {
+            Text("12 AM")
+            Spacer()
+            Text("Noon")
+            Spacer()
+            Text("11 PM")
+        }
+        .font(PPFont.mono(10))
+        .foregroundStyle(TopoStyle.inkColor.opacity(0.4))
+    }
+
+    // MARK: - Sun facts (the template's HORIZON / VISIBLE grid)
+
+    private func timeText(_ date: Date?) -> String {
+        date.map { timeFormatter.string(from: $0) } ?? "—"
+    }
+
+    /// ```
+    ///            HORIZON    VISIBLE
+    /// Sunrise    5:24 AM    6:02 AM
+    /// Sunset     8:58 PM    8:12 PM
+    /// ```
+    /// HORIZON = true rise/set at the sea-level horizon; VISIBLE = when the
+    /// sun actually clears / drops behind the terrain ridge at this viewpoint.
+    /// "—" until the renderer's celestial pass lands (or when the sun never
+    /// crosses, e.g. polar day/night).
+    private var sunGrid: some View {
+        let sun = model.sunTimes
+        return Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 6) {
+            GridRow {
+                Color.clear
+                    .gridCellUnsizedAxes([.horizontal, .vertical])
+                    .frame(maxWidth: .infinity)
+                gridHeader("Horizon")
+                gridHeader("Visible")
+            }
+            GridRow {
+                gridLabel("Sunrise")
+                gridTime(timeText(sun?.sunrise))
+                gridTime(timeText(sun?.firstVisible))
+            }
+            GridRow {
+                gridLabel("Sunset")
+                gridTime(timeText(sun?.sunset))
+                gridTime(timeText(sun?.lastVisible))
             }
         }
-        .font(.system(size: 10))
-        .foregroundStyle(.white.opacity(0.45))
+    }
+
+    private func gridHeader(_ text: String) -> some View {
+        Text(text.uppercased())
+            .font(PPFont.mono(10))
+            .tracking(1.2)
+            .foregroundStyle(TopoStyle.inkColor.opacity(0.45))
+    }
+
+    private func gridLabel(_ text: String) -> some View {
+        Text(text)
+            .font(PPFont.ui(14, .medium))
+            .foregroundStyle(TopoStyle.inkColor)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func gridTime(_ text: String) -> some View {
+        Text(text)
+            .font(PPFont.mono(12))
+            .foregroundStyle(TopoStyle.inkColor)
     }
 
     // MARK: - Date math

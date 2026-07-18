@@ -28,7 +28,24 @@ enum DEMFetcher {
     // MARK: Caches
 
     private final class Box { let tile: DEMTile; init(_ t: DEMTile) { tile = t } }
-    private static let memoryCache = NSCache<NSString, Box>()
+    private static let memoryCache: NSCache<NSString, Box> = {
+        let cache = NSCache<NSString, Box>()
+        // Stitched tiles reach 4096² × 4 B = 64 MB each; without a cost limit a
+        // few viewpoint moves could pin hundreds of MB until the OS forces
+        // eviction. Two near+far pairs' worth is plenty.
+        cache.totalCostLimit = 256 * 1024 * 1024
+        return cache
+    }()
+
+    /// Per-tile download outcome. Distinguishing a confirmed-ocean 404 from a
+    /// transient failure (offline, timeout, 5xx) is what keeps a Wi-Fi hiccup
+    /// from being stitched as sea level and then cached/persisted as if real.
+    private enum TileLoad: Sendable {
+        case data(Data)          // real tile bytes (network or disk cache)
+        case decoded(Data)       // decoded-cache hit — no gz needed at all
+        case ocean               // 404: genuinely no land here
+        case failed              // transient: retryable, NOT flat ocean
+    }
 
     /// Per-degree raw `.hgt.gz` cache (shared across overlapping boxes, survives
     /// launches → offline revisits and far fewer downloads). In Caches → the OS may
@@ -94,10 +111,16 @@ enum DEMFetcher {
     /// decode + copy into the output grid finishes. Together they let callers drive
     /// a progress readout spanning the download AND the (often longer) stitch —
     /// 2 × `tileCount(...)` is the matching total.
+    ///
+    /// `complete` is false when any tile failed TRANSIENTLY (offline, timeout):
+    /// the returned tile still renders — missing tiles void-fill, so the user
+    /// sees what could be loaded — but it is NOT memory-cached and callers must
+    /// not persist it, or a Wi-Fi hiccup becomes flat ocean across launches.
     static func fetch(lat: Double, lon: Double, radiusMeters: Double = 120_000,
                       maxGrid: Int = defaultMaxGrid,
                       onTileComplete: (@Sendable () -> Void)? = nil,
-                      onTileStitched: (@Sendable () -> Void)? = nil) async throws -> DEMTile {
+                      onTileStitched: (@Sendable () -> Void)? = nil)
+        async throws -> (tile: DEMTile, complete: Bool) {
         let key = boxKey(lat: lat, lon: lon, radiusMeters: radiusMeters) + "_g\(maxGrid)"
         if let hit = memoryCache.object(forKey: key as NSString) {
             // Already resident: no download or stitch, but tick both phases'
@@ -106,14 +129,18 @@ enum DEMFetcher {
                 onTileComplete?()
                 onTileStitched?()
             }
-            return hit.tile
+            return (hit.tile, true)
         }
 
-        let tile = try await assemble(lat: lat, lon: lon, radiusMeters: radiusMeters,
-                                      maxGrid: maxGrid, onTileComplete: onTileComplete,
-                                      onTileStitched: onTileStitched)
-        memoryCache.setObject(Box(tile), forKey: key as NSString)
-        return tile
+        let (tile, complete) = try await assemble(
+            lat: lat, lon: lon, radiusMeters: radiusMeters,
+            maxGrid: maxGrid, onTileComplete: onTileComplete,
+            onTileStitched: onTileStitched)
+        if complete {
+            memoryCache.setObject(Box(tile), forKey: key as NSString,
+                                  cost: tile.elevations.count * MemoryLayout<Float>.size)
+        }
+        return (tile, complete)
     }
 
     /// The 1°×1° skadi degree tiles the ±`radiusMeters` box around (lat, lon) spans.
@@ -149,7 +176,8 @@ enum DEMFetcher {
 
     private static func assemble(lat: Double, lon: Double, radiusMeters: Double, maxGrid: Int,
                                  onTileComplete: (@Sendable () -> Void)? = nil,
-                                 onTileStitched: (@Sendable () -> Void)? = nil) async throws -> DEMTile {
+                                 onTileStitched: (@Sendable () -> Void)? = nil)
+        async throws -> (tile: DEMTile, complete: Bool) {
         let mLat = 111_320.0
         let mLon = 111_320.0 * max(cos(lat * .pi / 180), 0.01)
         let south = lat - radiusMeters / mLat
@@ -179,19 +207,34 @@ enum DEMFetcher {
         let needed = neededTiles(lat: lat, lon: lon, radiusMeters: radiusMeters)
 
         // Download the covering tiles' raw gz concurrently (keyless GETs), ticking
-        // progress as each settles.
-        let gzData = await withTaskGroup(of: (Int, Int, Data?).self) { group -> [String: Data] in
+        // progress as each settles. Tiles whose DECODED bytes are already cached
+        // skip the gz disk read (10 MB/tile) and network entirely.
+        struct Loads { var gz: [String: Data] = [:]; var decoded: [String: Data] = [:]; var failures = 0 }
+        let loads = await withTaskGroup(of: (Int, Int, TileLoad).self) { group -> Loads in
             for t in needed {
-                group.addTask { (t.tLat, t.tLon, await loadHGTData(tLat: t.tLat, tLon: t.tLon)) }
+                group.addTask {
+                    if let hit = decodedCache.object(forKey: "\(t.tLat),\(t.tLon)" as NSString) {
+                        return (t.tLat, t.tLon, .decoded(hit as Data))
+                    }
+                    return (t.tLat, t.tLon, await loadHGTData(tLat: t.tLat, tLon: t.tLon))
+                }
             }
-            var out: [String: Data] = [:]
-            for await (tLat, tLon, data) in group {
-                if let data { out["\(tLat),\(tLon)"] = data }
+            var out = Loads()
+            for await (tLat, tLon, load) in group {
+                switch load {
+                case .data(let data): out.gz["\(tLat),\(tLon)"] = data
+                case .decoded(let raw): out.decoded["\(tLat),\(tLon)"] = raw
+                case .ocean: break
+                case .failed: out.failures += 1
+                }
                 onTileComplete?()
             }
             return out
         }
-        guard !gzData.isEmpty else { throw FetchError.empty }   // all ocean / unreachable
+        let gzData = loads.gz
+        let preDecoded = loads.decoded
+        // All ocean / unreachable.
+        guard !gzData.isEmpty || !preDecoded.isEmpty else { throw FetchError.empty }
 
         var elevations = [Float](repeating: voidSentinel, count: ncols * nrows)
         // Decode + copy the tiles CONCURRENTLY — with downloads usually disk-cache
@@ -206,8 +249,9 @@ enum DEMFetcher {
                 // Every tile ticks the stitch phase — including ocean/missing ones
                 // the guards skip — so the progress total stays exactly 2 × tileCount.
                 defer { onTileStitched?() }
-                guard let gz = gzData["\(t.tLat),\(t.tLon)"],
-                      let raw = decodedTile(tLat: t.tLat, tLon: t.tLon, gz: gz) else { return }
+                let key = "\(t.tLat),\(t.tLon)"
+                guard let raw = preDecoded[key]
+                    ?? decodedTile(tLat: t.tLat, tLon: t.tLon, gz: gzData[key]) else { return }
                 let n = Int((Double(raw.count / 2)).squareRoot().rounded())
                 guard n > 1, raw.count == n * n * 2 else { return }
 
@@ -244,12 +288,13 @@ enum DEMFetcher {
 
         fillVoids(&elevations, ncols: ncols, nrows: nrows)
         let maxElev = elevations.max() ?? 0
-        return DEMTile(
+        let tile = DEMTile(
             ncols: ncols, nrows: nrows,
             xllcorner: (Double(colMin) - 0.5 * Double(stride)) * arcsec,
             yllcorner: (Double(rowN) - (Double(nrows) - 0.5) * Double(stride)) * arcsec,
             cellsize: arcsec * Double(stride), nodata: voidSentinel,
             elevations: elevations, maxElevation: maxElev)
+        return (tile, loads.failures == 0)
     }
 
     /// Gunzipped degree tiles (~26 MB each decoded), shared between the near/far
@@ -263,10 +308,10 @@ enum DEMFetcher {
         return cache
     }()
 
-    private static func decodedTile(tLat: Int, tLon: Int, gz: Data) -> Data? {
+    private static func decodedTile(tLat: Int, tLon: Int, gz: Data?) -> Data? {
         let key = "\(tLat),\(tLon)" as NSString
         if let hit = decodedCache.object(forKey: key) { return hit as Data }
-        guard let raw = gunzip(gz) else { return nil }
+        guard let gz, let raw = gunzip(gz) else { return nil }
         decodedCache.setObject(raw as NSData, forKey: key, cost: raw.count)
         return raw
     }
@@ -318,9 +363,9 @@ enum DEMFetcher {
     /// twice on every cold region (~a third of the first-launch bytes). One
     /// task per tile name; concurrent requesters await the same task.
     private actor InflightDownloads {
-        private var tasks: [String: Task<Data?, Never>] = [:]
+        private var tasks: [String: Task<TileLoad, Never>] = [:]
 
-        func data(for name: String, download: @escaping @Sendable () async -> Data?) async -> Data? {
+        func load(for name: String, download: @escaping @Sendable () async -> TileLoad) async -> TileLoad {
             if let running = tasks[name] { return await running.value }
             let task = Task { await download() }
             tasks[name] = task
@@ -331,28 +376,30 @@ enum DEMFetcher {
     }
     private static let inflight = InflightDownloads()
 
-    private static func loadHGTData(tLat: Int, tLon: Int) async -> Data? {
+    private static func loadHGTData(tLat: Int, tLon: Int) async -> TileLoad {
         let (folder, name) = tileName(tLat: tLat, tLon: tLon)
         // Downloaded offline regions first (persistent), then the runtime cache.
-        if let d = try? Data(contentsOf: regionStoreDir.appendingPathComponent("\(name).hgt.gz")) { return d }
+        if let d = try? Data(contentsOf: regionStoreDir.appendingPathComponent("\(name).hgt.gz")) { return .data(d) }
         let cacheURL = hgtCacheDir.appendingPathComponent("\(name).hgt.gz")
-        if let cached = try? Data(contentsOf: cacheURL) { return cached }
+        if let cached = try? Data(contentsOf: cacheURL) { return .data(cached) }
 
-        return await inflight.data(for: name) {
+        return await inflight.load(for: name) {
             // Re-check inside the deduped task: a racing caller may have finished
             // (and written the cache) between our miss above and getting here.
-            if let cached = try? Data(contentsOf: cacheURL) { return cached }
+            if let cached = try? Data(contentsOf: cacheURL) { return .data(cached) }
             guard let url = URL(string:
-                "https://elevation-tiles-prod.s3.amazonaws.com/skadi/\(folder)/\(name).hgt.gz") else { return nil }
+                "https://elevation-tiles-prod.s3.amazonaws.com/skadi/\(folder)/\(name).hgt.gz") else { return .failed }
             NSLog("DEM tile download: %@", name)
             var req = URLRequest(url: url)
             req.timeoutInterval = 60
-            guard let (data, resp) = try? await URLSession.shared.data(for: req),
-                  (resp as? HTTPURLResponse)?.statusCode == 200, !data.isEmpty else {
-                return nil    // 404 = ocean tile, or transient failure
+            guard let (data, resp) = try? await URLSession.shared.data(for: req) else {
+                return .failed                          // offline / timeout: retryable
             }
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            if code == 404 { return .ocean }            // genuinely no land tile here
+            guard code == 200, !data.isEmpty else { return .failed }
             try? data.write(to: cacheURL)
-            return data
+            return .data(data)
         }
     }
 
@@ -370,6 +417,25 @@ enum DEMFetcher {
     }
 
     static func tileFileName(tLat: Int, tLon: Int) -> String { tileName(tLat: tLat, tLon: tLon).name }
+
+    /// Inverse of `tileFileName`: the SW-corner degree indices of a stored tile
+    /// ("N46W122" → (46, −122)) — lets the region picker draw downloaded coverage.
+    static func tileCoordinate(fromFileName name: String) -> (tLat: Int, tLon: Int)? {
+        guard name.count == 7,
+              let lat = Int(name.dropFirst(1).prefix(2)),
+              let lon = Int(name.dropFirst(4)) else { return nil }
+        let ns = name.first, ew = name.dropFirst(3).first
+        guard ns == "N" || ns == "S", ew == "E" || ew == "W" else { return nil }
+        return (ns == "S" ? -lat : lat, ew == "W" ? -lon : lon)
+    }
+
+    /// `regionTiles(...).count` without materializing the array — the region
+    /// picker reads this per map-camera frame while dragging.
+    static func regionTileCount(south: Double, north: Double, west: Double, east: Double) -> Int {
+        let s = min(south, north), n = max(south, north)
+        let w = min(west, east), e = max(west, east)
+        return (Int(floor(n)) - Int(floor(s)) + 1) * (Int(floor(e)) - Int(floor(w)) + 1)
+    }
 
     /// Ensure a tile is in the persistent region store. Returns bytes stored (0 = an
     /// ocean/void tile that 404s — nothing to keep but still "done"), or nil on a
@@ -397,6 +463,25 @@ enum DEMFetcher {
     /// Remove a downloaded tile from the persistent store (caller handles sharing).
     static func deletePersistentTile(name: String) {
         try? FileManager.default.removeItem(at: regionStoreDir.appendingPathComponent("\(name).hgt.gz"))
+    }
+
+    /// Tile names ("N46W122") currently in the persistent store — lets the
+    /// region store sweep orphans no manifest entry references.
+    static func persistentTileNames() -> [String] {
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: regionStoreDir, includingPropertiesForKeys: nil) else { return [] }
+        return items.compactMap { url in
+            let file = url.lastPathComponent
+            guard file.hasSuffix(".hgt.gz") else { return nil }
+            return String(file.dropLast(".hgt.gz".count))
+        }
+    }
+
+    /// On-disk size of one persistent tile (0 if absent) — the truthful basis
+    /// for a region's byte count, shared tiles included.
+    static func persistentTileBytes(name: String) -> Int {
+        let path = regionStoreDir.appendingPathComponent("\(name).hgt.gz").path
+        return (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int ?? 0
     }
 
     /// Total bytes currently used by the persistent region store.

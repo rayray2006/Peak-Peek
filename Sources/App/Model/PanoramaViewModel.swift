@@ -51,14 +51,6 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     @Published private(set) var pendingRecenter: Viewpoint?
     /// Real-world eye elevation (ground + eye height), reported by the renderer.
     @Published private(set) var eyeElevationMeters: Double?
-    /// Live look direction (compass degrees) and zoom factor (×), reported (~15 Hz)
-    /// by the renderer. NOT `@Published`: the compass/zoom HUD is drawn by the
-    /// `CompassZoomOverlayView` CALayer (updated directly in the renderer), so nothing
-    /// in SwiftUI reads these — publishing them fired `objectWillChange` 15×/s and
-    /// re-rendered the whole HUD (incl. the MapKit mini-map, which then struggled to
-    /// load tiles) while looking around. Kept as plain vars for any future read.
-    private(set) var headingDeg: Double?
-    private(set) var zoomFactor: Double = 1
     /// Vertical exaggeration fed to the renderer's `heightScale`. Fixed at 1.0 (true
     /// scale) — the user-facing Relief adjustment was removed.
     let terrainExaggeration: Double = 1.0
@@ -85,10 +77,28 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     /// (no network, no tz database): 15° of longitude ≈ 1 hour from UTC. Within ~an
     /// hour of a country's official clock — enough to place sunrise in the morning
     /// and sunset in the evening at the viewed location wherever the device sits.
-    static func approxTimeZone(longitudeDeg lon: Double) -> TimeZone {
+    /// nonisolated: pure longitude math, called from the celestial worker queue.
+    nonisolated static func approxTimeZone(longitudeDeg lon: Double) -> TimeZone {
         let secs = Int((lon / 15).rounded()) * 3600
         return TimeZone(secondsFromGMT: max(-12 * 3600, min(14 * 3600, secs)))
             ?? TimeZone(identifier: "UTC")!
+    }
+
+    /// Sun events for the day being viewed, computed by the renderer's celestial
+    /// pass (it owns the terrain skyline): TRUE sunrise/sunset against the
+    /// astronomical horizon, plus the window the sun is actually VISIBLE from
+    /// this viewpoint (above the terrain ridge). Shown on the Time card.
+    struct SunTimes: Equatable, Sendable {
+        var sunrise: Date?
+        var sunset: Date?
+        var firstVisible: Date?
+        var lastVisible: Date?
+    }
+    @Published private(set) var sunTimes: SunTimes?
+
+    /// The renderer finished a celestial pass for the current day/viewpoint.
+    func sunTimesResolved(_ times: SunTimes?) {
+        sunTimes = times
     }
 
     /// Scrub to a chosen instant (enters simulated-time mode).
@@ -115,6 +125,13 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         }
     }
 
+    deinit {
+        // Repeating timers are retained by the run loop until invalidated —
+        // without this a released VM would leave them firing no-op closures.
+        liveClock?.invalidate()
+        progressTimer?.invalidate()
+    }
+
     /// Peak overlays (Phase 2). Present so the directory/info UI compiles and the
     /// selection flow works; on-screen labels over the 3D view are deferred.
     @Published private(set) var allNearbyPeaks: [Peak] = []
@@ -130,6 +147,55 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     /// The renderer finished an occlusion pass for the current viewpoint.
     func visibleFeaturesResolved(_ ids: Set<String>) {
         visibleFeatureIDs = ids
+    }
+
+    /// HONEST visibility for a feature: true/false only when the renderer's
+    /// occlusion pass actually judged it this viewpoint; nil = unknown (no
+    /// pass yet, out of the candidate range, or a class the pipeline never
+    /// judges) — the UI shows no badge rather than a false "Hidden".
+    func visibilityVerdict(for peak: Peak) -> Bool? {
+        guard let ids = visibleFeatureIDs, let viewpoint else { return nil }
+        let isWater = nearbyLakes.contains { $0.id == peak.id }
+        let isCandidate = isWater || allNearbyPeaks.contains { $0.id == peak.id }
+        let distance = GeoMath.distanceMeters(
+            fromLatitude: viewpoint.latitude, fromLongitude: viewpoint.longitude,
+            toLatitude: peak.latitude, toLongitude: peak.longitude)
+        return Self.visibilityVerdict(
+            peakID: peak.id, isSaddle: peak.isSaddle,
+            elevationMeters: peak.elevationMeters,
+            prominenceMeters: peak.prominenceMeters, isWater: isWater,
+            distanceMeters: distance, visibleIDs: ids, isCandidate: isCandidate)
+    }
+
+    /// The pure verdict logic (also used per-row by the search, off-main).
+    /// Absence from `visibleIDs` means "Hidden" ONLY where the pipeline
+    /// actually judges features: water within the near tier (40 km), peaks
+    /// within the far tier (`FarHorizon.farTileMeters`), and beyond that only
+    /// real summits (elevation known, not a saddle) out to the ring's reach.
+    /// Everything else — and anything under 100 m (you're standing on it) —
+    /// is unknown, not hidden.
+    nonisolated static func visibilityVerdict(
+        peakID: String, isSaddle: Bool, elevationMeters: Double,
+        prominenceMeters: Double?, isWater: Bool,
+        distanceMeters: Double, visibleIDs: Set<String>, isCandidate: Bool
+    ) -> Bool? {
+        if visibleIDs.contains(peakID) { return true }
+        // Past the ring's reach NOTHING terrestrial can crest the horizon —
+        // Earth curvature settles it without a render pass, so "Occluded" is
+        // honest even for features the pipeline never looked at (a search hit
+        // half the world away).
+        if distanceMeters > FarHorizon.endMeters { return false }
+        guard isCandidate, distanceMeters > 100 else { return nil }
+        if isWater { return distanceMeters <= 40_000 ? false : nil }
+        if distanceMeters <= FarHorizon.farTileMeters { return false }
+        // Ring band (far tile → ring reach): only features big enough to be
+        // perceptible at their distance are judged at all — for the rest,
+        // neither "Visible" nor "Occluded" would mean anything.
+        guard FarHorizon.perceptible(prominenceMeters: prominenceMeters,
+                                     elevationMeters: elevationMeters,
+                                     distanceMeters: distanceMeters) else { return nil }
+        if !isSaddle, elevationMeters > 0 { return false }
+        return nil
     }
 
     /// True once the user explicitly teleported (map pin / peak visit / debug) —
@@ -158,10 +224,19 @@ final class PanoramaViewModel: NSObject, ObservableObject {
 
     private let peakStore: PeakStore
     private let location = CLLocationManager()
+    /// Debug (-noLocationPrompt): simulator screenshot runs must never be
+    /// blocked by the location-permission dialog (the same flag also guards the
+    /// heading + map location requests). The GPS feed simply stays off.
+    private var suppressLocationPrompt: Bool {
+        ProcessInfo.processInfo.arguments.contains("-noLocationPrompt")
+    }
     /// How far the device must move from the baked viewpoint before the HUD offers a
     /// "Recenter". Big enough that normal driving doesn't nag, small enough that the
     /// held panorama hasn't drifted much (distant terrain barely shifts under this).
-    private let recenterDistanceMeters: Double = 600
+    // Very sensitive on purpose: the button appears as soon as the fix is
+    // meaningfully off the standing viewpoint (jitter hysteresis: queueGPS
+    // clears the offer when the fix drifts back inside).
+    private let recenterDistanceMeters: Double = 50
 
     init(peakStore: PeakStore = PeakStore()) {
         self.peakStore = peakStore
@@ -198,15 +273,17 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         // raises the Recenter pill instead of reloading.
         if let saved = Self.loadSavedViewpoint() {
             teleport(to: saved.viewpoint, manual: saved.manual)
-            if !saved.manual {
+            if !saved.manual, !suppressLocationPrompt {
                 location.requestWhenInUseAuthorization()
                 location.startUpdatingLocation()
             }
             return
         }
         status = .locating
-        location.requestWhenInUseAuthorization()
-        location.startUpdatingLocation()
+        if !suppressLocationPrompt {
+            location.requestWhenInUseAuthorization()
+            location.startUpdatingLocation()
+        }
         // Safety net for environments with no GPS (e.g. a simulator with no
         // simulated location): if nothing resolves in 12 s, show the demo so the
         // screen isn't blank. A real fix that lands later still replaces it.
@@ -241,7 +318,17 @@ final class PanoramaViewModel: NSObject, ObservableObject {
             if case .rendering = status {} else { status = .preparingTerrain(progress: nil) }
         }
         loadPeaks(around: viewpoint)
+        reannotateSelection()
         Self.saveViewpoint(viewpoint, manual: isManualViewpoint)
+    }
+
+    /// Recompute the selected peak's annotation for the CURRENT eye. Distance,
+    /// bearing and the marker direction are baked in at selection time — after
+    /// a teleport / Use GPS they went stale, freezing the info card and leaving
+    /// the off-screen direction marker floating toward the old viewpoint's sky.
+    private func reannotateSelection() {
+        guard let peak = selectedPeak?.peak else { return }
+        select(peak)
     }
 
     // MARK: - Last-viewpoint persistence (instant reopen)
@@ -327,9 +414,15 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     private var lastPublishedPct = -1
 
     private func setProgressTarget(_ target: Double, rendering: Bool) {
-        // A fresh load (first report, or a target well below what's shown)
-        // resets the sweep; within one load progress only moves forward.
-        if progressTimer == nil || target + 0.02 < shownProgress {
+        // A fresh sweep (timer nil) starts at the first report; within one
+        // load the shown value NEVER moves backward. Every load begins with a
+        // non-progress status (.preparingTerrain(nil)) that stops the previous
+        // sweep, so there is no "new load with a lower target" case to catch
+        // here. The old extra reset ("target well below shown") misfired
+        // MID-load: the creep runs up to 5 pts past the last real report, so
+        // any real report landing under the crept value snapped the displayed
+        // percent visibly backward.
+        if progressTimer == nil {
             shownProgress = target
             targetProgress = target
         }
@@ -384,15 +477,11 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     }
 
     func eyeElevationResolved(_ meters: Double?) {
+        let changed = meters != eyeElevationMeters
         eyeElevationMeters = meters
-    }
-
-    func headingResolved(_ deg: Double) {
-        headingDeg = deg
-    }
-
-    func zoomResolved(_ factor: Double) {
-        zoomFactor = factor
+        // The selected peak's elevation ANGLE depends on the eye height, which
+        // only resolves after the new render lands — refresh the annotation.
+        if changed { reannotateSelection() }
     }
 
     // MARK: - Peaks (Phase 2 wiring; no on-screen labels yet)
@@ -445,11 +534,12 @@ final class PanoramaViewModel: NSObject, ObservableObject {
                 for peak in global + bundled + packs + osm where ids.insert(peak.id).inserted {
                     merged.append(peak)
                 }
-                // Lakes: label range only (120 km — matches the anchor cull), so
-                // the published set stays small even in lake country.
+                // Lakes: label range only (the far-tile radius — matches the
+                // anchor cull), so the published set stays small even in lake
+                // country.
                 let lakes = GlobalPeakDatabase.lakes?.peaks(
                     nearLatitude: viewpoint.latitude, longitude: viewpoint.longitude,
-                    withinMeters: 120_000
+                    withinMeters: FarHorizon.farTileMeters
                 ) ?? []
                 return (merged, lakes)
             }.value
@@ -480,10 +570,6 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         selectedPeak = AnnotatedPeak(
             peak: peak, azimuthDeg: bearing, elevationAngleDeg: angle, distanceMeters: distance
         )
-    }
-
-    func selectAnnotated(_ annotated: AnnotatedPeak?) {
-        selectedPeak = annotated
     }
 
     /// Stand on a peak: teleport the eye to the summit coordinate.

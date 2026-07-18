@@ -42,90 +42,45 @@ enum PeakPackService {
     private static let cacheVersion = "v1"
 
     static func cachedPeaks(aroundLatitude lat: Double, longitude lon: Double, radiusKm: Double) -> [Peak] {
-        var merged: [Peak] = []
+        // Linear-time dedup (see OSMPeakService.LinearPeakMerge) — the old
+        // contains(where:) scan was the same O(n²) pattern that took seconds
+        // over the OSM tile caches.
+        var merge = OSMPeakService.LinearPeakMerge()
         for pack in packsCovering(latitude: lat, longitude: lon, radiusKm: radiusKm) {
             guard let peaks = loadCachedPack(pack) ?? loadBundledPack(pack) else { continue }
-            append(peaks, to: &merged, latitude: lat, longitude: lon, radiusKm: radiusKm)
+            for peak in peaks where GeoMath.distanceMeters(
+                fromLatitude: lat, fromLongitude: lon,
+                toLatitude: peak.latitude, toLongitude: peak.longitude
+            ) <= radiusKm * 1000 {
+                merge.insert(peak)
+            }
         }
-        return merged
+        return merge.peaks
     }
 
     static func allCachedPeaks() -> [Peak] {
-        var merged: [Peak] = []
+        var merge = OSMPeakService.LinearPeakMerge()
         for pack in manifest()?.packs ?? [] {
             guard let peaks = loadCachedPack(pack) else { continue }
-            append(peaks, to: &merged)
+            for peak in peaks { merge.insert(peak) }
         }
-        return merged
-    }
-
-    @discardableResult
-    static func downloadRegion(latitude lat: Double, longitude lon: Double, radiusKm: Double) async -> [Peak] {
-        let packs = packsCovering(latitude: lat, longitude: lon, radiusKm: radiusKm)
-        var merged: [Peak] = []
-        for pack in packs {
-            guard let peaks = await ensurePack(pack) else { continue }
-            append(peaks, to: &merged, latitude: lat, longitude: lon, radiusKm: radiusKm)
-        }
-        return merged
-    }
-
-    static func downloadedBytes() -> Int {
-        let urls = (try? FileManager.default.contentsOfDirectory(
-            at: cacheDirectory(), includingPropertiesForKeys: [.fileSizeKey]
-        )) ?? []
-        return urls.reduce(0) { total, url in
-            total + (((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize) ?? 0)
-        }
-    }
-
-    @discardableResult
-    static func clearCache() -> Int {
-        let freed = downloadedBytes()
-        let urls = (try? FileManager.default.contentsOfDirectory(
-            at: cacheDirectory(), includingPropertiesForKeys: nil
-        )) ?? []
-        for url in urls where url.pathExtension == "json" {
-            try? FileManager.default.removeItem(at: url)
-        }
-        return freed
-    }
-
-    static func availablePackCount() -> Int {
-        manifest()?.packs.count ?? 0
+        return merge.peaks
     }
 
     static func packsCovering(latitude lat: Double, longitude lon: Double, radiusKm: Double) -> [Pack] {
         (manifest()?.packs ?? []).filter { $0.intersects(latitude: lat, longitude: lon, radiusKm: radiusKm) }
     }
 
-    private static func ensurePack(_ pack: Pack) async -> [Peak]? {
-        if let cached = loadCachedPack(pack) { return cached }
-        if let bundled = loadBundledPack(pack) {
-            saveCached(bundled, pack: pack)
-            return bundled
-        }
-
-        guard let tag = pack.tag, !tag.isEmpty else { return nil }
-        let request = NSBundleResourceRequest(tags: [tag])
-        request.loadingPriority = NSBundleResourceRequestLoadingPriorityUrgent
-        do {
-            try await request.beginAccessingResources()
-            defer { request.endAccessingResources() }
-            guard let peaks = loadBundledPack(pack) else { return nil }
-            saveCached(peaks, pack: pack)
-            return peaks
-        } catch {
-            return nil
-        }
-    }
-
-    private static func manifest() -> Manifest? {
+    /// The bundled manifest is immutable for the process lifetime — decode it
+    /// once instead of re-reading the JSON on every coverage query.
+    private static let cachedManifest: Manifest? = {
         guard let url = Bundle.main.url(forResource: manifestResource, withExtension: "json"),
               let data = try? Data(contentsOf: url)
         else { return nil }
         return try? JSONDecoder().decode(Manifest.self, from: data)
-    }
+    }()
+
+    private static func manifest() -> Manifest? { cachedManifest }
 
     private static func loadBundledPack(_ pack: Pack) -> [Peak]? {
         guard let url = Bundle.main.url(forResource: pack.fileBaseName, withExtension: pack.fileExtension),
@@ -140,37 +95,21 @@ enum PeakPackService {
     }
 
     private static func decodePack(_ data: Data) -> [Peak]? {
+        // Sniff the first non-whitespace byte ('[' = bare array, '{' = wrapped)
+        // — blindly trying the wrong shape first paid a complete failed parse
+        // of a multi-MB pack on every load.
+        let whitespace: Set<UInt8> = [0x20, 0x0A, 0x0D, 0x09]
+        if data.first(where: { !whitespace.contains($0) }) == UInt8(ascii: "{") {
+            return (try? JSONDecoder().decode(PeakPackPayload.self, from: data))?.peaks
+        }
         if let peaks = try? JSONDecoder().decode([Peak].self, from: data) {
             return peaks
         }
-        if let wrapped = try? JSONDecoder().decode(PeakPackPayload.self, from: data) {
-            return wrapped.peaks
-        }
-        return nil
+        return (try? JSONDecoder().decode(PeakPackPayload.self, from: data))?.peaks
     }
 
     private struct PeakPackPayload: Decodable {
         let peaks: [Peak]
-    }
-
-    private static func saveCached(_ peaks: [Peak], pack: Pack) {
-        guard let data = try? JSONEncoder().encode(peaks) else { return }
-        try? data.write(to: cacheURL(for: pack), options: .atomic)
-    }
-
-    private static func append(_ peaks: [Peak], to merged: inout [Peak], latitude lat: Double, longitude lon: Double, radiusKm: Double) {
-        for peak in peaks where GeoMath.distanceMeters(
-            fromLatitude: lat, fromLongitude: lon,
-            toLatitude: peak.latitude, toLongitude: peak.longitude
-        ) <= radiusKm * 1000 && !merged.contains(where: { samePeak($0, peak) }) {
-            merged.append(peak)
-        }
-    }
-
-    private static func append(_ peaks: [Peak], to merged: inout [Peak]) {
-        for peak in peaks where !merged.contains(where: { samePeak($0, peak) }) {
-            merged.append(peak)
-        }
     }
 
     private static func cacheDirectory() -> URL {
@@ -182,14 +121,5 @@ enum PeakPackService {
 
     private static func cacheURL(for pack: Pack) -> URL {
         cacheDirectory().appendingPathComponent("\(cacheVersion)_\(pack.id).json")
-    }
-
-    private static func samePeak(_ a: Peak, _ b: Peak) -> Bool {
-        if a.id == b.id { return true }
-        guard a.name.localizedCaseInsensitiveCompare(b.name) == .orderedSame else { return false }
-        return GeoMath.distanceMeters(
-            fromLatitude: a.latitude, fromLongitude: a.longitude,
-            toLatitude: b.latitude, toLongitude: b.longitude
-        ) < 200
     }
 }

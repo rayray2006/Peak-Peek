@@ -6,7 +6,7 @@ import simd
 ///
 /// Two passes, all rendered at `supersample`× the target resolution (SSAA)
 /// to anti-alias the distant silhouette:
-///   1. `raymarchFragment` (MRT) -> color + linear-depth intermediates.
+///   1. `raymarchFragment` -> shaded color intermediate.
 ///   2. `downsampleFragment` -> box-average the hi-res color into `target`.
 final class TerrainRenderer {
     let device: MTLDevice
@@ -29,20 +29,18 @@ final class TerrainRenderer {
 
     /// Optional sampled DEM height texture (R32Float, value = meters).
     var heightTexture: MTLTexture?
-    /// Far-horizon ring profile (FarHorizon.swift): rg16Float 1D texture of
-    /// (tan elevation, distance km) per azimuth. Nil binds `emptyRing` so the
-    /// bake shaders need no flag.
+    /// Far-horizon strip (FarHorizon.swift): r16Float 2D texture, azimuth ×
+    /// tan-elevation rows, texel = nearest beyond-tier hit distance in km
+    /// (0 = sky). Nil binds `emptyRing` so the bake shaders need no flag.
     var ringTexture: MTLTexture?
     private lazy var emptyRing: MTLTexture? = {
-        let d = MTLTextureDescriptor()
-        d.textureType = .type1D
-        d.pixelFormat = .rg16Float
-        d.width = 1
+        let d = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r16Float, width: 1, height: 1, mipmapped: false)
         d.usage = .shaderRead
         guard let t = device.makeTexture(descriptor: d) else { return nil }
-        var texel: [Float16] = [-10, 0]           // far below every ray: never drawn
-        t.replace(region: MTLRegionMake1D(0, 1), mipmapLevel: 0,
-                  withBytes: &texel, bytesPerRow: 4)
+        var texel: [Float16] = [0]                // 0 km = sky everywhere
+        t.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0,
+                  withBytes: &texel, bytesPerRow: 2)
         return t
     }()
     /// Coarse, wide-coverage far-field DEM, bound at texture(1). Sampled only where
@@ -52,12 +50,10 @@ final class TerrainRenderer {
     /// Supersampling factor (1 = off). 2 = render at 2x, downsample (4x cost).
     var supersample: Int = 2
 
-    // Hi-res intermediates, (re)allocated when the supersampled size changes.
+    // Hi-res intermediate, (re)allocated when the supersampled size changes.
     private var colorTex: MTLTexture?
-    private var depthTex: MTLTexture?
 
     static let colorFormat: MTLPixelFormat = .rgba8Unorm
-    static let depthFormat: MTLPixelFormat = .r32Float
 
     init(device: MTLDevice, preferSource: Bool = false) throws {
         self.device = device
@@ -75,10 +71,19 @@ final class TerrainRenderer {
             let source = try ShaderLoader.loadSource()
             library = try device.makeLibrary(source: source, options: nil)
         }
+        // DEM-sampling functions get told whether this GPU can linear-filter
+        // 32-bit float textures (Apple families before 9 — most iPhones —
+        // cannot; the sampler silently degrades to nearest and the terrain
+        // shows every 30 m cell as a flat step). false → the shader's manual
+        // bilinear fallback, selected at compile time.
+        let demConstants = MTLFunctionConstantValues()
+        var hwFilterF32 = device.supports32BitFloatFiltering
+        demConstants.setConstantValue(&hwFilterF32, type: .bool, index: 0)
+
         guard let vfn = library.makeFunction(name: "fullscreenVertex"),
-              let march = library.makeFunction(name: "raymarchFragment"),
+              let march = try? library.makeFunction(name: "raymarchFragment", constantValues: demConstants),
               let down = library.makeFunction(name: "downsampleFragment"),
-              let panoBake = library.makeFunction(name: "panoramaBakeFragment"),
+              let panoBake = try? library.makeFunction(name: "panoramaBakeFragment", constantValues: demConstants),
               let panoView = library.makeFunction(name: "panoramaViewFragment"),
               let panoViewAR = library.makeFunction(name: "panoramaViewARFragment"),
               let panoViewEdges = library.makeFunction(name: "panoramaViewEdgesFragment"),
@@ -90,7 +95,6 @@ final class TerrainRenderer {
         p1.vertexFunction = vfn
         p1.fragmentFunction = march
         p1.colorAttachments[0].pixelFormat = Self.colorFormat
-        p1.colorAttachments[1].pixelFormat = Self.depthFormat
         self.raymarchPipeline = try device.makeRenderPipelineState(descriptor: p1)
 
         let p3 = MTLRenderPipelineDescriptor()
@@ -107,7 +111,8 @@ final class TerrainRenderer {
         self.panoramaBakePipeline = try device.makeRenderPipelineState(descriptor: pb)
 
         // Panorama hit-distance map for label occlusion — r32Float target.
-        guard let panoDepth = library.makeFunction(name: "panoramaDepthFragment") else {
+        guard let panoDepth = try? library.makeFunction(name: "panoramaDepthFragment",
+                                                        constantValues: demConstants) else {
             throw RendererError.missingFunctions
         }
         let pd = MTLRenderPipelineDescriptor()
@@ -147,12 +152,29 @@ final class TerrainRenderer {
 
     // MARK: - 360° panorama
 
+    /// Height of an equirectangular panorama band `width` texels wide — the
+    /// single home of the aspect contract with the shader's v-mapping
+    /// (elevation band [-panoElevMax, +panoElevMax] out of a full π).
+    static func panoHeight(forWidth width: Int, elevMax: Float) -> Int {
+        max(1, Int(Double(width) * Double(elevMax) / Double.pi))
+    }
+
+    /// Bind the terrain inputs every raymarching pass needs: uniforms, near DEM
+    /// (texture 0), far tier (texture 1, near as stand-in so something is always
+    /// bound), far-horizon ring strip (texture 2, empty stand-in likewise).
+    private func bindTerrainInputs(_ enc: MTLRenderCommandEncoder, _ u: inout Uniforms) {
+        enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+        if let tex = heightTexture { enc.setFragmentTexture(tex, index: 0) }
+        enc.setFragmentTexture(farHeightTexture ?? heightTexture, index: 1)
+        if let ring = ringTexture ?? emptyRing { enc.setFragmentTexture(ring, index: 2) }
+    }
+
     /// Encode the equirectangular bake at `panoramaWidth` into a fresh color
     /// texture. Returns the committed-but-not-waited command buffer and the
     /// target color texture; the caller decides whether to block or wait async.
     private func encodeBake(uniforms: Uniforms) -> (MTLCommandBuffer, MTLTexture)? {
         let panoW = panoramaWidth
-        let panoH = max(1, Int(Double(panoW) * Double(uniforms.panoElevMax) / Double.pi))
+        let panoH = Self.panoHeight(forWidth: panoW, elevMax: uniforms.panoElevMax)
 
         func make(_ fmt: MTLPixelFormat) -> MTLTexture? {
             let d = MTLTextureDescriptor.texture2DDescriptor(
@@ -173,11 +195,7 @@ final class TerrainRenderer {
         pa.colorAttachments[0].storeAction = .store
         if let enc = cb.makeRenderCommandEncoder(descriptor: pa) {
             enc.setRenderPipelineState(panoramaBakePipeline)
-            enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
-            if let tex = heightTexture { enc.setFragmentTexture(tex, index: 0) }
-            // Far tier at index 1 (fall back to near so a texture is always bound).
-            enc.setFragmentTexture(farHeightTexture ?? heightTexture, index: 1)
-        if let ring = ringTexture ?? emptyRing { enc.setFragmentTexture(ring, index: 2) }
+            bindTerrainInputs(enc, &u)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             enc.endEncoding()
         }
@@ -191,7 +209,7 @@ final class TerrainRenderer {
     /// lands on sky the bake draws above the (coarsely-rendered) terrain. CPU-readable.
     func terrainSkyMask(uniforms: Uniforms, width: Int = 1024) -> (width: Int, height: Int, alpha: [UInt8])? {
         let w = max(8, width)
-        let h = max(1, Int(Double(w) * Double(uniforms.panoElevMax) / Double.pi))
+        let h = Self.panoHeight(forWidth: w, elevMax: uniforms.panoElevMax)
         let d = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: Self.colorFormat, width: w, height: h, mipmapped: false)
         d.usage = [.renderTarget, .shaderRead]
@@ -205,10 +223,7 @@ final class TerrainRenderer {
         pa.colorAttachments[0].storeAction = .store
         guard let enc = cb.makeRenderCommandEncoder(descriptor: pa) else { return nil }
         enc.setRenderPipelineState(panoramaBakePipeline)
-        enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
-        if let t = heightTexture { enc.setFragmentTexture(t, index: 0) }
-        enc.setFragmentTexture(farHeightTexture ?? heightTexture, index: 1)
-        if let ring = ringTexture ?? emptyRing { enc.setFragmentTexture(ring, index: 2) }
+        bindTerrainInputs(enc, &u)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
         cb.commit()
@@ -235,7 +250,7 @@ final class TerrainRenderer {
     func terrainDepthMap(uniforms: Uniforms, width: Int = 4096)
         -> (width: Int, height: Int, depth: [Float])? {
         let w = max(8, width)
-        let h = max(1, Int(Double(w) * Double(uniforms.panoElevMax) / Double.pi))
+        let h = Self.panoHeight(forWidth: w, elevMax: uniforms.panoElevMax)
         let d = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .r32Float, width: w, height: h, mipmapped: false)
         d.usage = [.renderTarget, .shaderRead]
@@ -257,10 +272,7 @@ final class TerrainRenderer {
             pa.colorAttachments[0].storeAction = .store
             guard let enc = cb.makeRenderCommandEncoder(descriptor: pa) else { return nil }
             enc.setRenderPipelineState(panoramaDepthPipeline)
-            enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
-            if let t = heightTexture { enc.setFragmentTexture(t, index: 0) }
-            enc.setFragmentTexture(farHeightTexture ?? heightTexture, index: 1)
-        if let ring = ringTexture ?? emptyRing { enc.setFragmentTexture(ring, index: 2) }
+            bindTerrainInputs(enc, &u)
             let x = i * bandW
             enc.setScissorRect(MTLScissorRect(x: x, y: 0, width: min(bandW, w - x), height: h))
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
@@ -333,7 +345,7 @@ final class TerrainRenderer {
                            onProgress: ((Double) -> Void)? = nil,
                            completion: @escaping (MTLTexture?) -> Void) {
         let panoW = panoramaWidth
-        let panoH = max(1, Int(Double(panoW) * Double(uniforms.panoElevMax) / Double.pi))
+        let panoH = Self.panoHeight(forWidth: panoW, elevMax: uniforms.panoElevMax)
         let d = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: Self.colorFormat, width: panoW, height: panoH, mipmapped: false)
         d.usage = [.renderTarget, .shaderRead]
@@ -363,10 +375,7 @@ final class TerrainRenderer {
             pa.colorAttachments[0].storeAction = .store
             if let enc = cb.makeRenderCommandEncoder(descriptor: pa) {
                 enc.setRenderPipelineState(panoramaBakePipeline)
-                enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
-                if let tex = heightTexture { enc.setFragmentTexture(tex, index: 0) }
-                enc.setFragmentTexture(farHeightTexture ?? heightTexture, index: 1)
-        if let ring = ringTexture ?? emptyRing { enc.setFragmentTexture(ring, index: 2) }
+                bindTerrainInputs(enc, &u)
                 let x = i * bandW
                 enc.setScissorRect(MTLScissorRect(
                     x: x, y: 0, width: min(bandW, panoW - x), height: panoH))
@@ -488,15 +497,11 @@ final class TerrainRenderer {
 
     private func ensureIntermediates(width: Int, height: Int) {
         if let c = colorTex, c.width == width, c.height == height { return }
-        func make(_ fmt: MTLPixelFormat) -> MTLTexture? {
-            let d = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: fmt, width: width, height: height, mipmapped: false)
-            d.usage = [.renderTarget, .shaderRead]
-            d.storageMode = .private
-            return device.makeTexture(descriptor: d)
-        }
-        colorTex = make(Self.colorFormat)
-        depthTex = make(Self.depthFormat)
+        let d = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: Self.colorFormat, width: width, height: height, mipmapped: false)
+        d.usage = [.renderTarget, .shaderRead]
+        d.storageMode = .private
+        colorTex = device.makeTexture(descriptor: d)
     }
 
     /// Encode all passes, downsampling the final image into `target`.
@@ -508,26 +513,22 @@ final class TerrainRenderer {
         let hiW = target.width * ss
         let hiH = target.height * ss
         ensureIntermediates(width: hiW, height: hiH)
-        guard let colorTex = colorTex, let depthTex = depthTex else { return }
+        guard let colorTex = colorTex else { return }
         var u = uniforms
 
-        // --- Pass 1: raymarch -> color + depth (hi-res) ---
+        // --- Pass 1: raymarch -> color (hi-res) ---
+        // (The old second MRT attachment — a supersampled r32Float depth target,
+        // ~48 MB resident — had no downstream reader and is gone.)
         let p1 = MTLRenderPassDescriptor()
         p1.colorAttachments[0].texture = colorTex
         p1.colorAttachments[0].loadAction = .clear
         p1.colorAttachments[0].storeAction = .store
         p1.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        p1.colorAttachments[1].texture = depthTex
-        p1.colorAttachments[1].loadAction = .clear
-        p1.colorAttachments[1].storeAction = .store
-        let far = Double(uniforms.maxDistance) * 4.0
-        p1.colorAttachments[1].clearColor = MTLClearColor(red: far, green: far, blue: far, alpha: far)
         if let enc = commandBuffer.makeRenderCommandEncoder(descriptor: p1) {
             enc.setRenderPipelineState(raymarchPipeline)
-            enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
-            if let tex = heightTexture { enc.setFragmentTexture(tex, index: 0) }
-            enc.setFragmentTexture(farHeightTexture ?? heightTexture, index: 1)
-        if let ring = ringTexture ?? emptyRing { enc.setFragmentTexture(ring, index: 2) }
+            // The raymarch fragment takes no ring texture (the far ring only
+            // exists in the bake/depth paths), but the shared bind is harmless.
+            bindTerrainInputs(enc, &u)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             enc.endEncoding()
         }

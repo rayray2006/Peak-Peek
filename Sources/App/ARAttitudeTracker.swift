@@ -44,6 +44,11 @@ final class ARAttitudeTracker: NSObject, ARSessionDelegate {
     private var azOffset: Float?
     private var reportedInfo = false
     private var running = false
+    /// run()/pause() happen here, not on main: the FIRST session.run pays
+    /// ARKit's daemon + VIO + camera bring-up (hundreds of ms), which froze the
+    /// UI for the whole 3D→AR switch. Serial, so a quick start→stop→start stays
+    /// ordered; delegate callbacks remain on main (delegateQueue untouched).
+    private let sessionQueue = DispatchQueue(label: "com.peakpeek.arsession")
 
     func start() {
         guard Self.isSupported, !running else { return }
@@ -55,13 +60,15 @@ final class ARAttitudeTracker: NSObject, ARSessionDelegate {
         config.worldAlignment = .gravity          // yaw anchored by US, not the compass
         config.planeDetection = []
         session.delegate = self                   // callbacks on main
-        session.run(config, options: [.resetTracking, .removeExistingAnchors])
+        sessionQueue.async { [session] in
+            session.run(config, options: [.resetTracking, .removeExistingAnchors])
+        }
     }
 
     func stop() {
         guard running else { return }
         running = false
-        session.pause()
+        sessionQueue.async { [session] in session.pause() }
         basis = nil
         azOffset = nil
     }

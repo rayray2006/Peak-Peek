@@ -32,6 +32,13 @@ targets:
         NSLocationWhenInUseUsageDescription: "PeakPeek uses your location to render the terrain panorama around you."
         NSMotionUsageDescription: "PeakPeek uses motion sensors so you can look around by turning the phone."
         NSPhotoLibraryAddUsageDescription: "PeakPeek saves your captured panorama photos to your library."
+        UIAppFonts:
+          - SpaceGrotesk-Regular.ttf
+          - SpaceGrotesk-Medium.ttf
+          - SpaceGrotesk-SemiBold.ttf
+          - SpaceGrotesk-Bold.ttf
+          - IBMPlexMono-Regular.ttf
+          - IBMPlexMono-Medium.ttf
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

@@ -43,16 +43,34 @@ final class SkyArcOverlayView: UIView {
     var moonDisc: Disc?
     var tags: [Tag] = [] { didSet { rebuildTagLayers() } }
     /// Stars (white, brightness-tiered, unnamed) + planets (coloured, sized, named)
-    /// + the day→night fade (0 = day, hidden; 1 = full night).
+    /// + the day→night fade (0 = day, hidden; 1 = full night). The fade also
+    /// restyles the moon disc to keep it visible against either sky.
     var stars: [StarSample] = []
     var planets: [StarSample] = []
-    var nightOpacity: Float = 0
+    var nightOpacity: Float = 0 {
+        didSet { if nightOpacity != oldValue { updateMoonStyle() } }
+    }
     /// Tappable named objects (bright stars + planets + moon) for the name tag.
     var namedObjects: [NamedObject] = []
     /// Moon phase: illuminated fraction (0 new … 1 full) + waxing (lit limb on the
-    /// right) vs waning (left) — drives the disc shape.
-    var moonIlluminated: CGFloat = 1
-    var moonWaxing: Bool = true
+    /// right) vs waning (left) — drives the disc shape. The lit-phase path is
+    /// cached here: it changes only with the display date, but `project(...)`
+    /// runs per frame (60–120 Hz) and was re-tessellating it every time.
+    var moonIlluminated: CGFloat = 1 {
+        didSet { if moonIlluminated != oldValue { cachedMoonLitPath = nil } }
+    }
+    var moonWaxing: Bool = true {
+        didSet { if moonWaxing != oldValue { cachedMoonLitPath = nil } }
+    }
+    private var cachedMoonLitPath: CGPath?
+    private var moonLitPath: CGPath {
+        if let cached = cachedMoonLitPath { return cached }
+        let path = Self.moonLitPath(radius: Self.moonRadius,
+                                    illuminated: max(0, min(1, moonIlluminated)),
+                                    waxing: moonWaxing)
+        cachedMoonLitPath = path
+        return path
+    }
     /// Name tag currently shown (set by a tap; nil = none). Hiding on change stops
     /// the tag flashing the PREVIOUS star's name at the new position for a frame
     /// (the string/position update happens in the next `project(...)` pass).
@@ -153,9 +171,8 @@ final class SkyArcOverlayView: UIView {
         // Moon = a dark (earthshine) base disc with the illuminated phase shape on top.
         let mR = Self.moonRadius
         moonDiscLayer.path = CGPath(ellipseIn: CGRect(x: -mR, y: -mR, width: 2 * mR, height: 2 * mR), transform: nil)
-        moonDiscLayer.fillColor = UIColor(white: 0.17, alpha: 1).cgColor
-        moonDiscLayer.strokeColor = UIColor(white: 0.32, alpha: 1).cgColor
-        moonDiscLayer.lineWidth = 0.5
+        moonDiscLayer.lineWidth = 1
+        updateMoonStyle()
         moonLitLayer.fillColor = UIColor(white: 0.94, alpha: 1).cgColor
         moonLitLayer.shadowColor = UIColor(white: 0.96, alpha: 1).cgColor
         moonLitLayer.shadowRadius = 2.5
@@ -165,8 +182,8 @@ final class SkyArcOverlayView: UIView {
 
         // Tapped-object name tag: bare text (no box), kept legible over the sky
         // with a soft dark shadow.
-        skyTagLayer.font = UIFont.systemFont(ofSize: 11, weight: .semibold)
-        skyTagLayer.fontSize = 11
+        skyTagLayer.font = UIFont.systemFont(ofSize: 12, weight: .semibold)
+        skyTagLayer.fontSize = 12
         skyTagLayer.alignmentMode = .center
         skyTagLayer.contentsScale = UIScreen.main.scale
         skyTagLayer.foregroundColor = UIColor.white.cgColor
@@ -177,6 +194,18 @@ final class SkyArcOverlayView: UIView {
         skyTagLayer.bounds = CGRect(x: 0, y: 0, width: 100, height: 18)
         skyTagLayer.isHidden = true
         layer.addSublayer(skyTagLayer)
+    }
+
+    /// Moon disc + rim colors follow the sky behind them: over the bright day
+    /// gradient the unlit disc reads as a dark silhouette with a dark edge; as
+    /// night falls the fill brightens toward earthshine gray and the rim flips
+    /// to a light stroke. Keeps the disc visible against ANY background — a NEW
+    /// moon (no lit shape at all) used to vanish into the black night sky.
+    private func updateMoonStyle() {
+        let t = CGFloat(max(0, min(1, nightOpacity)))
+        moonDiscLayer.fillColor = UIColor(white: 0.17 + 0.16 * t, alpha: 1).cgColor
+        moonDiscLayer.strokeColor = UIColor(white: 0.10 + 0.72 * t,
+                                            alpha: 0.55 + 0.35 * t).cgColor
     }
 
     /// The lit-region path for a moon of radius R, illuminated fraction k (0…1),
@@ -222,11 +251,11 @@ final class SkyArcOverlayView: UIView {
     private func rebuildTagLayers() {
         while tagLayers.count < tags.count {
             let t = CATextLayer()
-            t.font = UIFont.systemFont(ofSize: 10, weight: .semibold)
-            t.fontSize = 10
+            t.font = UIFont.systemFont(ofSize: 11, weight: .semibold)
+            t.fontSize = 11
             t.alignmentMode = .center
             t.contentsScale = UIScreen.main.scale
-            t.bounds = CGRect(x: 0, y: 0, width: 86, height: 13)
+            t.bounds = CGRect(x: 0, y: 0, width: 94, height: 14)
             t.isHidden = true
             layer.addSublayer(t)
             tagLayers.append(t)
@@ -331,9 +360,7 @@ final class SkyArcOverlayView: UIView {
         // lit limb is fixed to the sky, so counter-roll it (like the tags) — otherwise
         // it rotates with the phone and the crescent tips sideways in landscape.
         if let md = moonDisc, md.visible, let p = screen(md.dir) {
-            moonLitLayer.path = Self.moonLitPath(radius: Self.moonRadius,
-                                                 illuminated: max(0, min(1, moonIlluminated)),
-                                                 waxing: moonWaxing)
+            moonLitLayer.path = moonLitPath
             moonDiscLayer.position = p
             moonLitLayer.position = p
             moonLitLayer.transform = rollT
@@ -358,11 +385,16 @@ final class SkyArcOverlayView: UIView {
                     CGRect(x: c.x - sz.width / 2, y: c.y - sz.height / 2,
                            width: sz.width, height: sz.height).insetBy(dx: 14, dy: 0)
                 }
-                var steps = 0
-                while steps < 4, placedTagRects.contains(where: { $0.intersects(frame(at: pos)) }) {
-                    pos.x += gUpX * 15
-                    pos.y += gUpY * 15
-                    steps += 1
+                // Continuous de-overlap: push along gravity-up by exactly the
+                // overlap amount (+pad). The old discrete 15 pt steps flipped
+                // on/off at the intersect boundary while panning, so the moon
+                // tag visibly jumped up and down; this slides smoothly instead.
+                for placed in placedTagRects {
+                    let f = frame(at: pos)
+                    guard placed.intersects(f) else { continue }
+                    let overlap = min(f.maxY, placed.maxY) - max(f.minY, placed.minY) + 4
+                    pos.x += gUpX * overlap
+                    pos.y += gUpY * overlap
                 }
                 placedTagRects.append(frame(at: pos))
                 layer.position = pos

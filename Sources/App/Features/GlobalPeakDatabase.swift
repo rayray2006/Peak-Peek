@@ -72,8 +72,7 @@ struct GlobalPeakDatabase: Sendable {
 
     /// All peaks within `radius` meters of the given coordinate.
     func peaks(nearLatitude lat: Double, longitude lon: Double, withinMeters radius: Double) -> [Peak] {
-        let latDelta = radius / 111_000
-        let lonDelta = radius / (111_000 * max(cos(lat * .pi / 180), 0.001))
+        let (latDelta, lonDelta) = GeoMath.boundingDegreeDeltas(radiusMeters: radius, latitude: lat)
         let latLo = max(Int(floor(lat - latDelta)), -90)
         let latHi = min(Int(floor(lat + latDelta)), 89)
         let lonLo = Int(floor(lon - lonDelta)), lonHi = Int(floor(lon + lonDelta))

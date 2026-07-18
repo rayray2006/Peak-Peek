@@ -99,6 +99,14 @@ final class PeakLabelOverlayView: UIView {
         let nameText = CATextLayer()
         let elevText = CATextLayer()
         var width: CGFloat = 0
+        /// The raw strings, kept so the cased (attributed) text can be
+        /// re-baked when tier/tint/theme changes.
+        var nameString = ""
+        var elevString = ""
+        /// Cache key of the currently baked text style — (theme generation,
+        /// emphasized, tint). Re-baking happens only on a mismatch, never
+        /// per frame.
+        var styleKey = -1
 
         func setHidden(_ hidden: Bool) {
             leader.isHidden = hidden
@@ -108,25 +116,79 @@ final class PeakLabelOverlayView: UIView {
     }
     private var pool: [Node] = []
 
-    private static let nameFont = UIFont.systemFont(ofSize: 13, weight: .semibold)
-    private static let elevFont = UIFont.systemFont(ofSize: 11, weight: .regular)
-    private static let capsuleHeight: CGFloat = 26
-    private static let hPad: CGFloat = 11
-    private static let gap: CGFloat = 7
-    private static let dotRadius: CGFloat = 3
+    /// Template label anatomy: Space Grotesk name over a mono elevation, both
+    /// floating bare (no pill) above a 1 px leader and a white-ringed ink dot.
+    /// The SELECTED (primary) label reads 13/semibold at full strength; the
+    /// rest sit back at 12/medium, 75% — exactly the mock's two tiers.
+    private static let nameFont = PPFont.grotesk(13, .semibold)
+    private static let elevFont = PPFont.plexMono(10)
+    private static let nameFontSecondary = PPFont.grotesk(12, .medium)
+    private static let elevFontSecondary = PPFont.plexMono(9)
+    private static let nameHeight: CGFloat = 17
+    private static let elevHeight: CGFloat = 13
+    /// The pill's internal padding around the two stacked text lines.
+    private static let vPad: CGFloat = 5
+    /// pad + name + 1 pt gap + elevation + pad.
+    private static let capsuleHeight: CGFloat = 5 + 17 + 1 + 13 + 5
+    private static let hPad: CGFloat = 9
+    /// Quiet little points on the terrain; the selected one scales up and
+    /// gains its ring, so small stays legible.
+    private static let dotRadius: CGFloat = 2.5
     private static let tierLeaderHeights: [CGFloat] = [30, 74, 118]
-    private static let pillBG = UIColor.black.withAlphaComponent(0.55).cgColor
-    /// Summit dots: red (reads over snow, rock and haze alike).
-    private static let peakFill = UIColor(red: 0.92, green: 0.26, blue: 0.21, alpha: 1).cgColor
-    /// Water-feature styling: lake-blue dot + a light-blue name tint.
-    private static let waterFill = UIColor(red: 0.36, green: 0.67, blue: 0.95, alpha: 1).cgColor
-    private static let waterText = UIColor(red: 0.75, green: 0.88, blue: 1.00, alpha: 1).cgColor
-    /// Saved-mode tints, matching the info-card chips: climbed = green,
-    /// bookmarked = orange (climbed wins when a peak is somehow both).
-    private static let climbedFill = UIColor.systemGreen.cgColor
-    private static let climbedText = UIColor(red: 0.62, green: 0.92, blue: 0.66, alpha: 1).cgColor
-    private static let bookmarkFill = UIColor.systemOrange.cgColor
-    private static let bookmarkText = UIColor(red: 1.00, green: 0.80, blue: 0.50, alpha: 1).cgColor
+    /// Water-feature styling: lake-blue dot + name tint (fixed, both themes).
+    private static let waterFill = TopoStyle.waterBlue.cgColor
+    private static let waterTint = TopoStyle.waterBlue
+    /// Saved-mode tints, matching the info-card badges: climbed = green,
+    /// bookmarked = gold (climbed wins when a peak is somehow both).
+    private static let climbedFill = TopoStyle.visibleGreen.cgColor
+    private static let climbedTint = TopoStyle.visibleGreen
+    private static let bookmarkFill = TopoStyle.savedGold.cgColor
+    private static let bookmarkTint = UIColor(red: 0.72, green: 0.52, blue: 0.05, alpha: 1)
+
+    /// Which fill a label's text carries (part of the style cache key).
+    private enum LabelTint: Int { case plain, climbed, bookmarked, water }
+
+    // MARK: - Day/night theme
+
+    /// TopoStyle's dynamic ink/paper resolved for THIS view's traits — after
+    /// sunset the scene flips to dark and every label inverts: white text +
+    /// dots with dark rings.
+    private var inkResolved: UIColor { TopoStyle.ink.resolvedColor(with: traitCollection) }
+    private var paperResolved: UIColor { TopoStyle.paper.resolvedColor(with: traitCollection) }
+
+    /// Bumped when the day/night theme flips: label text carries baked-in
+    /// (attributed) colors, so a generation mismatch forces a re-bake.
+    private var themeGeneration = 1
+
+    override func traitCollectionDidChange(_ previous: UITraitCollection?) {
+        super.traitCollectionDidChange(previous)
+        guard previous?.userInterfaceStyle != traitCollection.userInterfaceStyle else { return }
+        themeGeneration += 1
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for n in pool { applyThemeColors(to: n) }
+        applyTargetThemeColors()
+        CATransaction.commit()
+        setNeedsLayout()   // project() re-resolves + re-bakes the label text
+    }
+
+    private func fillText(_ text: String, font: UIFont, fill: UIColor) -> NSAttributedString {
+        NSAttributedString(string: text, attributes: [
+            .font: font,
+            .foregroundColor: fill,
+        ])
+    }
+
+    /// The node colors that don't get re-assigned every frame in project().
+    private func applyThemeColors(to n: Node) {
+        n.leader.strokeColor = inkResolved.withAlphaComponent(0.55).cgColor
+        n.dot.strokeColor = paperResolved.cgColor
+        // The label pill: paper behind ink text (inverting with the theme),
+        // edged with the same hairline the info card wears.
+        n.capsule.backgroundColor = paperResolved.withAlphaComponent(0.92).cgColor
+        n.capsule.borderColor = inkResolved.withAlphaComponent(0.12).cgColor
+        n.capsule.borderWidth = 1
+    }
 
     /// How many leading anchors have configured pool nodes. `project(...)` draws
     /// only below this — a node still holding the PREVIOUS viewpoint's text must
@@ -156,29 +218,33 @@ final class PeakLabelOverlayView: UIView {
         let end = min(anchors.count, start + 120)
         while pool.count < end { pool.append(makeNode()) }
         let scale = UIScreen.main.scale
-        let textY = (Self.capsuleHeight - 18) / 2
         for i in start..<end {
             let a = anchors[i]
             let node = pool[i]
-            let name = a.peak.name as NSString
+            let displayName = a.peak.displayName
+            let name = displayName as NSString
             let nameW = ceil(name.size(withAttributes: [.font: Self.nameFont]).width)
-            node.nameText.string = a.peak.name
-            node.nameText.font = Self.nameFont
-            node.nameText.fontSize = Self.nameFont.pointSize
-            node.nameText.contentsScale = scale
-            node.nameText.frame = CGRect(x: Self.hPad, y: textY, width: nameW + 1, height: 18)
 
             let elev = a.peak.elevationMeters > 0 ? UnitText.elevation(meters: a.peak.elevationMeters) : ""
             let elevW = elev.isEmpty ? 0 : ceil((elev as NSString).size(withAttributes: [.font: Self.elevFont]).width)
-            node.elevText.string = elev
-            node.elevText.font = Self.elevFont
-            node.elevText.fontSize = Self.elevFont.pointSize
+
+            // Both lines centered over the leader: the container is as wide as
+            // the longer of the two.
+            node.width = max(nameW, elevW) + Self.hPad * 2
+            node.capsule.bounds = CGRect(x: 0, y: 0, width: node.width, height: Self.capsuleHeight)
+
+            node.nameString = displayName
+            node.nameText.contentsScale = scale
+            node.nameText.frame = CGRect(x: (node.width - nameW - 1) / 2, y: Self.vPad,
+                                         width: nameW + 1, height: Self.nameHeight)
+
+            node.elevString = elev
             node.elevText.contentsScale = scale
             node.elevText.isHidden = elev.isEmpty
-            node.elevText.frame = CGRect(x: Self.hPad + nameW + Self.gap, y: textY, width: elevW + 1, height: 18)
-
-            node.width = Self.hPad + nameW + (elev.isEmpty ? 0 : Self.gap + elevW) + Self.hPad
-            node.capsule.bounds = CGRect(x: 0, y: 0, width: node.width, height: Self.capsuleHeight)
+            node.elevText.frame = CGRect(x: (node.width - elevW - 1) / 2,
+                                         y: Self.vPad + Self.nameHeight + 1,
+                                         width: elevW + 1, height: Self.elevHeight)
+            node.styleKey = -1       // bake the text styles on first projection
         }
         configuredCount = end
         if end < anchors.count {
@@ -197,22 +263,20 @@ final class PeakLabelOverlayView: UIView {
         n.dot.zPosition = 1
         n.leader.zPosition = 2
         n.capsule.zPosition = 3
-        n.leader.strokeColor = UIColor.white.withAlphaComponent(0.5).cgColor
         n.leader.lineWidth = 1
         n.leader.fillColor = nil
-        n.dot.fillColor = Self.peakFill
-        n.dot.strokeColor = UIColor.black.withAlphaComponent(0.55).cgColor
-        n.dot.lineWidth = 1
+        n.dot.fillColor = inkResolved.cgColor
+        // Quiet dot: no ring until the peak is selected (see project()).
+        n.dot.lineWidth = 0
         n.dot.path = UIBezierPath(ovalIn: CGRect(x: -Self.dotRadius, y: -Self.dotRadius,
                                                  width: Self.dotRadius * 2, height: Self.dotRadius * 2)).cgPath
-        // Clean upright pill, matching the HUD's translucent-black chrome.
-        n.capsule.backgroundColor = Self.pillBG
-        n.capsule.cornerRadius = Self.capsuleHeight / 2
+        // The label is a small paper pill above the leader — guaranteed
+        // contrast over rock, forest and snow.
+        n.capsule.cornerRadius = 9
         n.capsule.anchorPoint = CGPoint(x: 0.5, y: 1)   // bottom-centre sits on the leader top
-        n.nameText.foregroundColor = UIColor.white.cgColor
-        n.nameText.alignmentMode = .left
-        n.elevText.foregroundColor = UIColor.white.withAlphaComponent(0.6).cgColor
-        n.elevText.alignmentMode = .left
+        n.nameText.alignmentMode = .center
+        n.elevText.alignmentMode = .center
+        applyThemeColors(to: n)   // leader stroke + pill fill/border + dot ring color
         n.capsule.addSublayer(n.nameText)
         n.capsule.addSublayer(n.elevText)
         layer.addSublayer(n.leader)
@@ -247,9 +311,14 @@ final class PeakLabelOverlayView: UIView {
     private var savedListsStamp = 0
 
     /// (dot spacing pt, capsule x-spacing pt, capsule budget)
+    /// Dot spacing at `.all` is 9.5 pt — barely past the ~9 pt dot diameter, so
+    /// dots may just touch but never merge. It was 13 pt, which silently dropped
+    /// genuinely visible peaks in crowded scenes (standing on a summit compresses
+    /// every mountain into a thin band near the horizon): the info card said
+    /// "Visible" while the declutter contest had eaten the label.
     private var densityKnobs: (dot: CGFloat, capX: CGFloat, capMax: Int) {
         switch density {
-        case .all, .saved: return (13, 46, 60)
+        case .all, .saved: return (9.5, 46, 60)
         case .sparse: return (48, 130, 24)
         case .none: return (0, 0, 0)
         }
@@ -398,7 +467,10 @@ final class PeakLabelOverlayView: UIView {
         // screen-point density knobs into the angular spacings the stable
         // selection uses. Panning doesn't change it, so the set holds still.
         let pxPerRad = 0.5 * H / CGFloat(tanHalfFovY)
-        let capsulesOn = zoom >= Self.labelZoom || density == .saved
+        // Saved mode used to force every pill open at any zoom; saved points
+        // now behave like the rest — dots until zoomed past labelZoom (or
+        // tapped), just tinted by their list.
+        let capsulesOn = zoom >= Self.labelZoom
         if !selectionIsCurrent(pixelsPerRadian: pxPerRad, capsulesOn: capsulesOn) {
             recomputeSelection(pixelsPerRadian: pxPerRad, capsulesOn: capsulesOn)
         }
@@ -426,13 +498,49 @@ final class PeakLabelOverlayView: UIView {
             // Saved mode tints by list membership (climbed wins over bookmark).
             let isClimbed = density == .saved && climbedIDs.contains(peak.id)
             let isBookmarked = density == .saved && !isClimbed && bookmarkedIDs.contains(peak.id)
+            let selected = peak.id == selectedPeakID
+            // The SELECTED feature's dot grows and carries a halo ring the
+            // whole time it's on screen (it used to stay plain until the summit
+            // left the screen and the direction marker took over).
             node.dot.fillColor = isClimbed ? Self.climbedFill
                 : isBookmarked ? Self.bookmarkFill
-                : a.isWater ? Self.waterFill : Self.peakFill
+                : a.isWater ? Self.waterFill : inkResolved.cgColor
+            node.dot.strokeColor = paperResolved.cgColor
+            // The ring is the SELECTION mark — everything else is a bare dot.
+            node.dot.lineWidth = selected ? 1.5 : 0
+            node.dot.transform = selected
+                ? CATransform3DMakeScale(1.4, 1.4, 1) : CATransform3DIdentity
+            node.dot.shadowColor = inkResolved.cgColor
+            node.dot.shadowOpacity = selected ? 0.28 : 0
+            node.dot.shadowRadius = 4
+            node.dot.shadowOffset = .zero
+            // Two template tiers: the selected (primary) label at 13/semibold
+            // full strength, everything else at 12/medium, 75%. The cased
+            // (attributed) text re-bakes only when tier/tint/theme changes,
+            // never per frame.
+            let tint: LabelTint = isClimbed ? .climbed
+                : isBookmarked ? .bookmarked
+                : a.isWater ? .water : .plain
+            let key = (themeGeneration << 3) | (selected ? 4 : 0) | tint.rawValue
+            if node.styleKey != key {
+                node.styleKey = key
+                let nameFill: UIColor = switch tint {
+                case .climbed: Self.climbedTint
+                case .bookmarked: Self.bookmarkTint
+                case .water: Self.waterTint
+                case .plain: inkResolved
+                }
+                let nameFont = selected ? Self.nameFont : Self.nameFontSecondary
+                let elevFont = selected ? Self.elevFont : Self.elevFontSecondary
+                node.nameText.string = fillText(node.nameString, font: nameFont, fill: nameFill)
+                node.elevText.string = fillText(
+                    node.elevString, font: elevFont,
+                    fill: inkResolved.withAlphaComponent(0.6))
+            }
+            node.capsule.opacity = selected ? 1 : 0.75
+            node.leader.opacity = selected ? 1 : 0.75
             node.dot.position = point
             node.dot.isHidden = false
-
-            let selected = peak.id == selectedPeakID
             // Capsule membership comes from the stable set, so it can't change
             // while panning. The SELECTED peak always gets one — but only while
             // its summit is on the true screen; once it leaves, it hands off to
@@ -460,14 +568,8 @@ final class PeakLabelOverlayView: UIView {
                 node.capsule.position = CGPoint(x: pcx, y: pcy)
                 node.capsule.transform = rollT          // keep text gravity-upright
                 node.capsule.isHidden = false
-                node.capsule.backgroundColor = selected ? TopoStyle.accent.cgColor : Self.pillBG
-                node.nameText.foregroundColor = selected ? TopoStyle.accentText.cgColor
-                    : isClimbed ? Self.climbedText
-                    : isBookmarked ? Self.bookmarkText
-                    : a.isWater ? Self.waterText : UIColor.white.cgColor
-                node.elevText.foregroundColor = selected
-                    ? TopoStyle.accentText.withAlphaComponent(0.85).cgColor
-                    : UIColor.white.withAlphaComponent(0.6).cgColor
+                // (Text colors are baked into the cased attributed strings —
+                // see the styleKey block above.)
                 capsuleShownIDs.insert(peak.id)
                 hitTargets.append((peak, node.capsule.frame.insetBy(dx: -6, dy: -6), point))
             } else {
@@ -513,21 +615,34 @@ final class PeakLabelOverlayView: UIView {
     private static let arrowSize: CGFloat = 24
     private static let arrowMargin: CGFloat = 22
 
+    /// The themed colors of the direction marker — applied at setup and again
+    /// when the day/night theme flips. Same paper-pill language as the labels,
+    /// so the edge handoff reads as the SAME label sliding, not a style swap.
+    private func applyTargetThemeColors() {
+        targetCapsule.backgroundColor = paperResolved.withAlphaComponent(0.95).cgColor
+        targetCapsule.borderColor = inkResolved.withAlphaComponent(0.12).cgColor
+        targetCapsule.borderWidth = 1
+        targetText.foregroundColor = inkResolved.cgColor
+        targetDot.fillColor = inkResolved.cgColor
+        targetDot.strokeColor = paperResolved.cgColor
+        targetLeader.strokeColor = inkResolved.withAlphaComponent(0.85).cgColor
+        targetArrowBG.backgroundColor = paperResolved.withAlphaComponent(0.95).cgColor
+        targetArrowBG.borderColor = inkResolved.withAlphaComponent(0.12).cgColor
+        targetArrow.strokeColor = inkResolved.cgColor
+    }
+
     private func setupTarget() {
-        targetCapsule.cornerRadius = Self.capsuleHeight / 2
-        targetCapsule.backgroundColor = TopoStyle.accent.cgColor
+        // The direction marker is the one ink pill in the overlay — the
+        // template's ink-card language pointing at what you searched for.
+        targetCapsule.cornerRadius = 27 / 2
         targetCapsule.anchorPoint = CGPoint(x: 0.5, y: 0.5)
-        targetText.foregroundColor = TopoStyle.accentText.cgColor
         targetText.alignmentMode = .center
         targetText.contentsScale = UIScreen.main.scale
         targetText.font = Self.nameFont
         targetText.fontSize = Self.nameFont.pointSize
         targetCapsule.addSublayer(targetText)
-        targetDot.fillColor = TopoStyle.accent.cgColor
-        targetDot.strokeColor = UIColor.white.withAlphaComponent(0.85).cgColor
         targetDot.lineWidth = 1.5
-        targetDot.path = UIBezierPath(ovalIn: CGRect(x: -4, y: -4, width: 8, height: 8)).cgPath
-        targetLeader.strokeColor = TopoStyle.accent.withAlphaComponent(0.85).cgColor
+        targetDot.path = UIBezierPath(ovalIn: CGRect(x: -3, y: -3, width: 6, height: 6)).cgPath
         targetLeader.lineWidth = 1.5
         targetLeader.fillColor = nil
 
@@ -535,7 +650,7 @@ final class PeakLabelOverlayView: UIView {
         targetArrowBG.bounds = CGRect(x: -a / 2, y: -a / 2, width: a, height: a)
         targetArrowBG.anchorPoint = CGPoint(x: 0.5, y: 0.5)
         targetArrowBG.cornerRadius = a / 2
-        targetArrowBG.backgroundColor = UIColor.black.withAlphaComponent(0.25).cgColor
+        targetArrowBG.borderWidth = 1
         // Chevron pointing +x (screen-right); rotated per-frame toward the peak.
         targetArrow.bounds = CGRect(x: -a / 2, y: -a / 2, width: a, height: a)
         targetArrow.anchorPoint = CGPoint(x: 0.5, y: 0.5)
@@ -545,8 +660,8 @@ final class PeakLabelOverlayView: UIView {
         chev.addLine(to: CGPoint(x: -3, y: 5.5))
         targetArrow.path = chev
         targetArrow.fillColor = nil
-        targetArrow.strokeColor = TopoStyle.accent.withAlphaComponent(0.8).cgColor
         targetArrow.lineWidth = 2
+        applyTargetThemeColors()
         targetArrow.lineCap = .round
         targetArrow.lineJoin = .round
 
@@ -573,10 +688,12 @@ final class PeakLabelOverlayView: UIView {
     }
 
     private func setTargetText(_ string: String) {
+        let pillHeight: CGFloat = 27
+        let pad: CGFloat = 11
         targetText.string = string
         let tw = ceil((string as NSString).size(withAttributes: [.font: Self.nameFont]).width)
-        targetCapsule.bounds = CGRect(x: 0, y: 0, width: tw + 2 * Self.hPad, height: Self.capsuleHeight)
-        targetText.frame = CGRect(x: Self.hPad, y: (Self.capsuleHeight - 18) / 2, width: tw + 1, height: 18)
+        targetCapsule.bounds = CGRect(x: 0, y: 0, width: tw + 2 * pad, height: pillHeight)
+        targetText.frame = CGRect(x: pad, y: (pillHeight - 18) / 2, width: tw + 1, height: 18)
     }
 
     /// Place the accent direction marker for `t`: a dot on the horizon in the peak's

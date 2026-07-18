@@ -3,9 +3,10 @@ import MapKit
 import SwiftUI
 
 /// Pick an area on a map and download its terrain for offline use, plus manage
-/// already-downloaded regions. Pan/zoom the map; the accent frame in the centre is the
-/// area that gets downloaded. (Built on PeakPeek's `DEMFetcher` persistent tile
-/// store via `RegionStore`; styled to match the app's dark/accent chrome.)
+/// already-downloaded regions. Pan/zoom the map; the dashed ink frame in the
+/// centre is the area that gets downloaded (template's "SELECT AREA" language).
+/// (Built on PeakPeek's `DEMFetcher` persistent tile store via `RegionStore`;
+/// hosted in the white PanelCard, which owns the title + ✕.)
 struct RegionManagerView: View {
     @ObservedObject var store: RegionStore
     var currentViewpoint: PanoramaViewModel.Viewpoint?
@@ -13,6 +14,10 @@ struct RegionManagerView: View {
 
     /// Fraction of the (square) map side covered by the selection frame.
     private static let selectionFraction: CGFloat = 0.72
+
+    /// Rough on-disk size of one 1°×1° SRTM tile (gzipped ~5–25 MB by
+    /// terrain; mountainous areas run high). Drives the download estimate.
+    private static let approxTileBytes: Int64 = 15_000_000
 
     @State private var position: MapCameraPosition
     @State private var visibleRegion: MKCoordinateRegion?
@@ -42,31 +47,28 @@ struct RegionManagerView: View {
         Group {
             if verticalSizeClass == .compact { landscapeLayout } else { portraitLayout }
         }
-        .background(Color(TopoStyle.background).ignoresSafeArea())
-        .presentationDetents([.large])
-        .presentationDragIndicator(.visible)
     }
 
     private var portraitLayout: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            header
-            selector
+        VStack(alignment: .leading, spacing: 12) {
+            mapSelector
+                .frame(maxHeight: .infinity)
+            downloadControls
             if !store.regions.isEmpty { regionList }
-            Spacer(minLength: 0)
             footer
         }
-        .padding(20)
+        .padding(.horizontal, 20)
+        .padding(.bottom, 20)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// Landscape: map selector on the left (full height), header + download
-    /// controls + saved regions + footer in a column on the right.
+    /// Landscape: map selector on the left (full height), download controls +
+    /// saved regions + footer in a column on the right.
     private var landscapeLayout: some View {
         HStack(alignment: .top, spacing: 16) {
             mapSelector
                 .frame(maxWidth: .infinity)
-            VStack(alignment: .leading, spacing: 12) {
-                header
+            VStack(alignment: .leading, spacing: 10) {
                 downloadControls
                 if !store.regions.isEmpty { regionList }
                 Spacer(minLength: 0)
@@ -74,35 +76,11 @@ struct RegionManagerView: View {
             }
             .frame(maxWidth: .infinity)
         }
-        .padding(16)
-    }
-
-    // MARK: Header
-
-    private var header: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "square.dashed.inset.filled")
-                .font(.system(size: 20, weight: .semibold))
-                .foregroundStyle(store.isDownloading ? Color.orange : .white.opacity(0.9))
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Offline Regions").font(.system(size: 18, weight: .semibold)).foregroundStyle(.white)
-                Text("Pick an area on the map to use without a connection")
-                    .font(.system(size: 12)).foregroundStyle(.white.opacity(0.6))
-            }
-            Spacer()
-        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 16)
     }
 
     // MARK: Area selector (map + selection frame)
-
-    private var selector: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            mapSelector
-                .frame(height: 300)
-
-            downloadControls
-        }
-    }
 
     private var mapSelector: some View {
         GeometryReader { geo in
@@ -110,11 +88,24 @@ struct RegionManagerView: View {
             ZStack {
                 Map(position: $position,
                     interactionModes: store.isDownloading ? [] : [.pan, .zoom]) {
+                    // Already-downloaded coverage: the EXACT areas the user
+                    // selected (not the underlying 1° tile grid), unioned
+                    // across regions into non-overlapping green rectangles —
+                    // overlapping downloads read as one seamless shape.
+                    ForEach(savedAreas, id: \.self) { box in
+                        MapPolygon(coordinates: [
+                            CLLocationCoordinate2D(latitude: box.south, longitude: box.west),
+                            CLLocationCoordinate2D(latitude: box.north, longitude: box.west),
+                            CLLocationCoordinate2D(latitude: box.north, longitude: box.east),
+                            CLLocationCoordinate2D(latitude: box.south, longitude: box.east),
+                        ])
+                        .foregroundStyle(TopoStyle.visibleColor.opacity(0.45))
+                    }
                     if let vp = currentViewpoint {
                         Annotation(vp.name, coordinate:
                             CLLocationCoordinate2D(latitude: vp.latitude, longitude: vp.longitude)) {
-                            Circle().fill(.orange)
-                                .frame(width: 12, height: 12)
+                            Circle().fill(TopoStyle.inkColor)
+                                .frame(width: 10, height: 10)
                                 .overlay(Circle().stroke(.white, lineWidth: 2))
                         }
                     }
@@ -122,6 +113,10 @@ struct RegionManagerView: View {
                 .mapStyle(.standard(elevation: .flat))
                 .onMapCameraChange(frequency: .continuous) { ctx in visibleRegion = ctx.region }
                 .clipShape(RoundedRectangle(cornerRadius: 14))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14)
+                        .strokeBorder(TopoStyle.hairline(0.10), lineWidth: 1)
+                )
 
                 selectionFrame(side: side)
             }
@@ -131,22 +126,29 @@ struct RegionManagerView: View {
         .opacity(store.isDownloading ? 0.6 : 1)
     }
 
-    /// Dim everything outside a centred square + an accent frame around it.
+    /// Dim everything outside a centred square + the template's dashed ink
+    /// frame with its "SELECT AREA" tag.
     private func selectionFrame(side: CGFloat) -> some View {
         ZStack {
-            Color.black.opacity(0.34)
+            Color.black.opacity(0.18)
                 .mask {
                     Rectangle()
                         .overlay {
-                            RoundedRectangle(cornerRadius: 10)
+                            RoundedRectangle(cornerRadius: 4)
                                 .frame(width: side, height: side)
                                 .blendMode(.destinationOut)
                         }
                         .compositingGroup()
                 }
-            RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(Color(TopoStyle.accent), lineWidth: 2)
+                .clipShape(RoundedRectangle(cornerRadius: 14))
+            RoundedRectangle(cornerRadius: 4)
+                .strokeBorder(TopoStyle.inkColor, style: StrokeStyle(lineWidth: 1.5, dash: [5, 4]))
                 .frame(width: side, height: side)
+                .overlay(alignment: .topTrailing) {
+                    // Bare mono tag inside the frame's top corner, per the mock.
+                    PPMicroLabel(text: "Select area", opacity: 0.7)
+                        .padding(10)
+                }
         }
         .allowsHitTesting(false)
     }
@@ -155,34 +157,56 @@ struct RegionManagerView: View {
         if store.isDownloading {
             VStack(alignment: .leading, spacing: 8) {
                 Text(store.statusText ?? "Downloading…")
-                    .font(.system(size: 13)).foregroundStyle(.white.opacity(0.85))
-                ProgressView(value: store.progress).tint(Color(TopoStyle.accent))
+                    .font(PPFont.mono(11))
+                    .foregroundStyle(TopoStyle.inkColor.opacity(0.6))
+                PPProgressLine(progress: store.progress, width: 200)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(14)
-            .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+            .padding(.vertical, 6)
         } else {
-            Button {
-                Task { await downloadSelected() }
-            } label: {
-                HStack {
-                    Image(systemName: "arrow.down.circle.fill")
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Download selected area").font(.system(size: 15, weight: .semibold))
-                        Text("~\(tileEstimate) tile\(tileEstimate == 1 ? "" : "s") · pan & zoom to choose")
-                            .font(.system(size: 11)).foregroundStyle(Color(TopoStyle.accentText).opacity(0.8))
-                    }
-                    Spacer()
+            // One evaluation per render (this body re-runs on every continuous
+            // map-camera frame while dragging — it was computed four times).
+            let estimate = tileEstimate
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Selected area")
+                        .font(PPFont.ui(15, .medium))
+                        .foregroundStyle(TopoStyle.inkColor)
+                        .lineLimit(1)
+                    // ONE line, whatever the zoom: huge selections clamp to a
+                    // "zoom in" nudge — a four-digit readout used to wrap the
+                    // row and shove the whole sheet's layout around. The size
+                    // (like the template's "240 MB") reads better than a tile
+                    // count; it's an estimate, terrain-dependent.
+                    Text(estimate > 999
+                        ? "over 15 GB · zoom in"
+                        : "~\(Self.sizeText(tiles: estimate)) · pan & zoom to choose")
+                        .font(PPFont.mono(11))
+                        .foregroundStyle(TopoStyle.inkColor.opacity(0.5))
+                        .lineLimit(1)
                 }
-                .foregroundStyle(Color(TopoStyle.accentText))
-                .padding(.horizontal, 14).padding(.vertical, 12)
-                .background(Color(TopoStyle.accent), in: RoundedRectangle(cornerRadius: 12))
+                Spacer(minLength: 8)
+                Button {
+                    Task { await downloadSelected() }
+                } label: {
+                    Text("Download")
+                        .font(PPFont.ui(14, .semibold))
+                        .foregroundStyle(TopoStyle.paperColor)
+                        .lineLimit(1)
+                        .fixedSize()
+                        .padding(.horizontal, 18)
+                        .frame(height: 38)
+                        .background(TopoStyle.inkColor, in: RoundedRectangle(cornerRadius: 11))
+                }
+                .buttonStyle(.plain)
+                .disabled(estimate == 0)
+                .opacity(estimate == 0 ? 0.4 : 1)
             }
-            .buttonStyle(.plain)
-            .disabled(tileEstimate == 0)
-            .opacity(tileEstimate == 0 ? 0.5 : 1)
 
             if let status = store.statusText {
-                Text(status).font(.system(size: 12)).foregroundStyle(.orange.opacity(0.9))
+                Text(status)
+                    .font(PPFont.mono(11))
+                    .foregroundStyle(TopoStyle.inkColor.opacity(0.6))
             }
         }
     }
@@ -191,27 +215,36 @@ struct RegionManagerView: View {
 
     private var regionList: some View {
         ScrollView {
-            VStack(spacing: 8) {
+            VStack(spacing: 0) {
                 ForEach(store.regions) { region in
                     HStack(spacing: 12) {
-                        Image(systemName: "map").foregroundStyle(Color(TopoStyle.accent))
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(region.name).font(.system(size: 14, weight: .medium)).foregroundStyle(.white)
-                            Text("\(Int(region.radiusKm)) km · \(store.sizeText(region))")
-                                .font(.system(size: 11)).foregroundStyle(.white.opacity(0.55))
-                        }
+                        Image(systemName: "map")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(TopoStyle.inkColor.opacity(0.65))
+                        Text(region.name)
+                            .font(PPFont.ui(14, .medium))
+                            .foregroundStyle(TopoStyle.inkColor)
+                            .lineLimit(1)
                         Spacer()
+                        Text("\(Int(region.radiusKm)) km · \(store.sizeText(region))")
+                            .font(PPFont.mono(11))
+                            .foregroundStyle(TopoStyle.inkColor.opacity(0.5))
                         Button { store.delete(region) } label: {
-                            Image(systemName: "trash").foregroundStyle(.red.opacity(0.85))
+                            Image(systemName: "trash")
+                                .font(.system(size: 13))
+                                .foregroundStyle(TopoStyle.occludedColor.opacity(0.85))
+                                .contentShape(Rectangle().inset(by: -8))
                         }
                         .buttonStyle(.plain)
                     }
-                    .padding(.horizontal, 12).padding(.vertical, 10)
-                    .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                    .frame(height: 40)
+                    if region.id != store.regions.last?.id {
+                        Rectangle().fill(TopoStyle.hairline(0.08)).frame(height: 1)
+                    }
                 }
             }
         }
-        .frame(maxHeight: 180)
+        .frame(maxHeight: 132)
     }
 
     private var footer: some View {
@@ -220,7 +253,16 @@ struct RegionManagerView: View {
             Spacer()
             Text("Storage: \(store.totalSizeText)")
         }
-        .font(.system(size: 12)).foregroundStyle(.white.opacity(0.5))
+        .font(PPFont.mono(10))
+        .foregroundStyle(TopoStyle.inkColor.opacity(0.45))
+    }
+
+    // MARK: Downloaded coverage overlay
+
+    /// The exact saved areas across all regions, decomposed into
+    /// non-overlapping rectangles so the union fills seamlessly.
+    private var savedAreas: [RegionBox] {
+        RegionStore.unionRects(store.regions.flatMap(\.boxes))
     }
 
     // MARK: Selection geometry
@@ -238,7 +280,13 @@ struct RegionManagerView: View {
 
     private var tileEstimate: Int {
         guard let b = selectedBBox else { return 0 }
-        return DEMFetcher.regionTiles(south: b.south, north: b.north, west: b.west, east: b.east).count
+        return DEMFetcher.regionTileCount(south: b.south, north: b.north, west: b.west, east: b.east)
+    }
+
+    /// "~60 MB" for a tile-count estimate.
+    private static func sizeText(tiles: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(tiles) * approxTileBytes,
+                                  countStyle: .file)
     }
 
     private func downloadSelected() async {

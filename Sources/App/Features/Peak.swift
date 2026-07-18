@@ -50,6 +50,32 @@ struct Peak: Identifiable, Codable, Hashable, Sendable {
 
     /// Label priority: prominent peaks win declutter fights.
     var priority: Double { prominenceMeters ?? elevationMeters * 0.25 }
+
+    /// Display name: a name in a non-Latin script gets a Latin transliteration
+    /// appended in parens — "富士山 (Fu Shi Shan)", "Эльбрус (Elbrus)" — so
+    /// labels stay readable anywhere on Earth. Latin names pass through as-is.
+    var displayName: String {
+        guard let latin = Self.latinized(name) else { return name }
+        return "\(name) (\(latin))"
+    }
+
+    /// Offline ICU transliteration of `s` when it is written in a non-Latin
+    /// script; nil when `s` is already Latin (or transliterating adds nothing).
+    static func latinized(_ s: String) -> String? {
+        // Quick reject — the overwhelmingly common case. Everything below
+        // U+0370 (Greek onward) is Latin, punctuation, digits or combining
+        // diacritics; none of those need (or survive) transliteration.
+        guard s.unicodeScalars.contains(where: { $0.value >= 0x0370 }) else { return nil }
+        guard var latin = s.applyingTransform(
+                  StringTransform("Any-Latin; Latin-ASCII"), reverse: false)?
+                  .trimmingCharacters(in: .whitespacesAndNewlines),
+              !latin.isEmpty,
+              latin.caseInsensitiveCompare(s) != .orderedSame else { return nil }
+        // Han/kana readings come out all-lowercase ("fu shi shan") — title-case
+        // them; scripts that carry case (Cyrillic, Greek) keep their own.
+        if latin == latin.lowercased() { latin = latin.capitalized }
+        return latin
+    }
 }
 
 /// Loads the bundled peak directory and answers radius queries.
@@ -71,8 +97,7 @@ struct PeakStore: Sendable {
     }
 
     func peaks(nearLatitude lat: Double, longitude lon: Double, withinMeters radius: Double) -> [Peak] {
-        let latDelta = radius / 111_000
-        let lonDelta = radius / (111_000 * max(cos(lat * .pi / 180), 0.001))
+        let (latDelta, lonDelta) = GeoMath.boundingDegreeDeltas(radiusMeters: radius, latitude: lat)
         return peaks.filter {
             abs($0.latitude - lat) <= latDelta && abs($0.longitude - lon) <= lonDelta
                 && GeoMath.distanceMeters(

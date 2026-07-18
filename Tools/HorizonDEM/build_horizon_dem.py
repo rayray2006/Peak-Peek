@@ -3,8 +3,10 @@
 
 One-time, build-machine-only tool. The app uses this for the FAR-HORIZON RING:
 silhouettes of terrain beyond the 120 km raymarched tiers (see FarHorizon.swift).
-At those distances a 5-arc-minute grid predicts skyline angles to ~0.1°, so the
-whole planet fits in ~18 MB.
+A 3-arc-minute grid (max-pooled 3x from ETOPO1) keeps silhouette features
+~1.5° wide at 150 km instead of the 5' grid's ~3° blobs; the whole planet
+fits in ~52 MB. (POOL=5 was the original 18 MB tier — still a valid fallback
+if bundle size ever needs to shrink.)
 
 Input: etopo1_ice_g_i2.bin — ETOPO1 grid-registered int16 little-endian,
 21601 x 10801, row 0 = lat +90, col 0 = lon -180, 1 arc-minute cells.
@@ -24,8 +26,8 @@ import sys
 import numpy as np
 
 SRC_COLS, SRC_ROWS = 21601, 10801
-POOL = 5                    # 1' -> 5' cells
-OUT_COLS, OUT_ROWS = 4320, 2160
+POOL = 3                    # 1' -> 3' cells
+OUT_COLS, OUT_ROWS = 7200, 3600
 
 
 def main():
@@ -46,7 +48,7 @@ def main():
         f.write(struct.pack("<HHIIf", 1, 0, OUT_COLS, OUT_ROWS, POOL / 60.0))
         f.write(pooled.tobytes())
     land = int((pooled > 0).sum())
-    print(f"wrote {out_path}: {OUT_COLS}x{OUT_ROWS} 5' cells, "
+    print(f"wrote {out_path}: {OUT_COLS}x{OUT_ROWS} {POOL}' cells, "
           f"{land} land cells, max {int(pooled.max())} m")
 
 

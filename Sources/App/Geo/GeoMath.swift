@@ -5,12 +5,26 @@ import Foundation
 enum GeoMath {
     static let earthRadiusMeters: Double = 6_371_000
 
-    /// Earth-curvature drop (meters) at `distance`, including the standard 0.87
-    /// atmospheric-refraction factor (light bends down, recovering ~13% of the drop)
-    /// — the correction PeakFinder applies so 200 km giants appear exactly as high
-    /// as they really look.
+    /// Standard atmospheric refraction coefficient k ≈ 0.13: light bends down,
+    /// recovering ~13% of the curvature drop. THE one home for the constant —
+    /// the horizon march, label anchors, far-horizon ring and shader curvature
+    /// must all agree, or distant peaks and their labels drift apart.
+    static let refractionCoefficient = 0.13
+
+    /// Earth-curvature drop (meters) at `distance`, including the standard
+    /// atmospheric-refraction factor — the correction PeakFinder applies so
+    /// 200 km giants appear exactly as high as they really look.
     static func curvatureDrop(distanceMeters d: Double) -> Double {
-        0.87 * d * d / (2 * earthRadiusMeters)
+        (1 - refractionCoefficient) * d * d / (2 * earthRadiusMeters)
+    }
+
+    /// Bounding-box half-extents in degrees for a radius at a latitude — the
+    /// cheap prefilter used before exact haversine checks.
+    static func boundingDegreeDeltas(radiusMeters: Double, latitude: Double)
+        -> (lat: Double, lon: Double) {
+        let latDelta = radiusMeters / 111_000
+        let lonDelta = radiusMeters / (111_000 * max(cos(latitude * .pi / 180), 0.001))
+        return (latDelta, lonDelta)
     }
 
     /// Apparent rise (meters) of a terrain point above the eye's horizontal,

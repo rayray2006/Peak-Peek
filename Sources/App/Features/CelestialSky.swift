@@ -170,13 +170,12 @@ enum CelestialSky {
     }
 
     static func projectedStars(date: Date, latitude: Double, longitude: Double) -> [ProjectedStar] {
-        allStars.map { star in
+        let transform = SkyTransform(date: date, latitude: latitude, longitude: longitude)
+        return allStars.map { star in
             let position = horizontal(
                 rightAscensionDeg: star.rightAscensionHours * 15,
                 declinationDeg: star.declinationDeg,
-                date: date,
-                latitude: latitude,
-                longitude: longitude
+                transform: transform
             )
             return ProjectedStar(
                 name: star.name,
@@ -247,6 +246,7 @@ enum CelestialSky {
         let T = (jd - 2451545.0) / 36525.0
         let e0 = heliocentric(earth, T)
         let eps = 23.43928 * .pi / 180                       // obliquity (J2000)
+        let transform = SkyTransform(date: date, latitude: latitude, longitude: longitude)
         return planetElements.map { p in
             let h = heliocentric(p, T)
             let gx = h.x - e0.x, gy = h.y - e0.y, gz = h.z - e0.z   // geocentric ecliptic
@@ -257,7 +257,7 @@ enum CelestialSky {
             let raDeg = normalizeDeg(atan2(yeq, xeq) * 180 / .pi)
             let decDeg = atan2(zeq, (xeq * xeq + yeq * yeq).squareRoot()) * 180 / .pi
             let pos = horizontal(rightAscensionDeg: raDeg, declinationDeg: decDeg,
-                                 date: date, latitude: latitude, longitude: longitude)
+                                 transform: transform)
             let mag = p.vRef + 5 * log10(max(1e-4, h.r * delta))    // approximate
             return ProjectedPlanet(name: p.name, azimuthDeg: pos.azimuthDeg,
                                    elevationDeg: pos.elevationDeg, magnitude: mag, color: p.color)
@@ -293,41 +293,57 @@ enum CelestialSky {
         return t * t * (3 - 2 * t)
     }
 
-    /// J2000 catalog place → apparent local horizontal coordinates. Precesses the
-    /// equinox to the date (Meeus eq. 21.3/21.4 — by 2026 the sky has rotated
-    /// ~0.36° since J2000, a visible offset against a ridge), computes the hour
-    /// angle from of-date GMST, then adds atmospheric refraction so stars sit
-    /// where the eye sees them, consistent with the sun/moon and the terrain.
+    /// Date/site-only terms of the J2000 → horizontal transform, hoisted out of
+    /// the per-star loop: Julian day, the three precession polynomials, GMST and
+    /// the observer's latitude trig depend only on (date, lat, lon) — yet were
+    /// recomputed for each of the ~5,900 stars on every rebuild, the bulk of
+    /// scrub-time CPU.
+    private struct SkyTransform {
+        let zeta: Double, zDeg: Double
+        let sinTheta: Double, cosTheta: Double
+        let gmstPlusLonDeg: Double
+        let sinLat: Double, cosLat: Double
+
+        init(date: Date, latitude: Double, longitude: Double) {
+            let jd = Ephemeris.julianDay(date)
+            // Precession J2000 → date (rigorous rotation, ≪1′ over ±1 century;
+            // Meeus eq. 21.3/21.4 — by 2026 the sky has rotated ~0.36° since
+            // J2000, a visible offset against a ridge).
+            let t = (jd - 2451545.0) / 36525.0
+            let zetaDeg = (2306.2181 * t + 0.30188 * t * t + 0.017998 * t * t * t) / 3600
+            zDeg = (2306.2181 * t + 1.09468 * t * t + 0.018203 * t * t * t) / 3600
+            let thetaDeg = (2004.3109 * t - 0.42665 * t * t - 0.041833 * t * t * t) / 3600
+            zeta = zetaDeg * .pi / 180
+            let theta = thetaDeg * .pi / 180
+            sinTheta = sin(theta); cosTheta = cos(theta)
+            gmstPlusLonDeg = normalizeDeg(280.46061837 + 360.98564736629 * (jd - 2451545.0))
+                + longitude
+            let lat = latitude * .pi / 180
+            sinLat = sin(lat); cosLat = cos(lat)
+        }
+    }
+
+    /// J2000 catalog place → apparent local horizontal coordinates, using the
+    /// precomputed per-rebuild transform. Adds atmospheric refraction so stars
+    /// sit where the eye sees them, consistent with the sun/moon and terrain.
     private static func horizontal(
         rightAscensionDeg: Double,
         declinationDeg: Double,
-        date: Date,
-        latitude: Double,
-        longitude: Double
+        transform tf: SkyTransform
     ) -> (azimuthDeg: Double, elevationDeg: Double) {
-        let jd = Ephemeris.julianDay(date)
-
-        // Precession J2000 → date (rigorous rotation, ≪1′ over ±1 century).
-        let t = (jd - 2451545.0) / 36525.0
-        let zetaDeg = (2306.2181 * t + 0.30188 * t * t + 0.017998 * t * t * t) / 3600
-        let zDeg = (2306.2181 * t + 1.09468 * t * t + 0.018203 * t * t * t) / 3600
-        let thetaDeg = (2004.3109 * t - 0.42665 * t * t - 0.041833 * t * t * t) / 3600
-        let zeta = zetaDeg * .pi / 180, theta = thetaDeg * .pi / 180
         let ra0 = rightAscensionDeg * .pi / 180, dec0 = declinationDeg * .pi / 180
-        let A = cos(dec0) * sin(ra0 + zeta)
-        let B = cos(theta) * cos(dec0) * cos(ra0 + zeta) - sin(theta) * sin(dec0)
-        let C = sin(theta) * cos(dec0) * cos(ra0 + zeta) + cos(theta) * sin(dec0)
-        let raDeg = atan2(A, B) * 180 / .pi + zDeg
+        let A = cos(dec0) * sin(ra0 + tf.zeta)
+        let B = tf.cosTheta * cos(dec0) * cos(ra0 + tf.zeta) - tf.sinTheta * sin(dec0)
+        let C = tf.sinTheta * cos(dec0) * cos(ra0 + tf.zeta) + tf.cosTheta * sin(dec0)
+        let raDeg = atan2(A, B) * 180 / .pi + tf.zDeg
         let dec = asin(max(-1, min(1, C)))
 
-        let gmstDeg = normalizeDeg(280.46061837 + 360.98564736629 * (jd - 2451545.0))
-        let hourAngle = normalizeSignedDeg(gmstDeg + longitude - raDeg) * .pi / 180
-        let lat = latitude * .pi / 180
+        let hourAngle = normalizeSignedDeg(tf.gmstPlusLonDeg - raDeg) * .pi / 180
 
-        let elevation = asin(sin(lat) * sin(dec) + cos(lat) * cos(dec) * cos(hourAngle))
+        let elevation = asin(tf.sinLat * sin(dec) + tf.cosLat * cos(dec) * cos(hourAngle))
         let azFromSouth = atan2(
             sin(hourAngle),
-            cos(hourAngle) * sin(lat) - tan(dec) * cos(lat)
+            cos(hourAngle) * tf.sinLat - tan(dec) * tf.cosLat
         )
         let elDeg = elevation * 180 / .pi
         return (

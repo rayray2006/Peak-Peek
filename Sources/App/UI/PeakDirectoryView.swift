@@ -9,6 +9,18 @@ import SwiftUI
 /// (grabber, field, message — the rows scroll) closes it in a single gesture.
 struct PeakDirectoryView: View {
     @ObservedObject var model: PanoramaViewModel
+    /// Owned by RootScreen so the query survives the panel closing — picking a
+    /// result opens the peak card, and closing THAT returns here with the
+    /// search exactly as it was left.
+    @Binding var query: String
+    /// The user's Saved/Completed entries — included in the search index so
+    /// custom saved locations (not in any peak database) are findable by name.
+    let savedPeaks: [Peak]
+    /// Vertical space actually available to the card (the hosting container's
+    /// height, which the keyboard already shrinks). Caps how many result rows
+    /// show: the fixed 4/2-row caps overflowed small screens in landscape,
+    /// pushing the card's top rows off-screen while the keyboard was up.
+    let availableHeight: CGFloat
     let onPick: (Peak) -> Void
     let onClose: () -> Void
 
@@ -19,17 +31,43 @@ struct PeakDirectoryView: View {
         var id: String { rawValue }
     }
 
-    @State private var query = ""
     @State private var sort: Sort = .distance     // near-first by default
-    /// Everything searchable offline: nearby peaks + every downloaded pack/OSM
-    /// peak, deduped ONCE off-main. Per-keystroke work is a flat scan of this.
+    /// Everything searchable offline: nearby peaks + lakes + every downloaded
+    /// pack/OSM peak, deduped ONCE off-main. Per-keystroke work is a flat scan.
     @State private var baseIndex: [Peak] = []
-    /// Whole-world name matches from the bundled DB (instant, offline).
+    /// Whole-world name matches from the bundled DBs (instant, offline).
     @State private var globalIndex: [Peak] = []
+    /// Which indexed features are WATER (nearby lakes + global lake DB hits) —
+    /// drives the honest visibility verdict per row.
+    @State private var baseWaterIDs: Set<String> = []
+    @State private var globalWaterIDs: Set<String> = []
     /// Displayed results. Computed OFF the main thread (filter + dedup + sort of
     /// a ~100k index blocked typing when it ran in a computed property per
     /// keystroke); each recompute cancels the previous one.
     @State private var rows: [Row] = []
+
+    /// The last computed results, kept across panel instances (main-thread
+    /// only, like all of SwiftUI). Reopening with the restored query seeds
+    /// `rows` in the FIRST body pass, so the card arrives at full height in
+    /// one motion instead of opening as a bare field and then expanding when
+    /// the async recompute lands.
+    private static var lastSession: (query: String, sort: Sort, rows: [Row])?
+
+    init(model: PanoramaViewModel, query: Binding<String>, savedPeaks: [Peak],
+         availableHeight: CGFloat,
+         onPick: @escaping (Peak) -> Void, onClose: @escaping () -> Void) {
+        self._model = ObservedObject(wrappedValue: model)
+        self._query = query
+        self.savedPeaks = savedPeaks
+        self.availableHeight = availableHeight
+        self.onPick = onPick
+        self.onClose = onClose
+        let trimmed = query.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, let cached = Self.lastSession, cached.query == trimmed {
+            _rows = State(initialValue: cached.rows)
+            _sort = State(initialValue: cached.sort)
+        }
+    }
     /// A rows recompute is in flight — suppresses the "no matches" empty state.
     @State private var searchPending = false
     @State private var searchTask: Task<Void, Never>?
@@ -49,14 +87,15 @@ struct PeakDirectoryView: View {
     var body: some View {
         VStack(spacing: 0) {
             grabber
-            resultsArea
+            titleRow
             inputBar
+            resultsArea
         }
-        .background(Color(TopoStyle.background), in: RoundedRectangle(cornerRadius: 18))
-        .environment(\.colorScheme, .dark)
+        .background(TopoStyle.paperColor, in: RoundedRectangle(cornerRadius: 24))
+        .shadow(color: .black.opacity(0.22), radius: 20, y: 12)
         .frame(maxWidth: 500)
-        .padding(.horizontal, 10)
-        .padding(.bottom, 6)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 8)
         // Interactive swipe-down: the card FOLLOWS the finger (upward pulls
         // rubber-band like a sheet), then commits past a distance/velocity
         // threshold or springs back. The results scroll view consumes its own
@@ -88,15 +127,33 @@ struct PeakDirectoryView: View {
             if let i = args.firstIndex(of: "-searchQuery"), i + 1 < args.count {
                 query = args[i + 1]
             }
+            // A RESTORED query (reopening after the peak card closes) arrives
+            // with the view, so onChange(of: query) never fires — search it now.
+            if !trimmedQuery.isEmpty {
+                searchGlobal()
+                recomputeRows()
+            }
         }
-        .onChange(of: model.viewpoint) { _, _ in
-            reloadDownloadedIndex()
+        .onChange(of: model.viewpoint) { old, new in
+            // The index merges ~100k cached peaks; while GPS-following every
+            // small fix change republishes the viewpoint, so gate the rebuild
+            // on a move that could actually change the nearby set.
+            guard let old, let new else { reloadDownloadedIndex(); return }
+            let moved = GeoMath.distanceMeters(
+                fromLatitude: old.latitude, fromLongitude: old.longitude,
+                toLatitude: new.latitude, toLongitude: new.longitude)
+            if moved > 500 { reloadDownloadedIndex() }
         }
         .onChange(of: query) { _, _ in
             searchGlobal()
             recomputeRows()
         }
         .onChange(of: sort) { _, _ in
+            recomputeRows()
+        }
+        // The occlusion pass lands a beat after the render — refresh the
+        // visibility badges when its verdict set arrives or changes.
+        .onChange(of: model.visibleFeatureIDs) { _, _ in
             recomputeRows()
         }
         .onDisappear {
@@ -108,10 +165,32 @@ struct PeakDirectoryView: View {
 
     private var grabber: some View {
         Capsule()
-            .fill(.white.opacity(0.28))
-            .frame(width: 36, height: 4.5)
-            .padding(.top, 8)
-            .padding(.bottom, 1)
+            .fill(TopoStyle.hairline(0.15))
+            .frame(width: 36, height: 4)
+            .padding(.top, 10)
+            .padding(.bottom, 8)
+    }
+
+    /// The template's sheet header: "Search" + quiet ✕.
+    private var titleRow: some View {
+        HStack {
+            Text("Search")
+                .font(PPFont.ui(16, .semibold))
+                .foregroundStyle(TopoStyle.inkColor)
+            Spacer()
+            Button {
+                searchFocused = false
+                onClose()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(TopoStyle.inkColor.opacity(0.5))
+                    .contentShape(Rectangle().inset(by: -12))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 20)
+        .padding(.bottom, 12)
     }
 
     /// Everything above the search field, sized to content: nothing while the
@@ -122,15 +201,17 @@ struct PeakDirectoryView: View {
         if trimmedQuery.isEmpty || (rows.isEmpty && searchPending) {
             EmptyView()
         } else if rows.isEmpty {
-            VStack(spacing: 3) {
+            VStack(spacing: 5) {
                 Text("No matches")
-                    .font(.subheadline.weight(.semibold))
-                Text("Every named peak worldwide is searched.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(PPFont.ui(15, .semibold))
+                    .foregroundStyle(TopoStyle.inkColor)
+                Text("Peaks and lakes worldwide are searched.")
+                    .font(PPFont.mono(11))
+                    .foregroundStyle(TopoStyle.inkColor.opacity(0.5))
             }
-            .padding(.top, 10)
-            .padding(.bottom, 4)
+            .padding(.top, 2)
+            .padding(.bottom, 20)
+            .padding(.horizontal, 20)
             .frame(maxWidth: .infinity)
             .multilineTextAlignment(.center)
         } else {
@@ -138,44 +219,55 @@ struct PeakDirectoryView: View {
                 LazyVStack(spacing: 0) {
                     ForEach(rows) { row in
                         Button { onPick(row.peak) } label: {
+                            // Template row: name over the sightline badge on
+                            // the left, the mono facts on the right.
                             HStack(spacing: 12) {
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text(row.peak.name)
-                                        .font(.system(size: 16, weight: .semibold))
-                                        .foregroundStyle(.primary)
+                                    Text(row.peak.displayName)
+                                        .font(PPFont.ui(15, .medium))
+                                        .foregroundStyle(TopoStyle.inkColor)
                                         .lineLimit(1)
-                                    if !row.subtitle.isEmpty {
-                                        Text(row.subtitle)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
+                                    if let visible = row.isVisible {
+                                        PPVisibilityBadge(visible: visible)
                                     }
                                 }
                                 Spacer(minLength: 12)
+                                if !row.subtitle.isEmpty {
+                                    Text(row.subtitle)
+                                        .font(PPFont.mono(11))
+                                        .foregroundStyle(TopoStyle.inkColor.opacity(0.5))
+                                        .lineLimit(1)
+                                }
                             }
-                            // Fixed row height: the results detent shows exactly
-                            // four of these (56×4 + hairlines + bar = 304).
-                            .frame(height: 56)
+                            // Fixed row height (template rows are 52 pt); the
+                            // results window shows up to four.
+                            .frame(height: 52)
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         if row.id != rows.last?.id {
-                            Divider().overlay(.white.opacity(0.08))
+                            Divider().overlay(TopoStyle.hairline(0.08))
                         }
                     }
                 }
-                .padding(.horizontal, 26)
-                .padding(.top, 6)
+                .padding(.horizontal, 20)
+                .padding(.top, 2)
             }
             .frame(height: resultsHeight)
+            .padding(.bottom, 10)
         }
     }
 
-    /// Content-sized results window: exactly as many 56 pt rows as there are,
-    /// capped at four (two in landscape, where the keyboard owns the height);
-    /// anything past the cap scrolls.
+    /// Content-sized results window: exactly as many 52 pt rows as there are,
+    /// capped at four (fewer when the space above the keyboard can't fit them —
+    /// small phones in landscape fit just one); anything past the cap scrolls.
     private var resultsHeight: CGFloat {
         let cap = verticalSizeClass == .compact ? 2 : 4
-        return CGFloat(min(rows.count, cap)) * 56 + 8
+        // Chrome around the rows: grabber + title + field + card paddings, plus
+        // a little clearance so the card never kisses the screen edge.
+        let chrome: CGFloat = 170
+        let fitting = max(1, Int((availableHeight - chrome) / 52))
+        return CGFloat(min(rows.count, min(cap, fitting))) * 52 + 6
     }
 
     /// Bottom search bar: field + clear + sort, one thumb-height row, styled as
@@ -184,26 +276,32 @@ struct PeakDirectoryView: View {
     private var inputBar: some View {
         HStack(spacing: 10) {
             Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
-            TextField("Search peaks", text: $query)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(TopoStyle.inkColor.opacity(0.65))
+            TextField("Search", text: $query)
+                .font(PPFont.ui(15))
+                .foregroundStyle(TopoStyle.inkColor)
+                .tint(TopoStyle.inkColor)
                 .focused($searchFocused)
                 .autocorrectionDisabled()
                 .submitLabel(.search)
             if !query.isEmpty {
                 Button { query = "" } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(TopoStyle.inkColor.opacity(0.35))
                 }
                 .buttonStyle(.plain)
             }
             sortMenu
         }
         .padding(.horizontal, 14)
-        .frame(height: 48)
-        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
-        .padding(.horizontal, 12)
-        .padding(.top, 6)
-        .padding(.bottom, 10)
+        .frame(height: 44)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(TopoStyle.hairline(0.18), lineWidth: 1)
+        )
+        .padding(.horizontal, 20)
+        .padding(.bottom, 12)
     }
 
     /// Sort control: plain glyph, no circle — the circled ✕ next to it is the
@@ -225,7 +323,7 @@ struct PeakDirectoryView: View {
         } label: {
             Image(systemName: "arrow.up.arrow.down")
                 .font(.footnote.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(TopoStyle.inkColor.opacity(0.65))
                 .frame(width: 26, height: 30)
                 .contentShape(Rectangle())
         }
@@ -243,6 +341,9 @@ struct PeakDirectoryView: View {
         /// does, 2 = mid-word substring ("Ja[lake]"). Primary sort key — mid-word
         /// noise stays below real matches whatever the chosen sort.
         let rank: Int
+        /// Renderer's sightline verdict from the current viewpoint; nil = never
+        /// judged (out of range / no pass yet) — no badge, not a false "Hidden".
+        let isVisible: Bool?
         var id: String { peak.id }
         var subtitle: String {
             var parts: [String] = []
@@ -269,8 +370,16 @@ struct PeakDirectoryView: View {
         // against the whole-world matches.
         let base = baseIndex, global = globalIndex
         let eye = model.viewpoint, sort = sort, cap = maxDisplayedRows
+        // Visibility badge inputs, snapshotted on main: the renderer's verdict
+        // set plus the candidate lists that were actually judged.
+        let visibleIDs = model.visibleFeatureIDs
+        let candidatePeaks = model.allNearbyPeaks
+        let candidateLakes = model.nearbyLakes
+        let waterIDs = baseWaterIDs.union(globalWaterIDs)
         rowsTask = Task {
             let computed = await Task.detached(priority: .userInitiated) { () -> [Row] in
+                let candidateIDs = Set(candidatePeaks.map(\.id))
+                    .union(candidateLakes.map(\.id))
                 let localHits = base.filter { $0.name.localizedCaseInsensitiveContains(needle) }
                 let merged = Self.mergePeaks(localHits + global)
                 // Relevance: a match at the start of the name or a word beats a
@@ -295,8 +404,17 @@ struct PeakDirectoryView: View {
                             fromLatitude: $0.latitude, fromLongitude: $0.longitude,
                             toLatitude: peak.latitude, toLongitude: peak.longitude) * 180 / .pi
                     }
+                    let visible: Bool? = if let visibleIDs, let distance {
+                        PanoramaViewModel.visibilityVerdict(
+                            peakID: peak.id, isSaddle: peak.isSaddle,
+                            elevationMeters: peak.elevationMeters,
+                            prominenceMeters: peak.prominenceMeters,
+                            isWater: waterIDs.contains(peak.id),
+                            distanceMeters: distance, visibleIDs: visibleIDs,
+                            isCandidate: candidateIDs.contains(peak.id))
+                    } else { nil }
                     return Row(peak: peak, distanceMeters: distance, bearingDeg: bearing,
-                               rank: rank(of: peak.name))
+                               rank: rank(of: peak.name), isVisible: visible)
                 }
                 switch sort {
                 case .elevation: return Array(mapped.sorted {
@@ -310,38 +428,48 @@ struct PeakDirectoryView: View {
             guard !Task.isCancelled else { return }
             rows = computed
             searchPending = false
+            // Seed for the next open: reopening with this query renders these
+            // rows synchronously (see init).
+            Self.lastSession = (needle, sort, computed)
         }
     }
 
     private func reloadDownloadedIndex() {
         indexTask?.cancel()
+        // Saved entries first: dedup keeps the first occurrence, so a saved
+        // location's user-given name wins over a database twin at the same spot.
+        let saved = savedPeaks
         let nearby = model.allNearbyPeaks
+        let lakes = model.nearbyLakes
         indexTask = Task {
             let peaks = await Task.detached(priority: .utility) {
                 let packPeaks = PeakPackService.allCachedPeaks()
                 let osmPeaks = OSMPeakService.allCachedPeaks()
-                return Self.mergePeaks(nearby + packPeaks + osmPeaks)
+                return Self.mergePeaks(saved + nearby + lakes + packPeaks + osmPeaks)
             }.value
             guard !Task.isCancelled else { return }
             baseIndex = peaks
+            baseWaterIDs = Set(lakes.map(\.id))
             recomputeRows()
         }
     }
 
-    /// Instant whole-world search against the bundled database (no network) —
-    /// a raw byte scan of ~1.5M names, debounced per keystroke.
+    /// Instant whole-world search against the bundled databases (no network) —
+    /// raw byte scans of ~1.5M peak names + the lake DB, debounced per keystroke.
     private func searchGlobal() {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
         searchTask?.cancel()
-        guard needle.count >= 2 else { globalIndex = []; return }
+        guard needle.count >= 2 else { globalIndex = []; globalWaterIDs = []; return }
         searchTask = Task {
             try? await Task.sleep(for: .milliseconds(150))       // debounce typing
             guard !Task.isCancelled else { return }
-            let hits = await Task.detached(priority: .userInitiated) {
-                GlobalPeakDatabase.shared?.search(nameContains: needle) ?? []
+            let (peakHits, lakeHits) = await Task.detached(priority: .userInitiated) {
+                (GlobalPeakDatabase.shared?.search(nameContains: needle) ?? [],
+                 GlobalPeakDatabase.lakes?.search(nameContains: needle) ?? [])
             }.value
             guard !Task.isCancelled else { return }
-            globalIndex = hits
+            globalIndex = peakHits + lakeHits
+            globalWaterIDs = Set(lakeHits.map(\.id))
             recomputeRows()
         }
     }

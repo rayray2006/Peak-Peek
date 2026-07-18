@@ -28,8 +28,13 @@ enum Ephemeris {
     struct Path: Sendable {
         let body: Body
         let samples: [PathSample]
-        let rises: [Date]
-        let sets: [Date]
+
+        /// Whether `date` falls inside the sampled lap — the caller's guarantee
+        /// that the body's disc at `date` lies ON the drawn arc.
+        func covers(_ date: Date) -> Bool {
+            guard let first = samples.first?.date, let last = samples.last?.date else { return false }
+            return date >= first && date <= last
+        }
     }
 
     struct MoonPhase: Sendable {
@@ -37,10 +42,6 @@ enum Ephemeris {
         let illuminatedFraction: Double
         let ageDays: Double
     }
-
-    /// Rise/set target altitude for APPARENT positions (refraction is already in
-    /// the elevations): −0.27° ≈ the semidiameter, i.e. upper limb on the horizon.
-    static let riseSetAltitudeDeg: Double = -0.27
 
     /// Atmospheric refraction (degrees) lifting a body at TRUE altitude `h`
     /// (degrees): Sæmundsson's standard-atmosphere formula (Meeus ch. 16),
@@ -132,31 +133,60 @@ enum Ephemeris {
         return MoonPhase(name: names[index], illuminatedFraction: illuminated, ageDays: age)
     }
 
-    /// One full diurnal lap for the CALENDAR DAY of `date`, anchored at the body's
-    /// LOWER CULMINATION so the open seam sits at the bottom of the sky.
+    /// One full diurnal lap CONTAINING `date`, anchored at the body's LOWER
+    /// CULMINATION so the open seam sits at the bottom of the sky.
     ///
-    /// The lap is anchored to the day (via local noon), NOT to the exact `date`, so
-    /// scrubbing the time of day leaves the arc fixed in the sky — only the disc moves
-    /// along it. (Anchoring to `date` made the discrete back-scan re-pick the lower
-    /// culmination as you scrubbed, so the whole arc drifted up and jumped back.)
+    /// The lap is anchored to the culmination (an instant intrinsic to the sky,
+    /// refined to the minute grid), NOT to the exact `date`, so scrubbing the
+    /// time of day leaves the arc fixed — only the disc moves along it; the arc
+    /// re-anchors only when the scrub crosses the culmination itself, at the
+    /// bottom of the sky. It used to be anchored to the CALENDAR day instead
+    /// (back-scan from local noon), which broke the moon: its lap is ~24h50m,
+    /// so an evening `date` could fall AFTER the day-anchored lap ended and the
+    /// disc sat visibly off the drawn arc — off by the ~13°/day orbital drift
+    /// from the previous lap.
     static func windowPath(
         of body: Body, centeredOn date: Date, latitude: Double, longitude: Double,
         stepMinutes: Int = 10
     ) -> Path {
         let totalMinutes = body == .moon ? 1_490 : 1_440
-        // Stable per-day anchor: local noon of the day containing `date`.
-        let anchor = Calendar.current.startOfDay(for: date).addingTimeInterval(12 * 3600)
-        var start = anchor
-        var lowest = Double.infinity
-        var scan = -totalMinutes
+        func elevation(_ d: Date) -> Double {
+            position(of: body, date: d, latitude: latitude, longitude: longitude).elevationDeg
+        }
+        // Coarse back-scan over a bit MORE than one lap (the pad keeps a
+        // culmination in view even at the moon's longest laps), keeping the most
+        // recent LOCAL minimum before `date` — the lower culmination that starts
+        // the lap containing it. A plain global minimum re-picked the previous
+        // culmination when the window held two, ending the lap before `date`.
+        let scanBackMinutes = totalMinutes + 120
+        var els: [Double] = []
+        els.reserveCapacity(scanBackMinutes / stepMinutes + 1)
+        var scan = -scanBackMinutes
         while scan <= 0 {
-            let d = anchor.addingTimeInterval(TimeInterval(scan * 60))
-            let el = position(of: body, date: d, latitude: latitude, longitude: longitude).elevationDeg
+            els.append(elevation(date.addingTimeInterval(TimeInterval(scan * 60))))
+            scan += stepMinutes
+        }
+        var anchorIndex = els.indices.min { els[$0] < els[$1] } ?? 0   // fallback: global min
+        for i in stride(from: els.count - 2, through: 1, by: -1)
+        where els[i] <= els[i - 1] && els[i] < els[i + 1] {
+            anchorIndex = i
+            break
+        }
+        let coarse = date.addingTimeInterval(TimeInterval((anchorIndex * stepMinutes - scanBackMinutes) * 60))
+        // Refine on the ABSOLUTE minute grid (not offsets from `date`): the
+        // anchor then lands on the same instant however the caller scrubs, so
+        // every sample — and the drawn arc — holds still to the sub-pixel.
+        var start = coarse
+        var lowest = Double.infinity
+        let gridStart = (coarse.timeIntervalSince1970 / 60).rounded(.down) * 60
+            - Double(stepMinutes * 60)
+        for m in 0...(2 * stepMinutes) {
+            let d = Date(timeIntervalSince1970: gridStart + Double(m * 60))
+            let el = elevation(d)
             if el < lowest {
                 lowest = el
                 start = d
             }
-            scan += stepMinutes
         }
         var samples: [PathSample] = []
         samples.reserveCapacity(totalMinutes / stepMinutes + 1)
@@ -168,19 +198,9 @@ enum Ephemeris {
             ))
             t += stepMinutes
         }
-        var rises: [Date] = []
-        var sets: [Date] = []
-        for i in 1..<samples.count {
-            let e0 = samples[i - 1].position.elevationDeg - riseSetAltitudeDeg
-            let e1 = samples[i].position.elevationDeg - riseSetAltitudeDeg
-            guard e0 == 0 || e0.sign != e1.sign, e0 != e1 else { continue }
-            let f = e0 / (e0 - e1)
-            let crossing = samples[i - 1].date.addingTimeInterval(
-                f * samples[i].date.timeIntervalSince(samples[i - 1].date)
-            )
-            if e1 > e0 { rises.append(crossing) } else { sets.append(crossing) }
-        }
-        return Path(body: body, samples: samples, rises: rises, sets: sets)
+        // (No astronomical-horizon rise/set scan here: the sky overlay derives
+        // its rise/set tags from the RIDGE skyline, not sea level.)
+        return Path(body: body, samples: samples)
     }
 
     // MARK: - Shared helpers
