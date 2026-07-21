@@ -40,16 +40,17 @@ struct PeakInfoPanel: View {
             }
             .padding(.trailing, 28)
 
-            // Facts left, sightline verdict right — one row.
+            // Facts with the sightline verdict riding right beside them —
+            // pushed to the far edge it read as a stray element.
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Text(statsLine)
                     .font(PPFont.mono(12))
                     .foregroundStyle(TopoStyle.inkColor.opacity(0.55))
                     .lineLimit(1)
-                Spacer(minLength: 8)
                 if let isVisible {
                     PPVisibilityBadge(visible: isVisible)
                 }
+                Spacer(minLength: 0)
             }
 
             // Three real buttons sharing the card's width.
@@ -62,7 +63,7 @@ struct PeakInfoPanel: View {
                              systemImage: isClimbed ? "checkmark.circle.fill" : "checkmark.circle",
                              tint: TopoStyle.visibleColor, active: isClimbed,
                              action: onToggleClimbed)
-                actionButton("Stand here", systemImage: "figure.stand",
+                actionButton("View", systemImage: "figure.stand",
                              tint: nil, active: false, action: onVisit)
             }
         }

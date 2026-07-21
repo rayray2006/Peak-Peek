@@ -9,6 +9,8 @@ enum GeoMath {
     /// recovering ~13% of the curvature drop. THE one home for the constant —
     /// the horizon march, label anchors, far-horizon ring and shader curvature
     /// must all agree, or distant peaks and their labels drift apart.
+    /// (Camera.swift in Sources/Terrain carries a LOCK-STEP twin: it also
+    /// builds in the ReliefRender target, which doesn't compile this file.)
     static let refractionCoefficient = 0.13
 
     /// Earth-curvature drop (meters) at `distance`, including the standard

@@ -94,6 +94,17 @@ final class PeakListStore: ObservableObject {
         }
     }
 
+    /// Rewrite an existing entry's date (debug backdating; a future
+    /// "edit the Been date" flow would land here too).
+    func setDate(_ date: Date, for peak: Peak, in kind: PeakListKind) {
+        guard var entry = saved[peak.id], entry.date(for: kind) != nil else { return }
+        switch kind {
+        case .climbed: entry.climbedAt = date
+        case .wantToClimb: entry.wantToClimbAt = date
+        }
+        saved[peak.id] = entry
+    }
+
     func remove(_ peak: Peak, from kind: PeakListKind) {
         guard var entry = saved[peak.id] else { return }
         switch kind {

@@ -1,4 +1,5 @@
 import Foundation
+import MapKit
 
 /// A lat/lon rectangle — the exact area a download selection covered. Regions
 /// carry one box per constituent download (merged regions carry several), and
@@ -136,6 +137,11 @@ final class RegionStore: ObservableObject {
             progress = Double(i + 1) / Double(tiles.count)
         }
 
+        // Best-effort offline map imagery for the pin-drop map: snapshotting
+        // the area routes its tiles through MapKit's own disk cache.
+        statusText = "Caching map imagery…"
+        await Self.warmMapCache(south: south, north: north, west: west, east: east)
+
         let newBox = RegionBox(south: min(south, north), west: min(west, east),
                                north: max(south, north), east: max(west, east))
 
@@ -185,6 +191,35 @@ final class RegionStore: ObservableObject {
         statusText = anyFailed ? "Some tiles failed — try again on Wi-Fi." : nil
         isDownloading = false
         progress = 0
+    }
+
+    /// Low-res map imagery for the downloaded area, best effort: render the
+    /// region (overview + four quadrants) through MKMapSnapshotter in the
+    /// pin-drop map's hybrid style, which lands the tiles in MapKit's disk
+    /// cache — offline, the teleport map then usually still shows the area.
+    /// (Apple ships no public offline-maps API; this is the strongest
+    /// available lever, not a guarantee.)
+    nonisolated private static func warmMapCache(
+        south: Double, north: Double, west: Double, east: Double
+    ) async {
+        let cLat = (south + north) / 2, cLon = (west + east) / 2
+        let dLat = max(0.05, north - south), dLon = max(0.05, east - west)
+        var regions = [MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: cLat, longitude: cLon),
+            span: MKCoordinateSpan(latitudeDelta: dLat * 1.4, longitudeDelta: dLon * 1.4))]
+        for (qy, qx) in [(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)] {
+            regions.append(MKCoordinateRegion(
+                center: CLLocationCoordinate2D(latitude: south + dLat * (0.25 + 0.5 * qy),
+                                               longitude: west + dLon * (0.25 + 0.5 * qx)),
+                span: MKCoordinateSpan(latitudeDelta: dLat * 0.55, longitudeDelta: dLon * 0.55)))
+        }
+        for region in regions {
+            let opts = MKMapSnapshotter.Options()
+            opts.region = region
+            opts.size = CGSize(width: 640, height: 640)
+            opts.preferredConfiguration = MKHybridMapConfiguration()
+            _ = try? await MKMapSnapshotter(options: opts).start()
+        }
     }
 
     /// Remove a region; delete only the tiles no other region still uses.

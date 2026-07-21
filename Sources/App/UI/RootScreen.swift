@@ -25,10 +25,15 @@ struct RootScreen: View {
     /// Double tap again to bring it back.
     @State private var immersive = false
     @State private var showActionMenu = false
+    /// The tapped location card's info card, for viewpoints that are NOT a
+    /// catalog feature (GPS spots, map pins): name + coordinates + Save Spot.
+    @State private var showLocationCard = false
     @State private var mode: TerrainViewMode = .threeD
     @State private var manualAlignment = false
-    /// Label density (All / Sparse / None), persisted across launches.
-    @AppStorage("labelDensity") private var labelDensityRaw = LabelDensity.all.rawValue
+    /// Label density (All / Sparse / Saved / None), persisted across
+    /// launches. Sparse by default: well-separated peaks at 1×, everything
+    /// on zoom-in.
+    @AppStorage("labelDensity") private var labelDensityRaw = LabelDensity.sparse.rawValue
     private var labelDensity: LabelDensity {
         LabelDensity(rawValue: labelDensityRaw) ?? .all
     }
@@ -110,6 +115,7 @@ struct RootScreen: View {
                 }
             },
             onVisibleFeatures: { model.visibleFeaturesResolved($0) },
+            onDEMTiles: { model.demTilesResolved(near: $0, far: $1) },
             onSunTimes: { model.sunTimesResolved($0) },
             onStatus: { model.renderStatusChanged($0) },
             onEyeElevation: { model.eyeElevationResolved($0) },
@@ -117,7 +123,10 @@ struct RootScreen: View {
             arRecenterToken: arRecenterToken,
             onARAdjustedChanged: { arAdjusted = $0 },
             onAlignmentNudged: { alignmentNudges &+= 1 },
+            onNightChanged: { isNight = $0 },
             captureToken: captureToken,
+            unitsStamp: unitsRaw,
+            photoFraming: showPhotoShutter,
             captureIncludesLabels: photoIncludesLabels,
             captureIncludesCompass: photoIncludesCompass,
             onPhotoCaptured: { ok in
@@ -163,8 +172,10 @@ struct RootScreen: View {
                 // the rotation snap and dissolves back in at its new positions.
                 Group {
                     hud
-                        .opacity(immersive ? 0 : 1)
-                        .allowsHitTesting(!immersive)
+                        // Photo framing hides every non-photo control too —
+                        // the frame is the interface.
+                        .opacity(immersive || showPhotoShutter ? 0 : 1)
+                        .allowsHitTesting(!immersive && !showPhotoShutter)
                     timePanel
                     regionsPanel
                     listsPanel
@@ -194,7 +205,9 @@ struct RootScreen: View {
         // whole theme inverts: ink chrome turns white, paper sheets turn dark —
         // legible against the night render. The dynamic TopoStyle colors and
         // every UIKit-backed view resolve against this scene-wide scheme.
-        .preferredColorScheme(isNight ? .dark : .light)
+        // Theme mode can pin it Day or Night; Auto follows the sky (fed by
+        // the renderer's onNightChanged, in the same beat the sky changes).
+        .preferredColorScheme(resolvedScheme)
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: showPhotoShutter)
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: showSaveLocation)
         // A panel opening takes over the bottom region — the armed shutter and
@@ -203,8 +216,17 @@ struct RootScreen: View {
             if sheet != nil {
                 showPhotoShutter = false
                 showSaveLocation = false
+                showLocationCard = false
             }
         }
+        // The location card describes where you STAND — a move retires it.
+        .onChange(of: model.viewpoint) { _, _ in showLocationCard = false }
+        // Selecting a feature replaces it with the feature's card; keep it
+        // retired so it doesn't pop back when that card closes.
+        .onChange(of: model.selectedPeak?.peak.id) { _, id in
+            if id != nil { showLocationCard = false }
+        }
+        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: showLocationCard)
         // The info card slides in/out with selection (picking from search runs
         // this together with the panel's activeSheet dismissal above).
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: model.selectedPeak?.peak.id)
@@ -287,15 +309,44 @@ struct RootScreen: View {
                     }
                 }
             }
+            // Debug: auto-select a NAMED peak/lake for the info card —
+            // e.g. -select "Diablo Lake" (lakes have no other headless path).
+            if let i = args.firstIndex(of: "-select"), i + 1 < args.count {
+                let needle = args[i + 1].lowercased()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 9) {
+                    if let hit = (model.allNearbyPeaks + model.nearbyLakes)
+                        .first(where: { $0.name.lowercased() == needle }) {
+                        model.select(hit)
+                    } else {
+                        NSLog("select debug: no feature named '\(needle)' nearby")
+                    }
+                }
+            }
+            // Debug: pin the sky to an instant (unix epoch seconds) — makes
+            // sunrise/sunset states reproducible, e.g. -displayDate 1789000000.
+            if let i = args.firstIndex(of: "-displayDate"), i + 1 < args.count,
+               let epoch = Double(args[i + 1]) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    model.setDisplayDate(Date(timeIntervalSince1970: epoch))
+                }
+            }
             // Debug: teleport to raw coordinates on launch — reproduces reports
             // anywhere on Earth (e.g. -viewpoint "-8.8497,-77.5949").
+            // -viewpointDelay <s> defers it, so the RESTORED scene renders
+            // first and the jump exercises the mid-session move path.
             if let i = args.firstIndex(of: "-viewpoint"), i + 1 < args.count {
                 let parts = args[i + 1].split(separator: ",")
                     .compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+                var delay = 0.0
+                if let d = args.firstIndex(of: "-viewpointDelay"), d + 1 < args.count {
+                    delay = Double(args[d + 1]) ?? 0
+                }
                 if parts.count == 2 {
-                    model.teleport(to: .init(name: "Debug viewpoint",
-                                             latitude: parts[0], longitude: parts[1]),
-                                   manual: true)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                        model.teleport(to: .init(name: "Debug viewpoint",
+                                                 latitude: parts[0], longitude: parts[1]),
+                                       manual: true)
+                    }
                 }
             }
             // Debug: "Stand here" on a named peak/lake once the render is up —
@@ -334,11 +385,25 @@ struct RootScreen: View {
                 let saves = debugSaveNames
                 debugSaveNames = []
                 DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                    // Comma-separated names, each optionally "name@year" to
+                    // backdate the entry (exercises the year separators):
+                    // -bookmark "ruby mountain@2023,colonial peak".
                     for s in saves {
-                        if let hit = model.allNearbyPeaks.first(where: { $0.name.lowercased() == s.name }),
-                           !peakLists.contains(hit, in: s.kind) {
+                        for token in s.name.split(separator: ",") {
+                            var name = token.trimmingCharacters(in: .whitespaces)
+                            var year: Int?
+                            if let at = name.lastIndex(of: "@"), let y = Int(name[name.index(after: at)...]) {
+                                year = y
+                                name = String(name[..<at])
+                            }
+                            guard let hit = model.allNearbyPeaks.first(where: { $0.name.lowercased() == name }),
+                                  !peakLists.contains(hit, in: s.kind) else { continue }
                             peakLists.toggle(hit, in: s.kind)
-                            NSLog("save debug: \(s.kind) ← \(hit.name)")
+                            if let year,
+                               let d = Calendar.current.date(from: DateComponents(year: year, month: 6, day: 15)) {
+                                peakLists.setDate(d, for: hit, in: s.kind)
+                            }
+                            NSLog("save debug: \(s.kind) ← \(hit.name)\(year.map { " @\($0)" } ?? "")")
                         }
                     }
                 }
@@ -361,7 +426,7 @@ struct RootScreen: View {
                                 toLatitude: b.latitude, toLongitude: b.longitude)
                             return da < db
                         }) {
-                        NSLog("standOn debug: standing on \(hit.name) @ \(hit.latitude),\(hit.longitude)")
+                        NSLog("standOn debug: standing on \(hit.name) @ \(hit.latitude),\(hit.longitude) id=\(hit.id) saddle=\(hit.isSaddle) ele=\(hit.elevationMeters)")
                         model.select(hit)
                         if let sel = model.selectedPeak { model.standOnPeak(sel) }
                     } else {
@@ -467,7 +532,8 @@ struct RootScreen: View {
         if activeSheet == .regions {
             PanelCard(maxWidth: 720, height: isChromeLandscape ? 336 : 540,
                       title: "Offline", onClose: { activeSheet = nil }) {
-                RegionManagerView(store: regions, currentViewpoint: model.viewpoint)
+                RegionManagerView(store: regions, currentViewpoint: model.viewpoint,
+                                  isManualViewpoint: model.isManualViewpoint)
             }
         }
     }
@@ -548,7 +614,11 @@ struct RootScreen: View {
                 // viewpoint; drifting past the recenter threshold flips
                 // pending). statusIsReady folds in so the announcement lands
                 // AFTER the load — not burned during the switching card.
-                signal: AnyHashable("\(model.viewpoint?.latitude ?? 0)|\(model.viewpoint?.longitude ?? 0)|\(model.pendingRecenter != nil)|\(statusIsReady)")
+                signal: AnyHashable("\(model.viewpoint?.latitude ?? 0)|\(model.viewpoint?.longitude ?? 0)|\(model.pendingRecenter != nil)|\(statusIsReady)"),
+                // …and gates it: the signal also changes the moment a move
+                // STARTS (viewpoint/status flip), which used to expand the
+                // label right away — stay collapsed until the move completes.
+                announce: statusIsReady
             ) {
                 // Returning to your real position also returns to DEVICE-driven
                 // alignment — keeping the earlier drag offset would show your own
@@ -634,7 +704,7 @@ struct RootScreen: View {
                 .background(TopoStyle.paperColor, in: RoundedRectangle(cornerRadius: 24))
                 .clipShape(RoundedRectangle(cornerRadius: 24))
                 .shadow(color: .black.opacity(0.22), radius: 20, y: 12)
-                .padding(.horizontal, 12)
+                .padding(.horizontal, 16)   // 12 read cramped on narrow phones
                 .padding(.bottom, 12)
                 // Displacement + swipe live on the CARD (not the scrim): the
                 // swipe re-renders only the card, and the scrim stays put.
@@ -675,6 +745,11 @@ struct RootScreen: View {
     /// again after a beat) every time this value changes — so "the related
     /// thing changed again" always re-announces what the button undoes.
     var signal: AnyHashable = AnyHashable(0)
+    /// Gates the announcement: while false, signal changes (and the button's
+    /// own first appearance) keep it COLLAPSED instead of expanding — used
+    /// mid-move so the label only lands when the move completes, not when it
+    /// starts.
+    var announce = true
     let action: () -> Void
     @State private var expanded = true
 
@@ -715,11 +790,14 @@ struct RootScreen: View {
         .disabled(busy)
         .transition(.opacity.combined(with: .scale(scale: 0.85, anchor: .leading)))
         // Restarts whenever `signal` changes: expand (back) to the labelled
-        // form, then collapse 3.6 s after the LAST change.
+        // form, then collapse 3.6 s after the LAST change. A gated change
+        // (`announce == false`, e.g. a move just STARTED) collapses instead —
+        // the announcement belongs to the completion signal.
         .task(id: signal) {
             withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-                expanded = true
+                expanded = announce
             }
+            guard announce else { return }
             try? await Task.sleep(for: .seconds(3.6))
             // A signal change mid-sleep CANCELS this task; `try?` swallows
             // that, so without this guard the dying task collapsed the button
@@ -787,6 +865,24 @@ struct RootScreen: View {
                     // (No mini-map beside the card: it owns the full width so
                     // long peak names fit on one line.)
                     Spacer(minLength: 0)
+                } else if showLocationCard, let vp = model.viewpoint,
+                          activeSheet != .directory, statusIsReady {
+                    // Tapping the location card opens THIS when the eye stands
+                    // somewhere without a catalog feature: name, coordinates,
+                    // elevation, and the way into the Save Spot sheet.
+                    LocationInfoCard(
+                        viewpoint: vp,
+                        elevationMeters: model.eyeElevationMeters,
+                        onSave: {
+                            showLocationCard = false
+                            saveLocationName = vp.name
+                            showSaveLocation = true
+                        },
+                        onDismiss: { showLocationCard = false }
+                    )
+                    .frame(maxWidth: isChromeLandscape ? 400 : .infinity, alignment: .leading)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    Spacer(minLength: 0)
                 } else if !hideBottomChrome {
                     // Hidden while the search panel (or the landscape Time card)
                     // is up: they occupy exactly this region, and both want the
@@ -806,7 +902,10 @@ struct RootScreen: View {
                 }
             }
         }
-        .padding()
+        // 20 pt sides (not the default 16): on narrower phones (iPhone 13
+        // class) the chrome read cramped against the screen edges.
+        .padding(.horizontal, 20)
+        .padding(.vertical, 16)
         // (No tap-outside scrim for the open menu: it swallowed EVERY touch, so
         // pinch-zoom and look-around died while the menu was up. Terrain taps
         // collapse it instead — see the onSelectPeak closure in terrainView.)
@@ -819,7 +918,7 @@ struct RootScreen: View {
         // vs. the button's 15 pt half-height) — at 16 it floated awkwardly
         // between the heading text and the line.
         .overlay(alignment: .topTrailing) {
-            actionRail.padding([.horizontal, .bottom]).padding(.top, 24)
+            actionRail.padding(.horizontal, 20).padding(.bottom, 16).padding(.top, 24)
         }
         // Pin the HUD to the TRUE bottom. Without this the bottom row avoids the
         // keyboard, so picking a search result made the info card appear
@@ -855,20 +954,30 @@ struct RootScreen: View {
                     .buttonStyle(.plain)
                     .accessibilityLabel("Cancel photo")
 
-                    Button {
-                        captureToken &+= 1
-                        showPhotoShutter = false
-                    } label: {
-                        ZStack {
-                            Circle().stroke(TopoStyle.inkColor, lineWidth: 3)
-                                .frame(width: 62, height: 62)
-                            Circle().fill(TopoStyle.inkColor)
-                                .frame(width: 50, height: 50)
+                    // Shutter centered; what-goes-in-the-photo checkboxes on
+                    // its sides. They preview LIVE: toggling shows/hides the
+                    // overlay on screen, so the frame is exactly the capture.
+                    HStack {
+                        photoCheck("Labels", isOn: $photoIncludesLabels)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Button {
+                            captureToken &+= 1
+                            showPhotoShutter = false
+                        } label: {
+                            ZStack {
+                                Circle().stroke(TopoStyle.inkColor, lineWidth: 3)
+                                    .frame(width: 62, height: 62)
+                                Circle().fill(TopoStyle.inkColor)
+                                    .frame(width: 50, height: 50)
+                            }
+                            .contentShape(Circle().inset(by: -8))
                         }
-                        .contentShape(Circle().inset(by: -8))
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Take photo")
+                        photoCheck("Compass", isOn: $photoIncludesCompass)
+                            .frame(maxWidth: .infinity, alignment: .trailing)
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Take photo")
+                    .padding(.horizontal, 16)
                 }
                 // Clear the footer/mini-map row: the shutter floats in the
                 // free center ABOVE them (a wide location card can reach the
@@ -878,6 +987,34 @@ struct RootScreen: View {
             .padding()
         }
         .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+
+    /// A minimal checkbox: 14 pt hairline square, ink check when on, mono
+    /// label — quiet enough to live beside the shutter.
+    private func photoCheck(_ title: String, isOn: Binding<Bool>) -> some View {
+        Button {
+            isOn.wrappedValue.toggle()
+        } label: {
+            HStack(spacing: 6) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 3)
+                        .strokeBorder(TopoStyle.inkColor.opacity(0.6), lineWidth: 1.25)
+                        .frame(width: 14, height: 14)
+                    if isOn.wrappedValue {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(TopoStyle.inkColor)
+                    }
+                }
+                Text(title)
+                    .font(PPFont.mono(11))
+                    .tracking(0.5)
+            }
+            .foregroundStyle(TopoStyle.inkColor.opacity(0.85))
+            .contentShape(Rectangle().inset(by: -10))
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isOn.wrappedValue ? .isSelected : [])
     }
 
     private var shouldShowInitialLoading: Bool {
@@ -892,14 +1029,51 @@ struct RootScreen: View {
         return false
     }
 
-    /// The displayed sky is night: the display time (live or simulated) falls
-    /// outside the viewed location's sunrise–sunset window. Drives the theme
-    /// inversion. Defaults to day until the celestial pass lands (and in
-    /// polar edge cases where the sun never crosses the horizon).
-    private var isNight: Bool {
-        guard let sun = model.sunTimes,
-              let sunrise = sun.sunrise, let sunset = sun.sunset else { return false }
-        return model.displayDate < sunrise || model.displayDate > sunset
+    /// The displayed sky is night — drives the Auto theme inversion. Set by
+    /// the renderer's `onNightChanged` in the SAME beat the live sky sun
+    /// applies (scene swaps, time scrubs, month jumps), so the theme can
+    /// never lag the scene or flash against stale sunrise/sunset data.
+    @State private var isNight = false
+
+    /// Theme: Auto follows the displayed sky (the signature inversion);
+    /// Day / Night pin it. (Raw values stay `light`/`dark` — they're what
+    /// existing installs have persisted in AppStorage.)
+    enum ThemeMode: String, CaseIterable {
+        case auto, light, dark
+        var title: String {
+            switch self {
+            case .auto: return "Auto"
+            case .light: return "Day"
+            case .dark: return "Night"
+            }
+        }
+        var systemImage: String {
+            switch self {
+            case .auto: return "circle.lefthalf.filled"
+            case .light: return "sun.max"
+            case .dark: return "moon"
+            }
+        }
+        var next: ThemeMode {
+            switch self {
+            case .auto: return .light
+            case .light: return .dark
+            case .dark: return .auto
+            }
+        }
+    }
+    @AppStorage("themeMode") private var themeModeRaw = ThemeMode.auto.rawValue
+    private var themeMode: ThemeMode { ThemeMode(rawValue: themeModeRaw) ?? .auto }
+
+    /// Units override ("" = follow locale) — the menu toggles ft ↔ m.
+    @AppStorage(UnitText.overrideKey) private var unitsRaw = ""
+
+    private var resolvedScheme: ColorScheme {
+        switch themeMode {
+        case .auto: return isNight ? .dark : .light
+        case .light: return .light
+        case .dark: return .dark
+        }
     }
 
     /// Kills the interface-rotation animation: the terrain is counter-rotated in
@@ -1015,16 +1189,43 @@ struct RootScreen: View {
                     }
                     menuDivider
 
+                    // Cycle Auto → Day → Night. Stays open for live cycling.
+                    controlButton(
+                        "Theme: \(themeMode.title)",
+                        systemName: themeMode.systemImage,
+                        prominence: themeMode == .auto ? .secondary : .primary
+                    ) {
+                        themeModeRaw = themeMode.next.rawValue
+                    }
+                    menuDivider
+
+                    // Toggle ft ↔ m (seeded from the locale on first toggle).
+                    controlButton(
+                        "Units: \(UnitText.usesFeet ? "ft" : "m")",
+                        systemName: "ruler",
+                        prominence: unitsRaw.isEmpty ? .secondary : .primary
+                    ) {
+                        unitsRaw = UnitText.usesFeet ? "metric" : "imperial"
+                    }
+                    menuDivider
+
                     // Photo: arm the shutter popup (capture on ITS button, not here —
-                    // the user frames the shot first).
+                    // the user frames the shot first). Arming takes over the
+                    // screen, so any open panel yields — the same one-thing-
+                    // at-a-time rule the panels apply to the shutter.
                     controlButton("Photo", systemName: "camera", prominence: .secondary) {
+                        activeSheet = nil
+                        showSaveLocation = false
                         showPhotoShutter = true
                         collapseActionMenu()
                     }
                     menuDivider
 
                     // Save the current viewpoint as a named Saved location.
+                    // Same takeover rule as Photo: open panels yield first.
                     controlButton("Save Spot", systemName: "bookmark", prominence: .secondary) {
+                        activeSheet = nil
+                        showPhotoShutter = false
                         saveLocationName = model.viewpoint?.name ?? ""
                         showSaveLocation = true
                         collapseActionMenu()
@@ -1060,7 +1261,9 @@ struct RootScreen: View {
                 }
                 .frame(maxHeight: isChromeLandscape ? 290 : .infinity)
                 .fixedSize(horizontal: false, vertical: !isChromeLandscape)
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                // Grow out of the ☰ button (top-trailing corner, right above
+                // this menu) rather than sliding in from the screen's top edge.
+                .transition(.scale(scale: 0.1, anchor: .topTrailing).combined(with: .opacity))
             }
         }
     }
@@ -1096,6 +1299,24 @@ struct RootScreen: View {
         UINotificationFeedbackGenerator().notificationOccurred(.success)
     }
 
+    /// Location-card tap: standing ON a catalog feature (a "Stand here" visit
+    /// keeps its name) opens that feature's full card; anywhere else opens the
+    /// plain location card.
+    private func showLocationInfo(_ viewpoint: PanoramaViewModel.Viewpoint) {
+        if let hit = (model.allNearbyPeaks + model.nearbyLakes).first(where: {
+            $0.name == viewpoint.name &&
+            GeoMath.distanceMeters(
+                fromLatitude: $0.latitude, fromLongitude: $0.longitude,
+                toLatitude: viewpoint.latitude, toLongitude: viewpoint.longitude) < 1_000
+        }) {
+            model.select(hit)
+        } else {
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
+                showLocationCard = true
+            }
+        }
+    }
+
     private func collapseActionMenu() {
         withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
             showActionMenu = false
@@ -1119,13 +1340,94 @@ struct RootScreen: View {
                     .font(PPFont.ui(15, prominence == .secondary ? .medium : .semibold))
                 Image(systemName: systemName)
                     .font(.system(size: 16, weight: .regular))
-                    .frame(width: 20)
+                    // 26, not 20: wide glyphs (mountain.2) overflowed a 20 pt
+                    // box and the ScrollView clipped them at the row's edge.
+                    .frame(width: 26)
             }
             .foregroundStyle(TopoStyle.inkColor)
             .frame(height: 44)
             .contentShape(Rectangle())
+            // Cycling rows swap their title + icon INSTANTLY and together —
+            // inherited transactions animated the width change first and the
+            // glyph swap after, a two-step stutter on some rows.
+            .transaction { $0.animation = nil }
         }
         .buttonStyle(.plain)
+    }
+
+    /// The info card for a viewpoint that is NOT a catalog feature (GPS spot,
+    /// map pin, saved location): name over the coordinates + elevation in
+    /// mono, and a single Save Spot action — PeakInfoPanel's language without
+    /// the peak-only rows.
+    private struct LocationInfoCard: View {
+        let viewpoint: PanoramaViewModel.Viewpoint
+        let elevationMeters: Double?
+        let onSave: () -> Void
+        let onDismiss: () -> Void
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(viewpoint.name)
+                    .font(PPFont.ui(18, .semibold))
+                    .foregroundStyle(TopoStyle.inkColor)
+                    .lineLimit(1)
+                    .padding(.trailing, 28)
+                Text(statsLine)
+                    .font(PPFont.mono(12))
+                    .foregroundStyle(TopoStyle.inkColor.opacity(0.55))
+                    .lineLimit(1)
+                Button(action: onSave) {
+                    HStack(spacing: 7) {
+                        Image(systemName: "bookmark")
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(TopoStyle.inkColor.opacity(0.8))
+                        Text("Save Spot")
+                            .font(PPFont.ui(14, .semibold))
+                            .foregroundStyle(TopoStyle.inkColor)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 46)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .strokeBorder(TopoStyle.hairline(0.18), lineWidth: 1)
+                    )
+                    .contentShape(RoundedRectangle(cornerRadius: 12))
+                }
+                .buttonStyle(.plain)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 16)
+            .padding(.horizontal, 18)
+            .background(TopoStyle.paperColor, in: RoundedRectangle(cornerRadius: 16))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16)
+                    .strokeBorder(TopoStyle.hairline(0.12), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.10), radius: 14, y: 8)
+            .overlay(alignment: .topTrailing) {
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(TopoStyle.inkColor.opacity(0.5))
+                        .frame(width: 32, height: 32)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(2)
+            }
+        }
+
+        /// "48.5000° N, 121.0800° W · 5,547 ft"
+        private var statsLine: String {
+            var parts = [String(
+                format: "%.4f° %@, %.4f° %@",
+                abs(viewpoint.latitude), viewpoint.latitude >= 0 ? "N" : "S",
+                abs(viewpoint.longitude), viewpoint.longitude >= 0 ? "E" : "W")]
+            if let elevationMeters {
+                parts.append(UnitText.elevation(meters: elevationMeters))
+            }
+            return parts.joined(separator: " · ")
+        }
     }
 
     // MARK: - Location / status card (bottom-left black card)
@@ -1149,6 +1451,11 @@ struct RootScreen: View {
                             .opacity(0.6)
                     }
                 }
+                .contentShape(Rectangle())
+                // Tap: the full info card for where you stand — the catalog
+                // feature's card when standing ON one, else the plain
+                // location card (coordinates + Save Spot).
+                .onTapGesture { showLocationInfo(viewpoint) }
             }
         case .locating:
             statusCard(spacing: 6) {
@@ -1164,7 +1471,10 @@ struct RootScreen: View {
             switchingCard(progress: progress)
         case .failed(let message):
             statusCard(spacing: 6) {
-                Text("Terrain unavailable")
+                // With a scene still up this is a failed MOVE (offline
+                // teleport) about to fall back — connection is the story.
+                // With nothing rendered it's the launch-load failure.
+                Text(model.hasRenderedOnce ? "No connection" : "Terrain unavailable")
                     .font(PPFont.ui(15, .semibold))
                 Text(message)
                     .font(PPFont.mono(11))
@@ -1197,10 +1507,16 @@ struct RootScreen: View {
     private func switchingCard(progress: Double) -> some View {
         // Bar and status line span the card's full content width — they used
         // to float small (130 pt bar, 11 pt text) inside a much wider pill.
+        // 180 pt (not 220): this card shares its row with the 104 pt mini-map,
+        // and at 220 the fixed content overflowed the row on narrow phones —
+        // the whole HUD pressed against the screen edges (and the title
+        // wrapped) for the duration of every switch.
         statusCard(spacing: 8) {
             Text("Switching location")
                 .font(PPFont.ui(16, .semibold))
-            PPProgressLine(progress: progress, width: 220, height: 2)
+                .lineLimit(1)
+                .fixedSize()
+            PPProgressLine(progress: progress, width: 180, height: 2)
             WhimsyLine(style: .card)
         }
     }
@@ -1214,10 +1530,10 @@ struct RootScreen: View {
 /// load (first open, teleports, "Stand here") gets the same playful readout.
 private enum LoadingWhimsy {
     static let lines: [String] = [
-        "Stitching terrain tiles",
-        "Carving the valleys",
+        "Stitching tiles",
+        "Carving valleys",
         "Raising the mountains",
-        "Dropping the shadows",
+        "Dropping shadows",
         "Filling the lakes",
         "Sharpening the ridgelines",
         "Untangling contour lines",
@@ -1230,7 +1546,7 @@ private enum LoadingWhimsy {
         "Smoothing the foothills",
         "Counting the switchbacks",
         "Pitching base camp",
-        "Waking the glaciers",
+        "Sliding down glaciers",
         "Polishing the horizon",
         "Herding stray boulders",
         "Triangulating the summits",
@@ -1238,10 +1554,9 @@ private enum LoadingWhimsy {
         "Lifting the fog",
         "Fluffing the clouds",
         "Seeding the meadows",
-        "Planting the wildflowers",
-        "Watering the rivers",
-        "Bridging the creeks",
-        "Stacking the cairns",
+        "Planting wildflowers",
+        "Bridging creeks",
+        "Stacking cairns",
         "Charting the ridges",
         "Combing the treeline",
         "Growing the forests",
@@ -1257,13 +1572,68 @@ private enum LoadingWhimsy {
         "Petting the goats",
         "Calibrating the altimeter",
         "Drawing the map",
-    ].shuffled()
+        "Brewing summit coffee",
+        "Tightening guylines",
+        "Skipping some stones",
+        "Flagging false summits",
+        "Dusting the peaks",
+        "Booping mushrooms",
+        "Picking berries",
+        "Losing the trail",
+        "Trusting the cairns",
+        "Swatting mosquitos",
+        "Spraying dew",
+        "Following the bootpack",
+        "Going glissading",
+    ]
+}
+
+/// The whimsy rotation's shared cursor. WhimsyLine used to keep its shuffled
+/// order and timer in per-instance @State, but SwiftUI freely recreates the
+/// view (the status card is a different `switch` branch per load phase, and
+/// each branch is a fresh structural identity) — every recreation reshuffled
+/// and swapped the line immediately, so lines visibly rotated early. One
+/// process-wide cursor instead: a recreated instance shows the line already
+/// up and waits out the REMAINDER of its 3.2 s, and the timestamp guard means
+/// even two live instances can't double-advance the rotation.
+@MainActor
+private enum WhimsyClock {
+    static let interval: TimeInterval = 3.2
+    /// Random per-launch palette start, so the first line isn't always coral.
+    static let colorOffset = Int.random(in: 0..<6)
+    private(set) static var order = LoadingWhimsy.lines.shuffled()
+    private(set) static var index = 0
+    /// When the current line went up — recreated views resume this countdown.
+    private(set) static var shownAt = Date.now
+
+    static var currentLine: String { order[index] }
+
+    static var remaining: TimeInterval {
+        max(0.05, interval - Date.now.timeIntervalSince(shownAt))
+    }
+
+    /// Advance to the next line, unless another instance just did (its reset
+    /// timestamp makes this a no-op). Exhausting the pool reshuffles, with the
+    /// new first line guaranteed to differ from the last one shown (no
+    /// back-to-back repeats, ever).
+    static func advanceIfDue() {
+        guard Date.now.timeIntervalSince(shownAt) >= interval - 0.1 else { return }
+        if index + 1 >= order.count {
+            var next = LoadingWhimsy.lines.shuffled()
+            if next.first == order.last, next.count > 1 { next.swapAt(0, 1) }
+            order = next
+            index = 0
+        } else {
+            index += 1
+        }
+        shownAt = .now
+    }
 }
 
 /// One cycling whimsy line ("Carving the valleys…"), in the template's IBM
-/// Plex Mono. Cross-fades to the next line every ~3.2 s. Starts at a random
-/// spot in the (launch-shuffled) pool so back-to-back loads don't always open
-/// on the same chore.
+/// Plex Mono. Cross-fades to the next line every ~3.2 s through the shared
+/// WhimsyClock order. Colors rotate through the soft warm-to-cool set —
+/// pastels on dark, deeper siblings on paper so they read on white.
 private struct WhimsyLine: View {
     enum Style {
         /// Centered on the launch screen.
@@ -1272,26 +1642,62 @@ private struct WhimsyLine: View {
         case card
     }
     var style: Style = .paper
-    @State private var index = Int.random(in: 0..<LoadingWhimsy.lines.count)
+    @Environment(\.colorScheme) private var scheme
+    /// Render trigger only — the line/color come from WhimsyClock; bumping
+    /// this re-evaluates body after each advance.
+    @State private var tick = 0
+
+    /// Coral → amber → sage → sky → lavender → rose, one per message.
+    /// Pastels for dark surfaces (the original launch-screen set)…
+    private static let pastel: [Color] = [
+        Color(red: 1.00, green: 0.66, blue: 0.51),   // coral
+        Color(red: 1.00, green: 0.80, blue: 0.55),   // amber
+        Color(red: 0.68, green: 0.90, blue: 0.72),   // sage
+        Color(red: 0.62, green: 0.84, blue: 1.00),   // sky
+        Color(red: 0.79, green: 0.75, blue: 1.00),   // lavender
+        Color(red: 1.00, green: 0.72, blue: 0.82),   // rose
+    ]
+    /// …and ink-deep siblings that hold up on paper white.
+    private static let deep: [Color] = [
+        Color(red: 0.78, green: 0.33, blue: 0.20),   // coral
+        Color(red: 0.70, green: 0.49, blue: 0.10),   // amber
+        Color(red: 0.24, green: 0.53, blue: 0.32),   // sage
+        Color(red: 0.16, green: 0.44, blue: 0.68),   // sky
+        Color(red: 0.42, green: 0.36, blue: 0.74),   // lavender
+        Color(red: 0.72, green: 0.29, blue: 0.44),   // rose
+    ]
 
     var body: some View {
-        Text("\(LoadingWhimsy.lines[index % LoadingWhimsy.lines.count])…")
-            .font(PPFont.mono(12))
-            .foregroundStyle(style == .paper
-                ? TopoStyle.inkColor : TopoStyle.inkColor.opacity(0.6))
-            .lineLimit(1)
-            .minimumScaleFactor(0.85)     // safety net; lines are sized to fit
-            .contentTransition(.opacity)
-            // Fixed width so the hosting surface doesn't resize with every
-            // line — sized to the longest chore in the pool.
-            .frame(width: style == .paper ? 232 : 220,
-                   alignment: style == .paper ? .center : .leading)
-            .task {
-                while !Task.isCancelled {
-                    try? await Task.sleep(nanoseconds: 3_200_000_000)
-                    withAnimation(.easeInOut(duration: 0.35)) { index += 1 }
-                }
+        let palette = scheme == .dark ? Self.pastel : Self.deep
+        let line = WhimsyClock.currentLine
+        // A ZStack of id-keyed Texts, NOT contentTransition(.opacity): the
+        // in-place glyph cross-fade laid the incoming line out against the
+        // outgoing line's width, so it appeared offset (and mis-scaled via
+        // minimumScaleFactor) and snapped into place as the fade settled.
+        // Separate Texts each get their final layout before fading.
+        return ZStack(alignment: style == .paper ? .center : .leading) {
+            Text("\(line)…")
+                .font(PPFont.mono(12))
+                .foregroundStyle(palette[(WhimsyClock.index + WhimsyClock.colorOffset) % palette.count])
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)     // safety net; lines are sized to fit
+                .transition(.opacity)
+                .id(line)
+        }
+        // Fixed width so the hosting surface doesn't resize with every
+        // line — the paper size fits the longest chore; the card size matches
+        // the switching card's slimmed 180 pt bar (minimumScaleFactor absorbs
+        // the few longest lines).
+        .frame(width: style == .paper ? 232 : 180,
+               alignment: style == .paper ? .center : .leading)
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(WhimsyClock.remaining))
+                guard !Task.isCancelled else { break }
+                WhimsyClock.advanceIfDue()
+                withAnimation(.easeInOut(duration: 0.35)) { tick += 1 }
             }
+        }
     }
 }
 

@@ -149,6 +149,18 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         visibleFeatureIDs = ids
     }
 
+    /// The loaded DEM tiles (near ≈ high-res 40 km, far ≈ coarse 160 km),
+    /// reported up by the renderer so UI features can sample terrain heights —
+    /// the search fills missing catalog elevations from these. Not published:
+    /// consumers snapshot them when they compute.
+    private(set) var demNear: DEMTile?
+    private(set) var demFar: DEMTile?
+
+    func demTilesResolved(near: DEMTile?, far: DEMTile?) {
+        demNear = near
+        demFar = far
+    }
+
     /// HONEST visibility for a feature: true/false only when the renderer's
     /// occlusion pass actually judged it this viewpoint; nil = unknown (no
     /// pass yet, out of the candidate range, or a class the pipeline never
@@ -168,12 +180,14 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     }
 
     /// The pure verdict logic (also used per-row by the search, off-main).
-    /// Absence from `visibleIDs` means "Hidden" ONLY where the pipeline
-    /// actually judges features: water within the near tier (40 km), peaks
-    /// within the far tier (`FarHorizon.farTileMeters`), and beyond that only
-    /// real summits (elevation known, not a saddle) out to the ring's reach.
-    /// Everything else — and anything under 100 m (you're standing on it) —
-    /// is unknown, not hidden.
+    /// The badge answers "can you see this from here?", so absence from
+    /// `visibleIDs` reads as "Hidden" wherever that answer is settled: the
+    /// pass judged it (within the far tile, or a perceptible ring-band
+    /// summit), Earth curvature settles it (past the ring's reach), or it's
+    /// simply too small to discern at its distance (the old `nil` ring-band
+    /// cases — "you can't see it" is the honest practical answer). nil now
+    /// means only: no pass yet, you're standing on it (< 100 m), or a
+    /// perceptible summit the pipeline genuinely never looked at.
     nonisolated static func visibilityVerdict(
         peakID: String, isSaddle: Bool, elevationMeters: Double,
         prominenceMeters: Double?, isWater: Bool,
@@ -185,17 +199,20 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         // honest even for features the pipeline never looked at (a search hit
         // half the world away).
         if distanceMeters > FarHorizon.endMeters { return false }
-        guard isCandidate, distanceMeters > 100 else { return nil }
-        if isWater { return distanceMeters <= 40_000 ? false : nil }
-        if distanceMeters <= FarHorizon.farTileMeters { return false }
-        // Ring band (far tile → ring reach): only features big enough to be
-        // perceptible at their distance are judged at all — for the rest,
-        // neither "Visible" nor "Occluded" would mean anything.
-        guard FarHorizon.perceptible(prominenceMeters: prominenceMeters,
-                                     elevationMeters: elevationMeters,
-                                     distanceMeters: distanceMeters) else { return nil }
-        if !isSaddle, elevationMeters > 0 { return false }
-        return nil
+        guard distanceMeters > 100 else { return nil }
+        // Water: judged through the far tile (absence = occluded); beyond it
+        // nothing at surface level survives the curvature drop, and no water
+        // is drawn or discernible at that range regardless.
+        if isWater { return false }
+        if isCandidate, distanceMeters <= FarHorizon.farTileMeters { return false }
+        // Ring band (far tile → ring reach): too small to perceive at this
+        // distance = not visible, whatever the exact geometry.
+        if !FarHorizon.perceptible(prominenceMeters: prominenceMeters,
+                                   elevationMeters: elevationMeters,
+                                   distanceMeters: distanceMeters) { return false }
+        // A perceptible ring-band summit the pass looked at and didn't mark
+        // visible is occluded; outside the candidate set it was never judged.
+        return isCandidate ? false : nil
     }
 
     /// True once the user explicitly teleported (map pin / peak visit / debug) —
@@ -294,11 +311,16 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         }
     }
 
+    /// The viewpoint whose scene is actually ON SCREEN, captured as a move
+    /// leaves a healthy scene — a move that fails to load (offline teleport)
+    /// falls back here instead of stranding the model at a place the terrain
+    /// never rendered.
+    private var lastGoodViewpoint: (viewpoint: Viewpoint, manual: Bool)?
+    private var failedMoveRevertTask: Task<Void, Never>?
+
     /// Jump the eye anywhere. A user-initiated jump (map / peak visit / debug) also
     /// stops GPS auto-follow.
     func teleport(to viewpoint: Viewpoint, manual: Bool = false) {
-        if manual { isManualViewpoint = true; location.stopUpdatingLocation() }
-        pendingRecenter = nil
         // Re-standing on the EXACT spot already rendered (double-tap "Stand
         // here"): the renderer dedupes identical coordinates and won't bake or
         // report .ready, so flipping to a loading status here would show
@@ -310,6 +332,14 @@ final class PanoramaViewModel: NSObject, ObservableObject {
             if case .rendering = status { return true }
             return false
         }()
+        // Leaving a rendered scene: remember it (with the mode flags as they
+        // are NOW, before this move mutates them) so a failed load can return.
+        // Chained moves mid-load keep the original good scene.
+        if healthy, let current = self.viewpoint, current != viewpoint {
+            lastGoodViewpoint = (current, isManualViewpoint)
+        }
+        if manual { isManualViewpoint = true; location.stopUpdatingLocation() }
+        pendingRecenter = nil
         let unchanged = self.viewpoint == viewpoint && healthy
         self.viewpoint = viewpoint
         if !unchanged {
@@ -370,10 +400,9 @@ final class PanoramaViewModel: NSObject, ObservableObject {
             // would cost seconds and change nothing. A manual viewpoint always
             // comes home, even if home is nearby (the name/mode must reset).
             if !wasManual, !isMeaningfulMove(to: fix.coordinate) { return }
-            teleport(to: Viewpoint(
-                name: "My location",
-                latitude: fix.coordinate.latitude, longitude: fix.coordinate.longitude
-            ))
+            teleport(to: gpsViewpoint(fix.coordinate.latitude, fix.coordinate.longitude))
+            resolveGPSName(latitude: fix.coordinate.latitude,
+                           longitude: fix.coordinate.longitude)
         } else {
             if viewpoint == nil { status = .locating }
             awaitingGPSFix = true
@@ -401,6 +430,26 @@ final class PanoramaViewModel: NSObject, ObservableObject {
             setProgressTarget(progress, rendering: false)
         case let .rendering(progress):
             setProgressTarget(progress, rendering: true)
+        case .failed where lastGoodViewpoint != nil:
+            // A MOVE failed to load (offline teleport) but the previous scene
+            // is still on screen: say so briefly in the status pill, then
+            // quietly stand back at the place that actually rendered instead
+            // of stranding the model somewhere the terrain never loaded.
+            stopProgressSmoothing()
+            self.status = .failed("Couldn't load that area — staying where you were.")
+            let prior = lastGoodViewpoint
+            failedMoveRevertTask?.cancel()
+            failedMoveRevertTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(3.2))
+                guard let self, !Task.isCancelled, let prior else { return }
+                // A newer move (or retry) has taken over — leave it alone.
+                guard case .failed = self.status else { return }
+                // One shot: if returning home fails too (tiles somehow gone),
+                // fall through to the persistent failure card, not a loop.
+                self.lastGoodViewpoint = nil
+                self.isManualViewpoint = prior.manual
+                self.teleport(to: prior.viewpoint)
+            }
         default:
             stopProgressSmoothing()
             self.status = status
@@ -529,11 +578,13 @@ final class PanoramaViewModel: NSObject, ObservableObject {
                     aroundLatitude: viewpoint.latitude, longitude: viewpoint.longitude,
                     radiusKm: radiusKm
                 )
-                var merged: [Peak] = []
-                var ids = Set<String>()
-                for peak in global + bundled + packs + osm where ids.insert(peak.id).inserted {
-                    merged.append(peak)
-                }
+                // GLOBAL FIRST wins duplicate fights: legacy packs and OSM
+                // tile caches predate the saddle flag, so their copy of a gap
+                // (different id, isSaddle=false) must never shadow the global
+                // record. The old id-only dedup let both through — tapping
+                // the pack's copy summit-snapped "Stand here" uphill of the
+                // gap (Dip Top Gap bug).
+                let merged = Peak.dedupedKeepingFirst(global + bundled + packs + osm)
                 // Lakes: label range only (the far-tile radius — matches the
                 // anchor cull), so the published set stays small even in lake
                 // country.
@@ -581,9 +632,24 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         // the snap climbed the shoreline ridge (up to 250 m of it), leaving you
         // looking DOWN at the lake you asked to stand on — same rule as the
         // label anchors, which never summit-snap water.
+        // The tapped record can be a STALE SNAPSHOT that lost the saddle flag
+        // (a save from before the flag existed, a legacy pack copy) — so
+        // resolve the freshest truth at the decision point: if ANY live-index
+        // record for this same feature says saddle, or the name itself says
+        // low point ("… Gap"/"… Pass"), the point IS the destination — never
+        // climb the neighboring hill.
         let isWater = nearbyLakes.contains { $0.id == peak.id }
+        let liveSaddle = allNearbyPeaks.contains {
+            ($0.id == peak.id
+             || ($0.name.localizedCaseInsensitiveCompare(peak.name) == .orderedSame
+                 && GeoMath.distanceMeters(
+                        fromLatitude: $0.latitude, fromLongitude: $0.longitude,
+                        toLatitude: peak.latitude, toLongitude: peak.longitude) < 200))
+            && $0.isSaddle
+        }
+        let isSaddle = peak.isSaddle || liveSaddle || peak.nameSuggestsSaddle
         teleport(to: Viewpoint(name: peak.name, latitude: peak.latitude, longitude: peak.longitude,
-                               snapToSummit: !peak.isSaddle && !isWater),
+                               snapToSummit: !isSaddle && !isWater),
                  manual: true)
     }
 
@@ -593,6 +659,44 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     /// the app reload endlessly in a car). Instead, once the device has moved far enough
     /// from the baked viewpoint, surface a "Recenter" prompt with the latest position;
     /// the panorama stays frozen (and aligned, for distant terrain) until the user taps it.
+    // MARK: - GPS viewpoint naming
+
+    /// "47.6205° N, 122.3493° W" — a GPS viewpoint's PROVISIONAL name, shown
+    /// until (and unless) the reverse geocoder supplies a friendly one. The
+    /// old fixed "My location" told you nothing.
+    private static func coordinateName(_ lat: Double, _ lon: Double) -> String {
+        String(format: "%.4f° %@, %.4f° %@",
+               abs(lat), lat >= 0 ? "N" : "S",
+               abs(lon), lon >= 0 ? "E" : "W")
+    }
+
+    private func gpsViewpoint(_ lat: Double, _ lon: Double) -> Viewpoint {
+        Viewpoint(name: Self.coordinateName(lat, lon), latitude: lat, longitude: lon)
+    }
+
+    /// Best-effort friendly name for the spot you're standing (area of
+    /// interest → locality → region — deliberately NOT the street address).
+    /// Never gates anything: offline the coordinate name simply stays. The
+    /// swap only lands if we're still GPS-following at (about) that fix.
+    private func resolveGPSName(latitude: Double, longitude: Double) {
+        Task { [weak self] in
+            let loc = CLLocation(latitude: latitude, longitude: longitude)
+            guard let pm = try? await CLGeocoder().reverseGeocodeLocation(loc).first else { return }
+            let friendly = pm.areasOfInterest?.first
+                ?? pm.subLocality ?? pm.locality ?? pm.administrativeArea
+            guard let friendly else { return }
+            await MainActor.run {
+                guard let self, !self.isManualViewpoint, let vp = self.viewpoint,
+                      abs(vp.latitude - latitude) < 0.01,
+                      abs(vp.longitude - longitude) < 0.01 else { return }
+                // Same spot: renderer dedupes by coordinate, so this renames
+                // the card without a re-bake.
+                self.viewpoint = Viewpoint(name: friendly,
+                                           latitude: vp.latitude, longitude: vp.longitude)
+            }
+        }
+    }
+
     private func queueGPS(_ next: Viewpoint) {
         guard !isManualViewpoint, let current = viewpoint else { return }
         let moved = GeoMath.distanceMeters(
@@ -611,6 +715,7 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         guard let next = pendingRecenter else { return }
         pendingRecenter = nil
         teleport(to: next)
+        resolveGPSName(latitude: next.latitude, longitude: next.longitude)
     }
 
     /// Whether standing at `coordinate` would show anything new: beyond ~30 m
@@ -639,16 +744,21 @@ extension PanoramaViewModel: @preconcurrency CLLocationManagerDelegate {
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard !isManualViewpoint, let fix = locations.last, fix.horizontalAccuracy <= 200 else { return }
-        let next = Viewpoint(
-            name: "My location",
-            latitude: fix.coordinate.latitude, longitude: fix.coordinate.longitude
-        )
-        guard viewpoint != nil else { awaitingGPSFix = false; teleport(to: next); return }
+        let next = gpsViewpoint(fix.coordinate.latitude, fix.coordinate.longitude)
+        guard viewpoint != nil else {
+            awaitingGPSFix = false
+            teleport(to: next)
+            resolveGPSName(latitude: next.latitude, longitude: next.longitude)
+            return
+        }
         if awaitingGPSFix {
             // The user explicitly asked to stand at their position — honor the
             // first usable fix regardless of the recenter distance gate.
             awaitingGPSFix = false
-            if isMeaningfulMove(to: fix.coordinate) { teleport(to: next) }
+            if isMeaningfulMove(to: fix.coordinate) {
+                teleport(to: next)
+                resolveGPSName(latitude: next.latitude, longitude: next.longitude)
+            }
             return
         }
         queueGPS(next)

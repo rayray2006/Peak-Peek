@@ -30,10 +30,10 @@ struct TeleportMapView: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        // The map IS the sheet: edge to edge, with the title floating over it
-        // as a paper tag (it read as a dead white bar as a header strip).
-        // Cancel button removed deliberately: swipe down (or tap outside on
-        // iPad) is the one way out.
+        // The map IS the sheet: edge to edge, with the bare title floating
+        // over it and a ✕ beside it. Both sit on SATELLITE imagery (dark in
+        // either theme), so they're white with a soft shadow — map-label
+        // styling, not the themed ink.
         MapReader { proxy in
             Map(initialPosition: startPosition) { mapAnnotations }
             .mapStyle(.hybrid(elevation: .realistic))
@@ -48,11 +48,22 @@ struct TeleportMapView: View {
         .overlay(alignment: .top) {
             Text("Drop a viewpoint")
                 .font(PPFont.ui(15, .semibold))
-                .foregroundStyle(TopoStyle.inkColor)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(TopoStyle.paperColor, in: Capsule())
-                .shadow(color: .black.opacity(0.15), radius: 8, y: 3)
+                .foregroundStyle(.white)
+                .shadow(color: .black.opacity(0.55), radius: 3, y: 1)
+                .frame(maxWidth: .infinity)
+                .overlay(alignment: .trailing) {
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .shadow(color: .black.opacity(0.55), radius: 3, y: 1)
+                            .frame(width: 34, height: 34)
+                            .contentShape(Circle().inset(by: -8))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Close map")
+                    .padding(.trailing, 10)
+                }
                 .padding(.top, 22)      // clears the sheet's drag indicator
         }
         .safeAreaInset(edge: .bottom) {
@@ -148,16 +159,16 @@ struct TeleportMapView: View {
             onDismiss: { selectedPeak = nil }
         )
         .frame(maxWidth: 560)
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 16)   // 12 read cramped on narrow phones
         .padding(.bottom, 8)
     }
 
-    /// The black "Stand here" confirm button (template button language),
+    /// The black "View" confirm button (template button language),
     /// shared by the pin and peak cards.
     private var standHereLabel: some View {
         HStack {
             if resolving { ProgressView().tint(.white) }
-            Text(resolving ? "Naming location..." : "Stand here")
+            Text(resolving ? "Naming location..." : "View")
                 .font(PPFont.ui(15, .semibold))
                 .lineLimit(1)
             Spacer()
@@ -244,11 +255,10 @@ struct TeleportMapView: View {
 /// opens the full teleport map.
 struct MiniMapView: View {
     let viewpoint: PanoramaViewModel.Viewpoint
-    /// GPS-following: the eye IS the user's location, so a single blue dot marks
-    /// both; manual: blue GPS dot + white viewpoint dot are distinct places.
+    /// GPS-following: the eye IS the user's location (the system puck marks
+    /// both); manual: puck + white viewpoint pin are distinct places.
     let isManualViewpoint: Bool
     let onTap: () -> Void
-    @StateObject private var location = MapLocationModel()
     /// Held in @State and updated ONLY when the viewpoint moves — so the map keeps a
     /// stable camera across the parent's re-renders instead of getting a freshly built
     /// `.constant(.region(...))` binding every time (which can reset the camera and
@@ -264,34 +274,19 @@ struct MiniMapView: View {
 
     var body: some View {
         Map(position: $position, interactionModes: []) {
-            Group {
-                if isManualViewpoint {
-                    if let coordinate = location.coordinate {
-                        Annotation("You", coordinate: coordinate, anchor: .center) {
-                            MiniMapLocationDot()
-                        }
-                    }
-                    Annotation(viewpoint.name, coordinate: center, anchor: .center) {
-                        ViewpointPin()
-                    }
-                } else {
-                    // Following GPS: one dot at the eye — not a GPS dot with a
-                    // viewpoint marker stacked on top of it. The template
-                    // captions it "You" in mono; the anchor keeps the DOT on
-                    // the coordinate, not the pair's midpoint.
-                    Annotation("You", coordinate: center,
-                               anchor: UnitPoint(x: 0.5, y: 0.21)) {
-                        VStack(spacing: 2) {
-                            MiniMapLocationDot()
-                            Text("You")
-                                .font(PPFont.mono(9))
-                                .foregroundStyle(TopoStyle.inkColor.opacity(0.55))
-                        }
-                    }
-                }
+            // The full teleport map keeps the system blue puck; at 104 pt the
+            // puck (accuracy ring, heading cone) dwarfed the whole peek, so
+            // the mini map draws a puck-toned dot scaled to its cartography.
+            UserAnnotation(anchor: .center) { _ in
+                MiniLocationDot()
             }
-            // The 104 pt peek has no room for annotation captions.
-            .annotationTitles(.hidden)
+            if isManualViewpoint {
+                // Manual viewpoint: the eye stands somewhere else — mark it.
+                Annotation(viewpoint.name, coordinate: center, anchor: .center) {
+                    ViewpointPin(compact: true)
+                }
+                .annotationTitles(.hidden)
+            }
         }
         .mapStyle(.standard(elevation: .realistic))
         // The template's pale cartography: wash most of the color out of the
@@ -308,8 +303,6 @@ struct MiniMapView: View {
         }
         .contentShape(RoundedRectangle(cornerRadius: 18))
         .onTapGesture(perform: onTap)
-        .task { location.start() }
-        .onDisappear { location.stop() }
         // Follow the eye only when it actually moves (not on every parent re-render).
         .onChange(of: viewpoint.latitude) { position = .region(Self.region(for: viewpoint)) }
         .onChange(of: viewpoint.longitude) { position = .region(Self.region(for: viewpoint)) }
@@ -328,31 +321,34 @@ struct MiniMapView: View {
     }
 }
 
-/// The template's "You" marker: an ink dot with a paper ring and halo
-/// (both dynamic — the pair inverts with the day/night theme).
-private struct MiniMapLocationDot: View {
+/// The viewpoint badge — one marker for "the eye stands (or will stand) here":
+/// the current viewpoint AND a freshly dropped pin. Same circular language as
+/// `SavedPeakDot`: ink pin glyph on a paper disc. `compact` is the mini-map
+/// size — the full 22 pt badge covered a quarter of the 104 pt peek.
+private struct ViewpointPin: View {
+    var compact = false
+
     var body: some View {
-        Circle()
-            .fill(TopoStyle.inkColor)
-            .frame(width: 10, height: 10)
-            .overlay(Circle().stroke(TopoStyle.paperColor, lineWidth: 2))
-            .background(Circle().fill(TopoStyle.inkColor.opacity(0.12)).padding(-4))
+        Image(systemName: "mappin")
+            .font(.system(size: compact ? 7 : 12, weight: .bold))
+            .foregroundStyle(TopoStyle.inkColor)
+            .frame(width: compact ? 13 : 22, height: compact ? 13 : 22)
+            .background(TopoStyle.paperColor, in: Circle())
+            .overlay(Circle().stroke(TopoStyle.inkColor.opacity(0.25), lineWidth: 1))
+            .shadow(radius: compact ? 1 : 1.5)
             .allowsHitTesting(false)
     }
 }
 
-/// The viewpoint badge — one marker for "the eye stands (or will stand) here":
-/// the current viewpoint AND a freshly dropped pin. Same circular language as
-/// `SavedPeakDot`: ink pin glyph on a paper disc.
-private struct ViewpointPin: View {
+/// Mini-map stand-in for the system location puck: the same blue, sized for
+/// a 104 pt map instead of a full-screen one.
+private struct MiniLocationDot: View {
     var body: some View {
-        Image(systemName: "mappin")
-            .font(.system(size: 12, weight: .bold))
-            .foregroundStyle(TopoStyle.inkColor)
-            .frame(width: 22, height: 22)
-            .background(TopoStyle.paperColor, in: Circle())
-            .overlay(Circle().stroke(TopoStyle.inkColor.opacity(0.25), lineWidth: 1))
-            .shadow(radius: 1.5)
+        Circle()
+            .fill(Color(red: 0.04, green: 0.52, blue: 1.00))
+            .frame(width: 9, height: 9)
+            .overlay(Circle().stroke(.white, lineWidth: 2))
+            .shadow(color: .black.opacity(0.3), radius: 1.5)
             .allowsHitTesting(false)
     }
 }

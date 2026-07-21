@@ -51,6 +51,54 @@ struct Peak: Identifiable, Codable, Hashable, Sendable {
     /// Label priority: prominent peaks win declutter fights.
     var priority: Double { prominenceMeters ?? elevationMeters * 0.25 }
 
+    /// The name says LOW POINT — "… Gap", "… Pass", "… Col", "Sattel" and
+    /// friends. A snap guard of last resort: legacy pack/cache records lost
+    /// the `isSaddle` flag, and OSM occasionally mis-tags a gap as a peak —
+    /// standing on a gap must never climb the neighboring hill. Whole-word
+    /// match, so "Compass Rose" doesn't trip on "pass".
+    var nameSuggestsSaddle: Bool {
+        let saddleWords: Set<String> = ["gap", "pass", "saddle", "col", "notch",
+                                        "joch", "sattel", "colle", "forcella",
+                                        "bocchetta", "furka", "scharte"]
+        return name.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .contains { saddleWords.contains($0) }
+    }
+
+    /// Order-preserving dedup across SOURCES: drops exact-id duplicates and
+    /// same-name records within 200 m of an earlier one (the same feature via
+    /// two catalogs — different id schemes defeat an id-only check). Callers
+    /// put the most trustworthy source FIRST: the global DB carries the
+    /// saddle flag, and its copy of a gap must shadow a legacy pack's
+    /// flag-less one, or "Stand here" summit-snaps the eye uphill.
+    nonisolated static func dedupedKeepingFirst(_ peaks: [Peak]) -> [Peak] {
+        var merged: [Peak] = []
+        var ids = Set<String>()
+        var buckets: [String: [Peak]] = [:]
+
+        func bucketKey(_ peak: Peak) -> String {
+            let lat = Int((peak.latitude * 200).rounded())
+            let lon = Int((peak.longitude * 200).rounded())
+            return "\(lat):\(lon)"
+        }
+
+        for peak in peaks {
+            guard ids.insert(peak.id).inserted else { continue }
+            let key = bucketKey(peak)
+            let duplicate = buckets[key]?.contains(where: {
+                guard $0.name.localizedCaseInsensitiveCompare(peak.name) == .orderedSame else { return false }
+                return GeoMath.distanceMeters(
+                    fromLatitude: $0.latitude, fromLongitude: $0.longitude,
+                    toLatitude: peak.latitude, toLongitude: peak.longitude
+                ) < 200
+            }) ?? false
+            guard !duplicate else { continue }
+            merged.append(peak)
+            buckets[key, default: []].append(peak)
+        }
+        return merged
+    }
+
     /// Display name: a name in a non-Latin script gets a Latin transliteration
     /// appended in parens — "富士山 (Fu Shi Shan)", "Эльбрус (Elbrus)" — so
     /// labels stay readable anywhere on Earth. Latin names pass through as-is.

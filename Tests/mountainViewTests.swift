@@ -434,14 +434,16 @@ final class RingPerceptibilityTests: XCTestCase {
             prominenceMeters: 1000, elevationMeters: 2500, distanceMeters: 550_000))
     }
 
-    func testVerdictNilForImperceptibleRingBandPeak() {
-        // In-band, crests nothing, too small to judge: no badge (nil), not
-        // a false "Occluded".
+    func testVerdictOccludedForImperceptibleRingBandPeak() {
+        // In-band, crests nothing, too small to discern at 200 km: the honest
+        // practical answer is "you can't see it" — Occluded, not nil (nil now
+        // means only no-pass-yet / standing-on-it / never-judged, per
+        // visibilityVerdict's contract).
         let v = PanoramaViewModel.visibilityVerdict(
             peakID: "hill", isSaddle: false, elevationMeters: 1800,
             prominenceMeters: 300, isWater: false,
             distanceMeters: 200_000, visibleIDs: [], isCandidate: true)
-        XCTAssertNil(v)
+        XCTAssertEqual(v, false)
     }
 
     func testVerdictOccludedForPerceptibleRingBandPeak() {

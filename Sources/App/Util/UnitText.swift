@@ -1,8 +1,18 @@
 import Foundation
 
-/// Locale-aware elevation/distance formatting. (Ported from RidgeLine.)
+/// Locale-aware elevation/distance formatting, with a user override
+/// (menu "Units" row). (Ported from RidgeLine.)
 enum UnitText {
-    private static let usesFeet = Locale.current.measurementSystem == .us
+    /// UserDefaults key: "imperial" / "metric"; unset = follow the locale.
+    static let overrideKey = "unitsOverride"
+
+    static var usesFeet: Bool {
+        switch UserDefaults.standard.string(forKey: overrideKey) {
+        case "imperial": return true
+        case "metric": return false
+        default: return Locale.current.measurementSystem == .us
+        }
+    }
     private static let number: NumberFormatter = {
         let f = NumberFormatter()
         f.numberStyle = .decimal

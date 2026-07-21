@@ -81,6 +81,9 @@ struct TerrainMetalView: UIViewRepresentable {
     /// clear line of sight from the current viewpoint (peaks + lakes). Anything
     /// absent is occluded by terrain, out of range, or behind the horizon.
     var onVisibleFeatures: (Set<String>) -> Void = { _ in }
+    /// Fired when the DEM tiles install (near, far) — the model keeps them so
+    /// UI features (search elevation fill) can sample terrain heights.
+    var onDEMTiles: (DEMTile?, DEMTile?) -> Void = { _, _ in }
     /// Fired per celestial rebuild: true sunrise/sunset + the ridge-visibility
     /// window for the displayed day at this viewpoint (drives the Time card).
     var onSunTimes: (PanoramaViewModel.SunTimes?) -> Void = { _ in }
@@ -95,10 +98,21 @@ struct TerrainMetalView: UIViewRepresentable {
     /// Fired at the END of every alignment-changing drag (yaw calibration or
     /// manual look-around) — the HUD re-introduces its Realign button on each.
     var onAlignmentNudged: () -> Void = { }
+    /// The DISPLAYED sky just crossed day↔night (fires in the same beat the
+    /// live sun applies: scene swaps and time scrubs alike). Drives the Auto
+    /// theme with zero lag — sunrise/sunset times arrive seconds later from
+    /// the async celestial pass and are not needed for this.
+    var onNightChanged: (Bool) -> Void = { _ in }
     /// Incremented by the HUD's shutter button to capture a photo of the view.
     var captureToken: Int = 0
-    /// Photo-sheet toggles: composite the peak labels / compass strip into the
-    /// captured image (the on-screen overlays are untouched either way).
+    /// Changes when the ft↔m preference flips — the label overlay re-bakes
+    /// its elevation strings.
+    var unitsStamp: String = ""
+    /// Photo framing mode: the shutter is up — chrome hides and the toggles
+    /// below preview live on screen.
+    var photoFraming: Bool = false
+    /// Photo toggles: composite (and, while framing, SHOW) the peak labels /
+    /// compass strip in the captured image.
     var captureIncludesLabels: Bool = true
     var captureIncludesCompass: Bool = false
     /// Fired when a capture finishes (true = saved) — drives the shutter flash.
@@ -121,6 +135,13 @@ struct TerrainMetalView: UIViewRepresentable {
         view.framebufferOnly = true
         view.isPaused = true                 // draw on demand (fixed viewpoint)
         view.enableSetNeedsDisplay = true
+        // Present the drawable INSIDE the CoreAnimation transaction (with the
+        // explicit commit → waitUntilScheduled → present in draw(in:)): the
+        // label/sky overlays are CALayers positioned in the same runloop turn
+        // as the render, and without this they reached the screen ~a frame
+        // after the Metal image — the dots visibly drifted over the terrain
+        // while the phone moved, snapping back at rest.
+        view.presentsWithTransaction = true
         view.preferredFramesPerSecond = 120
         view.delegate = context.coordinator
         context.coordinator.configure(view: view)
@@ -168,6 +189,7 @@ struct TerrainMetalView: UIViewRepresentable {
         context.coordinator.onForceManual = onForceManual
         context.coordinator.onARAdjustedChanged = onARAdjustedChanged
         context.coordinator.onAlignmentNudged = onAlignmentNudged
+        context.coordinator.onNightChanged = onNightChanged
         context.coordinator.setExaggeration(Float(exaggeration))
         context.coordinator.setDisplayDate(displayDate)
         context.coordinator.setManualAlignment(manualAlignment)
@@ -176,15 +198,18 @@ struct TerrainMetalView: UIViewRepresentable {
         context.coordinator.onPhotoCaptured = onPhotoCaptured
         context.coordinator.captureIncludesLabels = captureIncludesLabels
         context.coordinator.captureIncludesCompass = captureIncludesCompass
+        context.coordinator.setPhotoFraming(photoFraming)
         context.coordinator.setCaptureToken(captureToken)
         context.coordinator.onToggleImmersive = onToggleImmersive
         context.coordinator.setImmersive(immersive)
         context.coordinator.setPeaks(peaks)
         context.coordinator.setLakes(lakes)
         context.coordinator.setLabelDensity(labelDensity)
+        context.coordinator.setUnitsStamp(unitsStamp)
         context.coordinator.setSavedPeaks(climbed: climbedPeakIDs, bookmarked: bookmarkedPeakIDs)
         context.coordinator.onSelectPeak = onSelectPeak
         context.coordinator.onVisibleFeatures = onVisibleFeatures
+        context.coordinator.onDEMTiles = onDEMTiles
         context.coordinator.onSunTimes = onSunTimes
         context.coordinator.setSelectedPeak(selectedPeak)
         if let vp = viewpoint {
@@ -334,9 +359,32 @@ struct TerrainMetalView: UIViewRepresentable {
         /// Sun for the IN-FLIGHT bake (new viewpoint/date): the bake lights
         /// with this; it becomes `skySunENU` the moment its panorama installs.
         private var bakeSunENU = SIMD3<Float>(0, 0, 1)
+        /// Viewpoint the CURRENTLY APPLIED sky-overlay content (stars/arcs/
+        /// discs) was computed for. Lets a panorama swap detect that the
+        /// overlay still shows another location's sky — the new scene's
+        /// celestial pass (horizon march + ephemeris, CPU) can lose the race
+        /// against the GPU bake, and without this check the old stars kept
+        /// shining through the new terrain until that pass landed.
+        private var celestialRef: (lat: Double, lon: Double)?
+        /// Stamped with the viewpoint it was computed FOR: a reload-window
+        /// rebuild can still describe the OLD location (a live-clock tick
+        /// firing before the new DEM installs refLat/refLon), and applying
+        /// that at the swap overwrote the fresh sky sun with the old one —
+        /// the "wrong sky for a second after a teleport" flash.
         /// Celestial overlay content (stars/arcs/discs) computed for a scene
         /// that hasn't installed yet — applied atomically with the swap.
-        private var pendingCelestialApply: (() -> Void)?
+        private var pendingCelestialApply: (lat: Double, lon: Double, run: () -> Void)?
+
+        /// Run the held celestial content if it matches the CURRENT viewpoint;
+        /// drop it if it was computed for another one (the real content for
+        /// this scene lands moments later and applies directly).
+        private func applyPendingCelestialIfCurrent() {
+            defer { pendingCelestialApply = nil }
+            guard let pending = pendingCelestialApply,
+                  abs(pending.lat - refLat) < 1e-6, abs(pending.lon - refLon) < 1e-6
+            else { return }
+            pending.run()
+        }
         private var azimuth: Float = 215
         private var pitch: Float = -3
         private var fov: Float = 60
@@ -463,6 +511,21 @@ struct TerrainMetalView: UIViewRepresentable {
         /// "Recenter" button + orange menu icon).
         var onARAdjustedChanged: (Bool) -> Void = { _ in }
         var onAlignmentNudged: () -> Void = { }
+        var onNightChanged: (Bool) -> Void = { _ in }
+        private var lastReportedNight: Bool?
+
+        /// Report day↔night from the LIVE sun's elevation (z = sin el; night
+        /// below ~-0.833°, the refraction-corrected sunset). Called wherever
+        /// `skySunENU` is (re)applied, so the theme flips in the SAME beat as
+        /// the sky it describes. Async dispatch: call sites run inside view
+        /// updates.
+        private func reportNight() {
+            let night = skySunENU.z < Float(sin(-0.833 * Double.pi / 180))
+            guard night != lastReportedNight else { return }
+            lastReportedNight = night
+            let cb = onNightChanged
+            DispatchQueue.main.async { cb(night) }
+        }
         private var lastReportedARAdjusted = false
 
         // Peak labels.
@@ -471,6 +534,7 @@ struct TerrainMetalView: UIViewRepresentable {
         private var labelGeneration = 0
         var onSelectPeak: (Peak?) -> Void = { _ in }
         var onVisibleFeatures: (Set<String>) -> Void = { _ in }
+        var onDEMTiles: (DEMTile?, DEMTile?) -> Void = { _, _ in }
         var onSunTimes: (PanoramaViewModel.SunTimes?) -> Void = { _ in }
         var onToggleImmersive: () -> Void = { }
         private var selectedPeakID: String?
@@ -480,6 +544,9 @@ struct TerrainMetalView: UIViewRepresentable {
         /// Set by "Stand here": once the DEM is in, move the eye to the true summit.
         private var pendingSummitSnap = false
         private var isReloading = false
+        /// The last coordinate whose load FAILED, with when — gates the
+        /// passive re-request loop (see requestViewpoint).
+        private var lastFailedRequest: (lat: Double, lon: Double, at: Date)?
         /// The latest viewpoint requested while a reload was in flight; run when
         /// the current bake settles instead of being silently dropped.
         private var queuedRequest: (lat: Double, lon: Double, snap: Bool)?
@@ -537,11 +604,28 @@ struct TerrainMetalView: UIViewRepresentable {
             rebakePending = false
             renderer.installPanorama(tex)
             // Sky joins the swap: the sun the panorama was baked with becomes
-            // the live sky sun, and any celestial overlay computed for the new
-            // scene lands now — terrain, sky colour, labels, stars: one frame.
+            // the live sky sun, the theme flips with it, and any celestial
+            // overlay computed for the new scene lands now — terrain, sky
+            // colour, theme, labels, stars: one frame.
             skySunENU = bakeSunENU
-            pendingCelestialApply?()
-            pendingCelestialApply = nil
+            reportNight()
+            if let pending = pendingCelestialApply,
+               abs(pending.lat - refLat) < 1e-6, abs(pending.lon - refLon) < 1e-6 {
+                pending.run()
+                pendingCelestialApply = nil
+            } else {
+                // No held content for THIS scene (none, or stale content for
+                // another location — dropped, never applied over the fresh
+                // sky sun). If the overlay still shows another location's
+                // sky, clear it rather than let those stars shine through
+                // the new terrain; the real pass applies moments later.
+                pendingCelestialApply = nil
+                if let ref = celestialRef,
+                   abs(ref.lat - refLat) > 1e-6 || abs(ref.lon - refLon) > 1e-6 {
+                    container?.skyArc.clearCelestial()
+                    celestialRef = nil
+                }
+            }
             container?.labelOverlay.anchors = anchors
             onVisibleFeatures(visibleIDs)
             view?.setNeedsDisplay()
@@ -1125,6 +1209,15 @@ struct TerrainMetalView: UIViewRepresentable {
         func requestViewpoint(lat: Double, lon: Double, snapToSummit: Bool = false) {
             if let last = lastRequested,
                abs(last.lat - lat) < 1e-6, abs(last.lon - lon) < 1e-6 { return }
+            // A spot that just FAILED (offline fetch): updateUIView resubmits
+            // the model's viewpoint on every SwiftUI update, and with the
+            // dedupe memory cleared below that became a tight fail-retry loop
+            // (status thrashing "Switching location" ↔ failed ~every 1.5 s).
+            // Cool down instead: the model shows the failure and falls back to
+            // the previous scene; an explicit later retry sails past this.
+            if let failed = lastFailedRequest,
+               abs(failed.lat - lat) < 1e-6, abs(failed.lon - lon) < 1e-6,
+               Date().timeIntervalSince(failed.at) < 8 { return }
             if isReloading {
                 // Never DROP a move that arrives mid-bake: doing so left the model
                 // standing at the new feature while the render stayed put (the
@@ -1227,8 +1320,11 @@ struct TerrainMetalView: UIViewRepresentable {
                 guard let tile = nearTile else {
                     await MainActor.run {
                         // Clear the dedupe memory: a retry of the SAME spot after
-                        // a failure must re-attempt, not silently no-op.
+                        // a failure must re-attempt, not silently no-op — but
+                        // stamp the failure so the passive resubmission path
+                        // cools down instead of looping (see requestViewpoint).
                         self?.lastRequested = nil
+                        self?.lastFailedRequest = (lat, lon, Date())
                         self?.report(.failed(failure))
                         self?.finishReload()
                     }
@@ -1243,6 +1339,7 @@ struct TerrainMetalView: UIViewRepresentable {
                     guard let self else { return }
                     self.dem = tile
                     self.demFar = farTile
+                    self.onDEMTiles(tile, farTile)
                     self.renderer?.heightTexture = tex
                     self.renderer?.farHeightTexture = farTex
                     let eye = self.summitSnappedEye(lat: lat, lon: lon, tile: tile)
@@ -1377,7 +1474,17 @@ struct TerrainMetalView: UIViewRepresentable {
         /// on every SwiftUI update over potentially thousands of peaks, and the
         /// common case is "nothing changed".
         private static func sameIDs(_ a: [Peak], _ b: [Peak]) -> Bool {
-            a.count == b.count && zip(a, b).allSatisfy { $0.id == $1.id }
+            guard a.count == b.count else { return false }
+            // Same backing storage = definitely equal, for free. The common
+            // case by far: the model hasn't republished, SwiftUI is just
+            // re-running updateUIView (every frame during e.g. the keyboard
+            // animation) — the full ID scan over ~50k peaks each time was a
+            // visible main-thread hitch.
+            let sameStorage = a.withUnsafeBufferPointer { ap in
+                b.withUnsafeBufferPointer { bp in ap.baseAddress == bp.baseAddress }
+            }
+            if sameStorage { return true }
+            return zip(a, b).allSatisfy { $0.id == $1.id }
         }
 
         func setPeaks(_ p: [Peak]) {
@@ -1503,8 +1610,12 @@ struct TerrainMetalView: UIViewRepresentable {
             guard abs(date.timeIntervalSince(displayDate)) > 0.5 else { return }
             displayDate = date
             // Same viewpoint, new time: the live sky re-lights immediately
-            // (that's the point of scrubbing).
-            updateSunDirectionNow(applyToLiveSky: true)
+            // (that's the point of scrubbing) — EXCEPT mid-reload, where
+            // refLat/refLon may already be the new location's: the displayed
+            // scene keeps its own sun until the swap (a live-clock tick here
+            // used to repaint the sky for the destination over the old
+            // terrain).
+            updateSunDirectionNow(applyToLiveSky: !isReloading && !rebakePending)
             rebuildCelestial()
         }
 
@@ -1519,6 +1630,7 @@ struct TerrainMetalView: UIViewRepresentable {
             bakeSunENU = SkyArcOverlayView.enu(azimuthDeg: sun.azimuthDeg, elevationDeg: sun.elevationDeg)
             if applyToLiveSky || !panoInstalled {
                 skySunENU = bakeSunENU
+                reportNight()
             }
         }
 
@@ -1747,11 +1859,14 @@ struct TerrainMetalView: UIViewRepresentable {
                     named.append(.init(name: "Sun", dir: enu(sunNow.azimuthDeg, sunNow.elevationDeg),
                                        magnitude: -26.7))
                 }
+                let phase = Ephemeris.moonPhase(date: date)
                 if moonNow.elevationDeg >= horizonAt(moonNow.azimuthDeg) {
-                    named.append(.init(name: "Moon", dir: enu(moonNow.azimuthDeg, moonNow.elevationDeg),
+                    // Tapping the moon answers the question you actually have:
+                    // which phase is that?
+                    named.append(.init(name: "Moon · \(phase.name)",
+                                       dir: enu(moonNow.azimuthDeg, moonNow.elevationDeg),
                                        magnitude: -12.7))
                 }
-                let phase = Ephemeris.moonPhase(date: date)
                 let moonIllum = CGFloat(phase.illuminatedFraction)
                 let moonWaxing = phase.ageDays < 14.7653          // < half a synodic month
 
@@ -1765,6 +1880,9 @@ struct TerrainMetalView: UIViewRepresentable {
                         so.moonSamples = moon.samples
                         so.sunDisc = sunDisc
                         so.moonDisc = moonDisc
+                        // The skyline the discs emerge from — same profile the
+                        // verdicts above were judged against.
+                        so.horizonProfile = horizon
                         so.tags = sun.tags + moon.tags
                         so.stars = stars
                         so.planets = planets
@@ -1772,15 +1890,20 @@ struct TerrainMetalView: UIViewRepresentable {
                         so.namedObjects = named
                         so.moonIlluminated = moonIllum
                         so.moonWaxing = moonWaxing
+                        self.celestialRef = (lat, lon)
                         self.skySunENU = skySun
+                        self.reportNight()
                         self.onSunTimes(sunTimes)
                         self.view?.setNeedsDisplay()
                     }
-                    // A scene reload is in flight: this content belongs to the
-                    // NEW location — hold it and land it with the panorama
-                    // swap, not over the still-displayed old terrain.
+                    // A scene reload is in flight: hold the content and land
+                    // it with the panorama swap, not over the still-displayed
+                    // old terrain. Stamped with ITS viewpoint — a mid-reload
+                    // rebuild can still describe the OLD location (live-clock
+                    // tick before the new DEM installs), and the swap must
+                    // not apply that over the new scene.
                     if self.isReloading || self.rebakePending {
-                        self.pendingCelestialApply = apply
+                        self.pendingCelestialApply = (lat, lon, apply)
                     } else {
                         apply()
                     }
@@ -1819,7 +1942,10 @@ struct TerrainMetalView: UIViewRepresentable {
             // per viewpoint, off-main, so the 2× march cost is invisible.
             let bins = 960
             let curvatureK = (1 - GeoMath.refractionCoefficient) / (2 * GeoMath.earthRadiusMeters)
-            let maxDist = 120_000.0
+            // The far tile is a SQUARE box: corner directions carry rendered
+            // terrain out to √2 × its radius. March the whole square so a
+            // drawn corner-band ridge still shapes the sky skyline.
+            let maxDist = FarHorizon.farTileMeters * 2.0.squareRoot()
             // Cell-aware step (see lineOfSightClear): keep ≤ ~0.8 cell so a thin ridge
             // or notch can't slip between samples and let a sky-arc segment show
             // through the terrain.
@@ -1869,7 +1995,13 @@ struct TerrainMetalView: UIViewRepresentable {
             // correction (Shaders.metal terrainHeight): a feature due east is seen
             // slightly poleward of east, by east²·tanRef/(2R) meters of northing.
             let tanRefOver2R = tan(refLat * .pi / 180) / (2 * Uniforms.enuEarthRadiusMeters)
-            let maxDist = 120_000.0                             // within the far DEM tile
+            // The far DEM tile is a SQUARE ±farTileMeters box — in corner
+            // directions its rendered terrain reaches √2 × that. The real
+            // coverage gate is `contains` below; this radius must NOT
+            // undershoot the corners (a stale 120 km here skipped Rainier
+            // seen from Mount Olympus at 180 km: drawn by the tile, yet
+            // unanchored and mis-verdicted "Occluded").
+            let maxDist = FarHorizon.farTileMeters * 2.0.squareRoot()
             // The per-peak work (summit snap + line-of-sight ray march, thousands of
             // DEM samples each) is independent and reads only immutable data, so fan
             // it out across cores; single-threaded this was the visible post-load
@@ -1932,14 +2064,16 @@ struct TerrainMetalView: UIViewRepresentable {
                         }
                         // Coverage is the union of both tiers (far spans the whole scene).
                         let inNear = dem.contains(lat: peak.latitude, lon: peak.longitude)
-                        // WATER only within the near tier: the far grid's 58 m
-                        // cells barely render a lake basin, and the depth
-                        // fast-path's relative margin grows with distance —
-                        // together they scattered lake dots across the flat
-                        // far-valley render ("lakes showing through terrain",
-                        // Mount Adams). A lake beyond 40 km is a sub-pixel
-                        // speck anyway; peaks are unaffected.
-                        if isWater && !inNear { return }
+                        // WATER beyond the near tier is judged but never
+                        // ANCHORED: the far grid's 58 m cells barely render a
+                        // lake basin, and the depth fast-path's relative margin
+                        // grows with distance — together they scattered lake
+                        // dots across the flat far-valley render ("lakes
+                        // showing through terrain", Mount Adams). The exact CPU
+                        // march has neither problem, so far lakes still get an
+                        // honest Visible/Occluded for the search and the card —
+                        // verdict-only, like the ring's unlabeled giants.
+                        let farWater = isWater && !inNear
                         let snapTile = inNear ? dem : (far ?? dem)
                         // Beyond the far tile the ring draws terrain as haze.
                         // Peaks that crest its silhouette stay honestly visible
@@ -1948,10 +2082,20 @@ struct TerrainMetalView: UIViewRepresentable {
                         // the silhouette so the label overlay covers the whole
                         // horizon, ring included.
                         let onTile = snapTile.contains(lat: peak.latitude, lon: peak.longitude)
-                        guard onTile else {
+                        // The raymarch draws only to `skyDepth/2` (the shader's
+                        // tMax). The far tile is a SQUARE, so its corner band
+                        // holds peaks on-tile yet BEYOND the march — Rainier
+                        // from Mount Olympus (181 km) lives there: the RING
+                        // draws its hazy silhouette while the depth map is
+                        // honestly sky. Those must be judged and anchored by
+                        // the ring path, not the depth map.
+                        let inMarch = hypot((peak.longitude - refLon) * mLon,
+                                            (peak.latitude - refLat) * mLat)
+                            <= skyDepth / 2 - 1_000
+                        guard onTile, inMarch else {
                             guard !isWater, !peak.isSaddle, peak.elevationMeters > 0,
                                   let prof = ringProfile else {
-                                watch("skipped: outside both DEM tiers, not ring-drawable")
+                                watch("skipped: beyond the raymarch, not ring-drawable")
                                 return
                             }
                             // Same simple equirect mapping the ring march uses,
@@ -2003,12 +2147,16 @@ struct TerrainMetalView: UIViewRepresentable {
                             verd[i] = Verdict.ringVisible.rawValue
                             watch(String(format: "VISIBLE via the far-horizon ring at %.0f km", d / 1000))
                             // Ultra-prominent ring peaks anchor at the catalog
-                            // coord + elevation (no DEM out there to snap to) —
-                            // the dot rides the drawn silhouette.
+                            // coord (no DEM out there to snap to) — PINNED to
+                            // the ring's DRAWN silhouette at their azimuth.
+                            // The catalog summit can sit a shade above the
+                            // max-pooled ETOPO crest, and an unpinned dot then
+                            // floated in the sky over the drawn haze.
                             guard (peak.prominenceMeters ?? 0) >= 1500 else { return }
+                            let pinnedTan = min(tanEl, Double(prof.tanEl[bin]))
                             res[i] = .init(
                                 peak: peak,
-                                direction: SIMD3<Float>(Float(dE), Float(dN), Float(tanEl * d)),
+                                direction: SIMD3<Float>(Float(dE), Float(dN), Float(pinnedTan * d)),
                                 distanceMeters: d,
                                 isWater: false)
                             return
@@ -2095,8 +2243,11 @@ struct TerrainMetalView: UIViewRepresentable {
                             // occluding slope, much-farther means the basin
                             // wasn't drawn at all — either way no dot. The
                             // exact sightline march must ALSO agree.
-                            var drawnAtLake = depthW == 0     // no map yet: march decides alone
-                            if depthW > 0 {
+                            // Far-tier water skips the depth pre-pass entirely
+                            // (its far cells are what made the pixel test lie);
+                            // the march decides alone.
+                            var drawnAtLake = depthW == 0 || farWater
+                            if depthW > 0, !farWater {
                                 var uu = bearing / (2 * .pi)
                                 uu -= floor(uu)
                                 let vv = 0.5 - 0.5 * (sightAngle * .pi / 180) / panoElevMax
@@ -2128,6 +2279,14 @@ struct TerrainMetalView: UIViewRepresentable {
                             }
                             if occluded {
                                 verd[i] = Verdict.occluded.rawValue
+                                return
+                            }
+                            if farWater {
+                                // Visible, but no dot (see the far-water note
+                                // above) — the search/card verdict set picks
+                                // this up exactly like the ring peaks.
+                                verd[i] = Verdict.ringVisible.rawValue
+                                watch("ring-visible: far-tier water, judged by the march only")
                                 return
                             }
                         } else if depthW > 0 {
@@ -2253,11 +2412,12 @@ struct TerrainMetalView: UIViewRepresentable {
                 }
             }
             let all = results.compactMap { $0 }
-            // Ring-drawn peaks: all stay visible for the card/search; the
-            // ultra-prominent among them also carry anchors (in `all`).
-            let ringVisibleIDs = (0..<peaks.count).lazy
+            // Ring-drawn peaks (and far-tier water, judged but unlabeled): all
+            // stay visible for the card/search; the ultra-prominent peaks
+            // among them also carry anchors (in `all`).
+            let ringVisibleIDs = (0..<total).lazy
                 .filter { verdicts[$0] == Verdict.ringVisible.rawValue }
-                .map { peaks[$0].id }
+                .map { $0 < peaks.count ? peaks[$0].id : lakes[$0 - peaks.count].id }
             let occludedCount = verdicts.lazy.filter { $0 == Verdict.occluded.rawValue }.count
             let floatingCount = verdicts.lazy.filter { $0 == Verdict.floating.rawValue }.count
             let ringCount = ringVisibleIDs.count
@@ -2460,10 +2620,10 @@ struct TerrainMetalView: UIViewRepresentable {
                     return
                 }
                 renderer.installPanorama(tex)
-                // First install: sky + celestial land with the terrain.
+                // First install: sky + theme + celestial land with the terrain.
                 self.skySunENU = self.bakeSunENU
-                self.pendingCelestialApply?()
-                self.pendingCelestialApply = nil
+                self.reportNight()
+                self.applyPendingCelestialIfCurrent()
                 self.panoInstalled = true
                 self.view?.setNeedsDisplay()
                 onReady()
@@ -2729,8 +2889,40 @@ struct TerrainMetalView: UIViewRepresentable {
 
         /// Immersive chrome-hide: the compass + zoom readout are drawn inside
         /// this view (not RootScreen), so they hide here.
+        /// Chrome-hiding inputs: immersive (double tap) and photo framing.
+        private var immersiveChrome = false
+        private var photoFraming = false
+
+        /// ft↔m flip: re-set the overlay's anchors so every baked elevation
+        /// string re-measures and re-renders in the new units.
+        private var unitsStamp = ""
+        func setUnitsStamp(_ stamp: String) {
+            guard stamp != unitsStamp else { return }
+            unitsStamp = stamp
+            if let overlay = container?.labelOverlay {
+                let anchors = overlay.anchors   // re-set triggers the re-bake
+                overlay.anchors = anchors
+            }
+        }
+
         func setImmersive(_ hidden: Bool) {
-            container?.compassZoom.isHidden = hidden
+            immersiveChrome = hidden
+            refreshOverlayVisibility()
+        }
+
+        /// Photo framing: everything not going INTO the photo leaves the
+        /// screen, and the Labels/Compass checkboxes preview live — what you
+        /// see while framing is exactly what the capture composites.
+        func setPhotoFraming(_ on: Bool) {
+            photoFraming = on
+            refreshOverlayVisibility()
+        }
+
+        func refreshOverlayVisibility() {
+            container?.compassZoom.isHidden =
+                immersiveChrome || (photoFraming && !captureIncludesCompass)
+            container?.labelOverlay.isHidden =
+                photoFraming && !captureIncludesLabels
         }
 
         @objc func handleTap(_ g: UITapGestureRecognizer) {
@@ -2753,6 +2945,21 @@ struct TerrainMetalView: UIViewRepresentable {
             onSelectPeak(nil)
         }
 
+        /// The cached terrain skyline (ring included), interpolated at an
+        /// azimuth — the same lookup the celestial pass uses. nil before the
+        /// first horizon march completes.
+        private func horizonElevationDeg(atAzimuthDeg azDeg: Double) -> Double? {
+            guard let horizon = cachedHorizon, !horizon.isEmpty else { return nil }
+            let n = horizon.count
+            var a = azDeg.truncatingRemainder(dividingBy: 360); if a < 0 { a += 360 }
+            let x = a / 360 * Double(n) - 0.5
+            let i0 = Int(floor(x))
+            let f = x - Double(i0)
+            let a0 = horizon[((i0 % n) + n) % n]
+            let a1 = horizon[((i0 + 1) % n + n) % n]
+            return Double(a0) * (1 - f) + Double(a1) * f
+        }
+
         func setSelectedPeak(_ annotated: AnnotatedPeak?) {
             guard annotated?.id != selectedPeakID else { return }
             selectedPeakID = annotated?.id
@@ -2761,7 +2968,18 @@ struct TerrainMetalView: UIViewRepresentable {
             // DEM lookup needed): shown by the overlay only when the peak isn't already
             // an on-screen label.
             container?.labelOverlay.target = annotated.map { a in
-                let az = a.azimuthDeg * .pi / 180, el = a.elevationAngleDeg * .pi / 180
+                let az = a.azimuthDeg * .pi / 180
+                var elDeg = a.elevationAngleDeg
+                // Ring-range peaks (beyond the far tile): the drawn silhouette
+                // is the max-pooled ETOPO ring, which understates a sharp
+                // summit — the TRUE sightline angle then floats in the sky
+                // above the drawn haze (Everest from Manaslu North). Pin the
+                // marker to the drawn skyline, exactly like ring anchors do.
+                if a.distanceMeters > FarHorizon.farTileMeters,
+                   let ridge = horizonElevationDeg(atAzimuthDeg: a.azimuthDeg) {
+                    elDeg = min(elDeg, ridge)
+                }
+                let el = elDeg * .pi / 180
                 let dist = max(1, a.distanceMeters)
                 return PeakLabelOverlayView.Target(
                     id: a.id, name: a.peak.displayName,
@@ -2830,8 +3048,12 @@ struct TerrainMetalView: UIViewRepresentable {
             let uniforms = currentUniformsWithDeviceBasis(width: w, height: h)
             guard let cb = renderer.commandQueue.makeCommandBuffer() else { return }
             encodeScene(uniforms: uniforms, into: drawable.texture, commandBuffer: cb, renderer: renderer)
-            cb.present(drawable)
             cb.commit()
+            // NOTE: the drawable is presented at the END of this method (after
+            // the overlay layers below are positioned), via waitUntilScheduled +
+            // present — with presentsWithTransaction, that lands the Metal frame
+            // and the CALayer overlays in the SAME screen update. Presenting
+            // up here let the terrain move a frame ahead of the labels.
 
             // Project peak labels with the EXACT basis/FOV the GPU just used, so they
             // land on the rendered summits and track as the view moves.
@@ -2854,6 +3076,11 @@ struct TerrainMetalView: UIViewRepresentable {
             var headingDeg = atan2(Double(fwd.x), Double(fwd.y)) * 180 / .pi
             if headingDeg < 0 { headingDeg += 360 }
             container?.compassZoom.update(headingDeg: headingDeg, zoom: Double(zoom))
+
+            // All overlay layers are now positioned for this frame — put the
+            // Metal image on screen in the same CoreAnimation transaction.
+            cb.waitUntilScheduled()
+            drawable.present()
         }
 
         /// tan(30°) — the 60° reference FOV's half-angle tangent, hoisted from

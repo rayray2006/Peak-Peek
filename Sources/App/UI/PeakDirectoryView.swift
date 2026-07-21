@@ -51,7 +51,8 @@ struct PeakDirectoryView: View {
     /// `rows` in the FIRST body pass, so the card arrives at full height in
     /// one motion instead of opening as a bare field and then expanding when
     /// the async recompute lands.
-    private static var lastSession: (query: String, sort: Sort, rows: [Row])?
+    private static var lastSession: (query: String, sort: Sort, rows: [Row],
+                                     globalIndex: [Peak], globalWaterIDs: Set<String>)?
 
     init(model: PanoramaViewModel, query: Binding<String>, savedPeaks: [Peak],
          availableHeight: CGFloat,
@@ -66,9 +67,17 @@ struct PeakDirectoryView: View {
         if !trimmed.isEmpty, let cached = Self.lastSession, cached.query == trimmed {
             _rows = State(initialValue: cached.rows)
             _sort = State(initialValue: cached.sort)
+            // The global DB hits too: the first index-load recompute then merges
+            // against them and reproduces the same rows, instead of briefly
+            // dropping the whole-world matches until searchGlobal's debounce lands.
+            _globalIndex = State(initialValue: cached.globalIndex)
+            _globalWaterIDs = State(initialValue: cached.globalWaterIDs)
         }
     }
-    /// A rows recompute is in flight — suppresses the "no matches" empty state.
+    /// A rows recompute is in flight. With no rows to show yet it renders as
+    /// a quiet spinner ("Searching…") — the same height as the "No matches"
+    /// block, so fast typing never collapses/expands the card, and a stale
+    /// "No matches" is never claimed for a query still being searched.
     @State private var searchPending = false
     @State private var searchTask: Task<Void, Never>?
     @State private var indexTask: Task<Void, Never>?
@@ -94,7 +103,7 @@ struct PeakDirectoryView: View {
         .background(TopoStyle.paperColor, in: RoundedRectangle(cornerRadius: 24))
         .shadow(color: .black.opacity(0.22), radius: 20, y: 12)
         .frame(maxWidth: 500)
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 16)   // 12 read cramped on narrow phones
         .padding(.bottom, 8)
         // Interactive swipe-down: the card FOLLOWS the finger (upward pulls
         // rubber-band like a sheet), then commits past a distance/velocity
@@ -121,7 +130,6 @@ struct PeakDirectoryView: View {
         .onAppear { dragOffset = 0 }   // in case a dismissed card's offset survives
         .task {
             reloadDownloadedIndex()
-            searchFocused = true                   // straight to typing
             // Debug: pre-fill the query (the simulator can't type).
             let args = ProcessInfo.processInfo.arguments
             if let i = args.firstIndex(of: "-searchQuery"), i + 1 < args.count {
@@ -129,10 +137,21 @@ struct PeakDirectoryView: View {
             }
             // A RESTORED query (reopening after the peak card closes) arrives
             // with the view, so onChange(of: query) never fires — search it now.
+            // No eager recomputeRows here: the indexes are still loading, so it
+            // would find nothing and wipe the seeded rows (the card visibly
+            // collapsed and re-expanded). reloadDownloadedIndex and searchGlobal
+            // each recompute when their data lands.
             if !trimmedQuery.isEmpty {
                 searchGlobal()
-                recomputeRows()
             }
+            // Focus AFTER the card's entrance settles: focusing in the same
+            // beat stacked the keyboard's system animation — and its infamous
+            // first-use warm-up stall — on the panel transition, freezing and
+            // jittering the whole screen. The card now lands instantly; the
+            // keyboard follows a beat later.
+            try? await Task.sleep(for: .milliseconds(320))
+            guard !Task.isCancelled else { return }
+            searchFocused = true
         }
         .onChange(of: model.viewpoint) { old, new in
             // The index merges ~100k cached peaks; while GPS-following every
@@ -198,8 +217,24 @@ struct PeakDirectoryView: View {
     /// matches, up to four rows otherwise (two in landscape) — rest scrolls.
     @ViewBuilder
     private var resultsArea: some View {
-        if trimmedQuery.isEmpty || (rows.isEmpty && searchPending) {
+        if trimmedQuery.isEmpty {
             EmptyView()
+        } else if rows.isEmpty && searchPending {
+            // In-flight with nothing to show yet: a quiet spinner — never a
+            // stale "No matches" for a query still being searched. Same block
+            // height as "No matches" so fast typing doesn't pump the card.
+            VStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(TopoStyle.inkColor)
+                Text("Searching…")
+                    .font(PPFont.mono(11))
+                    .foregroundStyle(TopoStyle.inkColor.opacity(0.5))
+            }
+            .padding(.top, 2)
+            .padding(.bottom, 20)
+            .padding(.horizontal, 20)
+            .frame(maxWidth: .infinity)
         } else if rows.isEmpty {
             VStack(spacing: 5) {
                 Text("No matches")
@@ -364,12 +399,18 @@ struct PeakDirectoryView: View {
     private func recomputeRows() {
         rowsTask?.cancel()
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !needle.isEmpty else { rows = []; searchPending = false; return }
+        guard !needle.isEmpty else {
+            rows = []; searchPending = false
+            return
+        }
         searchPending = true
         // Base first (dedup keeps the first occurrence), so local results win ties
         // against the whole-world matches.
-        let base = baseIndex, global = globalIndex
+        let base = baseIndex, global = globalIndex, globalWater = globalWaterIDs
         let eye = model.viewpoint, sort = sort, cap = maxDisplayedRows
+        // Loaded DEM tiles: fill in missing catalog elevations (OSM peaks
+        // without an `ele` tag) by sampling the terrain at the coordinate.
+        let demNear = model.demNear, demFar = model.demFar
         // Visibility badge inputs, snapshotted on main: the renderer's verdict
         // set plus the candidate lists that were actually judged.
         let visibleIDs = model.visibleFeatureIDs
@@ -380,7 +421,11 @@ struct PeakDirectoryView: View {
             let computed = await Task.detached(priority: .userInitiated) { () -> [Row] in
                 let candidateIDs = Set(candidatePeaks.map(\.id))
                     .union(candidateLakes.map(\.id))
-                let localHits = base.filter { $0.name.localizedCaseInsensitiveContains(needle) }
+                // Match against displayName, not the raw name: non-Latin names
+                // carry their transliteration there ("富士山 (Fu Shi Shan)"),
+                // so the Latin spelling finds them too. Latin names hit
+                // displayName's quick-reject and cost the same as before.
+                let localHits = base.filter { $0.displayName.localizedCaseInsensitiveContains(needle) }
                 let merged = Self.mergePeaks(localHits + global)
                 // Relevance: a match at the start of the name or a word beats a
                 // mid-word hit ("Lake Serene" over "Condor Ja[lake] Loma"),
@@ -393,7 +438,24 @@ struct PeakDirectoryView: View {
                     let prev = l[l.index(before: r.lowerBound)]
                     return (prev.isLetter || prev.isNumber) ? 2 : 1
                 }
-                let mapped = merged.map { peak -> Row in
+                // Catalog elevation 0 = "unknown": substitute the DEM height at
+                // the coordinate wherever the loaded tiles cover it — the same
+                // rule the label anchors use. The filled peak flows onward
+                // (row subtitle, sorts, verdict, and the card via onPick).
+                func filled(_ p: Peak) -> Peak {
+                    guard p.elevationMeters <= 0 else { return p }
+                    let tile: DEMTile? = (demNear?.contains(lat: p.latitude, lon: p.longitude) ?? false)
+                        ? demNear
+                        : (demFar?.contains(lat: p.latitude, lon: p.longitude) ?? false) ? demFar : nil
+                    guard let tile else { return p }
+                    let elev = Double(tile.elevation(lat: p.latitude, lon: p.longitude))
+                    guard elev > 0 else { return p }
+                    return Peak(id: p.id, name: p.name,
+                                latitude: p.latitude, longitude: p.longitude,
+                                elevationMeters: elev, prominenceMeters: p.prominenceMeters,
+                                isSaddle: p.isSaddle)
+                }
+                let mapped = merged.map(filled).map { peak -> Row in
                     let distance = eye.map {
                         GeoMath.distanceMeters(
                             fromLatitude: $0.latitude, fromLongitude: $0.longitude,
@@ -414,7 +476,7 @@ struct PeakDirectoryView: View {
                             isCandidate: candidateIDs.contains(peak.id))
                     } else { nil }
                     return Row(peak: peak, distanceMeters: distance, bearingDeg: bearing,
-                               rank: rank(of: peak.name), isVisible: visible)
+                               rank: rank(of: peak.displayName), isVisible: visible)
                 }
                 switch sort {
                 case .elevation: return Array(mapped.sorted {
@@ -430,7 +492,7 @@ struct PeakDirectoryView: View {
             searchPending = false
             // Seed for the next open: reopening with this query renders these
             // rows synchronously (see init).
-            Self.lastSession = (needle, sort, computed)
+            Self.lastSession = (needle, sort, computed, global, globalWater)
         }
     }
 
@@ -475,30 +537,6 @@ struct PeakDirectoryView: View {
     }
 
     nonisolated private static func mergePeaks(_ peaks: [Peak]) -> [Peak] {
-        var merged: [Peak] = []
-        var ids = Set<String>()
-        var buckets: [String: [Peak]] = [:]
-
-        func bucketKey(_ peak: Peak) -> String {
-            let lat = Int((peak.latitude * 200).rounded())
-            let lon = Int((peak.longitude * 200).rounded())
-            return "\(lat):\(lon)"
-        }
-
-        for peak in peaks {
-            guard ids.insert(peak.id).inserted else { continue }
-            let key = bucketKey(peak)
-            let duplicate = buckets[key]?.contains(where: {
-                guard $0.name.localizedCaseInsensitiveCompare(peak.name) == .orderedSame else { return false }
-                return GeoMath.distanceMeters(
-                    fromLatitude: $0.latitude, fromLongitude: $0.longitude,
-                    toLatitude: peak.latitude, toLongitude: peak.longitude
-                ) < 200
-            }) ?? false
-            guard !duplicate else { continue }
-            merged.append(peak)
-            buckets[key, default: []].append(peak)
-        }
-        return merged
+        Peak.dedupedKeepingFirst(peaks)   // one shared implementation
     }
 }

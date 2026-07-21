@@ -91,8 +91,14 @@ struct TimeControlsView: View {
 
         Group {
             if compact {
-                ScrollView { stack }
-                    .frame(maxHeight: 300)
+                // Hug the content when it fits the short axis (a fixed-height
+                // scroll left a blank band under the sun table); scroll only
+                // when it genuinely doesn't (calendar open).
+                ViewThatFits(in: .vertical) {
+                    stack
+                    ScrollView { stack }
+                        .frame(maxHeight: 300)
+                }
             } else {
                 stack
             }

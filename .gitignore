@@ -23,6 +23,8 @@ Tools/PeakDB/fetchwater.log
 Tools/PeakDB/geonames/
 Tools/PeakDB/geonames.log
 Tools/StarCatalog/hygdata_v41.csv
+# Pipeline output staged next to the script; the shipped copy is the bundled resource
+Tools/HorizonDEM/horizon_global.bin
 
 # Regenerable website bundle (web/ is the source of truth)
 mountainView-website.zip

@@ -26,8 +26,13 @@ struct PanoramaCamera {
     var heightScale: Float = 1
 
     /// Earth radius (m) used for curvature drop.
+    /// LOCK-STEP with GeoMath.earthRadiusMeters (Sources/App/Geo) — this file
+    /// also builds in the ReliefRender target, which doesn't compile GeoMath,
+    /// so the constants are twinned rather than shared. Change both together.
     var earthRadius: Float = 6_371_000
-    /// Standard atmospheric refraction coefficient (~0.13 lifts distant terrain).
+    /// Standard atmospheric refraction coefficient (k ≈ 0.13: light bends
+    /// down, recovering ~13% of the curvature drop). LOCK-STEP with
+    /// GeoMath.refractionCoefficient — render and verdicts must agree.
     var refractionCoefficient: Float = 0.13
 
     func makeUniforms(width: Int, height: Int) -> Uniforms {

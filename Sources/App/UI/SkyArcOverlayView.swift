@@ -41,6 +41,13 @@ final class SkyArcOverlayView: UIView {
     var moonSamples: [Sample] = []
     var sunDisc: Disc?
     var moonDisc: Disc?
+    /// Terrain skyline elevation angle (degrees) per azimuth bin (0° = north,
+    /// wrapping) — the same profile the celestial pass judges against. Lets
+    /// the sun/moon discs RISE from behind the ridge: near the crossing the
+    /// disc is masked to the region above the local skyline instead of
+    /// popping in whole. Empty = no masking (discs fall back to their
+    /// precomputed visible flags).
+    var horizonProfile: [Float] = []
     var tags: [Tag] = [] { didSet { rebuildTagLayers() } }
     /// Stars (white, brightness-tiered, unnamed) + planets (coloured, sized, named)
     /// + the day→night fade (0 = day, hidden; 1 = full night). The fade also
@@ -71,6 +78,24 @@ final class SkyArcOverlayView: UIView {
         cachedMoonLitPath = path
         return path
     }
+    /// Drop everything scene-specific in one call — arcs, discs, tags, stars,
+    /// planets, the name tag. Used at a location swap when the NEW scene's
+    /// celestial pass hasn't landed yet: a beat of plain sky, then the real
+    /// content, instead of the old location's stars shining through the new
+    /// terrain.
+    func clearCelestial() {
+        sunSamples = []
+        moonSamples = []
+        sunDisc = nil
+        moonDisc = nil
+        horizonProfile = []
+        tags = []
+        stars = []
+        planets = []
+        namedObjects = []
+        selectedSkyName = nil
+    }
+
     /// Name tag currently shown (set by a tap; nil = none). Hiding on change stops
     /// the tag flashing the PREVIOUS star's name at the new position for a frame
     /// (the string/position update happens in the next `project(...)` pass).
@@ -83,6 +108,11 @@ final class SkyArcOverlayView: UIView {
     private let sunDiscLayer = CAShapeLayer()
     private let moonDiscLayer = CAShapeLayer()    // unlit (earthshine) base disc
     private let moonLitLayer = CAShapeLayer()      // illuminated portion (phase shape)
+    /// Skyline masks for the rising/setting discs (a CALayer can be the mask
+    /// of only ONE layer, so the moon's two layers need separate instances).
+    private let sunMaskLayer = CAShapeLayer()
+    private let moonMaskLayer = CAShapeLayer()
+    private let moonLitMaskLayer = CAShapeLayer()
     private let skyTagLayer = CATextLayer()        // tapped object's name tag
     private static let moonRadius: CGFloat = 9     // visible enough to read the phase
     /// Screen positions of named objects from the last `project(...)`, for hit-testing.
@@ -354,21 +384,56 @@ final class SkyArcOverlayView: UIView {
 
         sunArc.path = polyline(sunSamples)
         moonArc.path = polyline(moonSamples)
-        positionDisc(sunDiscLayer, disc: sunDisc, screen: screen)
+
+        let gUp = CGPoint(x: gUpX, y: gUpY)
+        // Sun: rises from behind the ridge — masked to the above-skyline
+        // region while crossing, whole once clear.
+        if let sd = sunDisc,
+           let place = discPlacement(dir: sd.dir, radius: 5, wasVisible: sd.visible,
+                                     screen: screen, gUp: gUp) {
+            sunDiscLayer.position = place.point
+            if let mask = place.mask {
+                sunMaskLayer.path = mask
+                sunDiscLayer.mask = sunMaskLayer
+            } else {
+                sunDiscLayer.mask = nil
+            }
+            sunDiscLayer.isHidden = false
+        } else {
+            sunDiscLayer.isHidden = true
+            sunDiscLayer.mask = nil
+        }
 
         // Moon: dark base disc + the illuminated phase shape on top. The crescent's
         // lit limb is fixed to the sky, so counter-roll it (like the tags) — otherwise
         // it rotates with the phone and the crescent tips sideways in landscape.
-        if let md = moonDisc, md.visible, let p = screen(md.dir) {
+        if let md = moonDisc,
+           let place = discPlacement(dir: md.dir, radius: Self.moonRadius,
+                                     wasVisible: md.visible, screen: screen, gUp: gUp) {
             moonLitLayer.path = moonLitPath
-            moonDiscLayer.position = p
-            moonLitLayer.position = p
+            moonDiscLayer.position = place.point
+            moonLitLayer.position = place.point
             moonLitLayer.transform = rollT
+            if let mask = place.mask {
+                moonMaskLayer.path = mask
+                moonDiscLayer.mask = moonMaskLayer
+                // The lit layer carries the roll counter-rotation, which would
+                // spin its (world-fixed) skyline mask too — pre-rotate the
+                // path by the inverse so the ridge line stays put.
+                var invRoll = CGAffineTransform(rotationAngle: -CGFloat(atan2(right.z, up.z)))
+                moonLitMaskLayer.path = mask.copy(using: &invRoll) ?? mask
+                moonLitLayer.mask = moonLitMaskLayer
+            } else {
+                moonDiscLayer.mask = nil
+                moonLitLayer.mask = nil
+            }
             moonDiscLayer.isHidden = false
             moonLitLayer.isHidden = moonIlluminated < 0.02   // new moon → no lit part
         } else {
             moonDiscLayer.isHidden = true
             moonLitLayer.isHidden = true
+            moonDiscLayer.mask = nil
+            moonLitLayer.mask = nil
         }
 
         // Rise/set time tags, with a stacking pass: when the sun and moon rise at
@@ -425,13 +490,67 @@ final class SkyArcOverlayView: UIView {
         CATransaction.commit()
     }
 
-    private func positionDisc(_ layer: CAShapeLayer, disc: Disc?, screen: (SIMD3<Float>) -> CGPoint?) {
-        if let disc, disc.visible, let p = screen(disc.dir) {
-            layer.position = p
-            layer.isHidden = false
-        } else {
-            layer.isHidden = true
+    /// The skyline elevation at an azimuth, interpolated across profile bins —
+    /// the same lookup the celestial pass uses. nil while no profile is set.
+    private func horizonElevationDeg(atAzimuthDeg azDeg: Double) -> Double? {
+        let n = horizonProfile.count
+        guard n > 0 else { return nil }
+        var a = azDeg.truncatingRemainder(dividingBy: 360); if a < 0 { a += 360 }
+        let x = a / 360 * Double(n) - 0.5
+        let i0 = Int(floor(x))
+        let f = x - Double(i0)
+        let a0 = horizonProfile[((i0 % n) + n) % n]
+        let a1 = horizonProfile[((i0 + 1) % n + n) % n]
+        return Double(a0) * (1 - f) + Double(a1) * f
+    }
+
+    /// Where a rising/setting disc stands against the skyline this frame:
+    /// nil = fully behind the terrain; (point, nil) = fully clear; (point,
+    /// path) = crossing — the path is the region ABOVE the local skyline, in
+    /// the disc layer's centred coordinates, to use as a layer mask so the
+    /// ridge covers the disc partially as it comes out.
+    private func discPlacement(
+        dir: SIMD3<Float>, radius: CGFloat, wasVisible: Bool,
+        screen: (SIMD3<Float>) -> CGPoint?, gUp: CGPoint
+    ) -> (point: CGPoint, mask: CGPath?)? {
+        guard let p = screen(dir) else { return nil }
+        // No profile (or a degenerate projection below): the precomputed
+        // whole-disc flag decides, exactly as before.
+        let azDeg = Double(atan2(dir.x, dir.y)) * 180 / .pi
+        guard let hEl = horizonElevationDeg(atAzimuthDeg: azDeg),
+              let hP = screen(Self.enu(azimuthDeg: azDeg, elevationDeg: hEl))
+        else { return wasVisible ? (p, nil) : nil }
+        // Signed clearance of the disc CENTRE above the skyline, in points
+        // (gravity-up, so it stays honest under device roll).
+        let clear = (p.x - hP.x) * gUp.x + (p.y - hP.y) * gUp.y
+        let glowPad: CGFloat = 14              // the sun's soft glow reach
+        if clear > radius + glowPad { return (p, nil) }
+        if clear < -(radius + 2) { return nil }
+        // Crossing: build the above-the-skyline region from profile samples
+        // across the disc's azimuth neighborhood. ±3° swamps the disc's drawn
+        // width at any zoom (narrow FOVs make the span larger on screen, never
+        // smaller than the fixed-point disc).
+        let stepDeg = 360.0 / Double(max(1, horizonProfile.count))
+        var ridge: [CGPoint] = []
+        var a = azDeg - 3
+        while a <= azDeg + 3 + 1e-9 {
+            if let el = horizonElevationDeg(atAzimuthDeg: a),
+               let sp = screen(Self.enu(azimuthDeg: a, elevationDeg: el)) {
+                ridge.append(CGPoint(x: sp.x - p.x, y: sp.y - p.y))
+            }
+            a += stepDeg
         }
+        guard ridge.count >= 2 else { return (p, nil) }
+        let lift = 4 * radius + 40             // well past the disc + its glow
+        let path = CGMutablePath()
+        path.move(to: ridge[0])
+        for q in ridge.dropFirst() { path.addLine(to: q) }
+        path.addLine(to: CGPoint(x: ridge[ridge.count - 1].x + gUp.x * lift,
+                                 y: ridge[ridge.count - 1].y + gUp.y * lift))
+        path.addLine(to: CGPoint(x: ridge[0].x + gUp.x * lift,
+                                 y: ridge[0].y + gUp.y * lift))
+        path.closeSubpath()
+        return (p, path)
     }
 
     /// Brightness tier for a star of the given magnitude (faint → higher index).

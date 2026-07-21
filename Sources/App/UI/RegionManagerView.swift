@@ -10,6 +10,9 @@ import SwiftUI
 struct RegionManagerView: View {
     @ObservedObject var store: RegionStore
     var currentViewpoint: PanoramaViewModel.Viewpoint?
+    /// The eye stands away from the GPS position (teleport) — mark it
+    /// separately from the system location puck.
+    var isManualViewpoint = false
     @Environment(\.dismiss) private var dismiss
 
     /// Fraction of the (square) map side covered by the selection frame.
@@ -26,9 +29,11 @@ struct RegionManagerView: View {
     /// controls, so they go side by side instead.
     @Environment(\.verticalSizeClass) private var verticalSizeClass
 
-    init(store: RegionStore, currentViewpoint: PanoramaViewModel.Viewpoint?) {
+    init(store: RegionStore, currentViewpoint: PanoramaViewModel.Viewpoint?,
+         isManualViewpoint: Bool = false) {
         self._store = ObservedObject(wrappedValue: store)
         self.currentViewpoint = currentViewpoint
+        self.isManualViewpoint = isManualViewpoint
         let region: MKCoordinateRegion
         if let vp = currentViewpoint {
             region = MKCoordinateRegion(
@@ -101,13 +106,25 @@ struct RegionManagerView: View {
                         ])
                         .foregroundStyle(TopoStyle.visibleColor.opacity(0.45))
                     }
-                    if let vp = currentViewpoint {
+                    // The 1° tile grid INSIDE the coverage — reads as "stored
+                    // in tiles", and gives the flat green some structure.
+                    // Lines are clipped to the union rects, so the grid never
+                    // suggests coverage beyond the actual saved area.
+                    ForEach(Array(savedGridLines.enumerated()), id: \.offset) { _, line in
+                        MapPolyline(coordinates: line)
+                            .stroke(TopoStyle.visibleColor.opacity(0.5), lineWidth: 1)
+                    }
+                    // The user's position: the system blue puck, same as
+                    // every other map in the app.
+                    UserAnnotation()
+                    if isManualViewpoint, let vp = currentViewpoint {
                         Annotation(vp.name, coordinate:
                             CLLocationCoordinate2D(latitude: vp.latitude, longitude: vp.longitude)) {
                             Circle().fill(TopoStyle.inkColor)
                                 .frame(width: 10, height: 10)
-                                .overlay(Circle().stroke(.white, lineWidth: 2))
+                                .overlay(Circle().stroke(TopoStyle.paperColor, lineWidth: 2))
                         }
+                        .annotationTitles(.hidden)
                     }
                 }
                 .mapStyle(.standard(elevation: .flat))
@@ -180,7 +197,7 @@ struct RegionManagerView: View {
                     // count; it's an estimate, terrain-dependent.
                     Text(estimate > 999
                         ? "over 15 GB · zoom in"
-                        : "~\(Self.sizeText(tiles: estimate)) · pan & zoom to choose")
+                        : "~\(Self.sizeText(tiles: estimate))")
                         .font(PPFont.mono(11))
                         .foregroundStyle(TopoStyle.inkColor.opacity(0.5))
                         .lineLimit(1)
@@ -263,6 +280,31 @@ struct RegionManagerView: View {
     /// non-overlapping rectangles so the union fills seamlessly.
     private var savedAreas: [RegionBox] {
         RegionStore.unionRects(store.regions.flatMap(\.boxes))
+    }
+
+    /// Integer-degree (tile-boundary) grid segments clipped to the coverage
+    /// rects. The rects are non-overlapping, so no line draws twice.
+    private var savedGridLines: [[CLLocationCoordinate2D]] {
+        var lines: [[CLLocationCoordinate2D]] = []
+        for box in savedAreas {
+            var lon = (box.west).rounded(.up)
+            while lon < box.east {
+                if lon > box.west {
+                    lines.append([CLLocationCoordinate2D(latitude: box.south, longitude: lon),
+                                  CLLocationCoordinate2D(latitude: box.north, longitude: lon)])
+                }
+                lon += 1
+            }
+            var lat = (box.south).rounded(.up)
+            while lat < box.north {
+                if lat > box.south {
+                    lines.append([CLLocationCoordinate2D(latitude: lat, longitude: box.west),
+                                  CLLocationCoordinate2D(latitude: lat, longitude: box.east)])
+                }
+                lat += 1
+            }
+        }
+        return lines
     }
 
     // MARK: Selection geometry

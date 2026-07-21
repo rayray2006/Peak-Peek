@@ -101,42 +101,99 @@ struct PeakListsView: View {
 
     private var rowsList: some View {
         List {
-            ForEach(rows) { row in
-                Button {
-                    onPick(row.saved.peak)
-                    dismiss()
-                } label: {
-                    PeakListRow(row: row, kind: selection)
-                }
-                .buttonStyle(.plain)
-                .listRowBackground(Color.clear)
-                .listRowInsets(EdgeInsets(top: 0, leading: 20, bottom: 0, trailing: 20))
-                .listRowSeparatorTint(TopoStyle.hairline(0.08))
-                .swipeActions(edge: .trailing) {
-                    Button(role: .destructive) {
-                        store.remove(row.saved.peak, from: selection)
-                    } label: {
-                        Label("Remove", systemImage: "trash")
+            ForEach(entries) { entry in
+                switch entry {
+                case .year(let year):
+                    // Quiet year boundary (date sort spanning years): mono
+                    // year + a dashed hairline across — the year you're
+                    // scrolling INTO, newest first.
+                    HStack(spacing: 10) {
+                        Text(String(year))
+                            .font(PPFont.mono(10))
+                            .tracking(0.8)
+                            .foregroundStyle(TopoStyle.inkColor.opacity(0.4))
+                        DashedHairline()
+                            .stroke(TopoStyle.hairline(0.25),
+                                    style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                            .frame(height: 1)
                     }
-                }
-                // Saved: swipe right to promote straight to Completed.
-                .swipeActions(edge: .leading) {
-                    if selection == .wantToClimb {
-                        Button {
-                            if !store.contains(row.saved.peak, in: .climbed) {
-                                store.toggle(row.saved.peak, in: .climbed)
-                            }
-                            store.remove(row.saved.peak, from: .wantToClimb)
+                    .frame(height: 26)
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets(top: 0, leading: 20, bottom: 0, trailing: 20))
+                    .listRowSeparator(.hidden, edges: .all)
+                case .peak(let row):
+                    Button {
+                        onPick(row.saved.peak)
+                        dismiss()
+                    } label: {
+                        PeakListRow(row: row, kind: selection)
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets(top: 0, leading: 20, bottom: 0, trailing: 20))
+                    .listRowSeparatorTint(TopoStyle.hairline(0.08))
+                    .swipeActions(edge: .trailing) {
+                        Button(role: .destructive) {
+                            store.remove(row.saved.peak, from: selection)
                         } label: {
-                            Label("Been", systemImage: "checkmark.seal.fill")
+                            Label("Remove", systemImage: "trash")
                         }
-                        .tint(TopoStyle.visibleColor)
+                    }
+                    // Saved: swipe right to promote straight to Completed.
+                    .swipeActions(edge: .leading) {
+                        if selection == .wantToClimb {
+                            Button {
+                                if !store.contains(row.saved.peak, in: .climbed) {
+                                    store.toggle(row.saved.peak, in: .climbed)
+                                }
+                                store.remove(row.saved.peak, from: .wantToClimb)
+                            } label: {
+                                Label("Been", systemImage: "checkmark.seal.fill")
+                            }
+                            .tint(TopoStyle.visibleColor)
+                        }
                     }
                 }
             }
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
+    }
+
+    /// Rows, with dashed year boundaries woven in — only under the date sort,
+    /// and only when the entries actually span more than one year. Each line
+    /// carries the year of the (older) section below it; the newest year at
+    /// the top needs no label.
+    private var entries: [ListEntry] {
+        let rows = self.rows
+        guard sort == .date else { return rows.map(ListEntry.peak) }
+        func year(of row: PeakListRowModel) -> Int {
+            Calendar.current.component(.year,
+                                       from: row.saved.date(for: selection) ?? .distantPast)
+        }
+        guard let first = rows.first, let last = rows.last,
+              year(of: first) != year(of: last) else { return rows.map(ListEntry.peak) }
+        var out: [ListEntry] = []
+        var previousYear: Int?
+        for row in rows {
+            let y = year(of: row)
+            if let previousYear, y != previousYear { out.append(.year(y)) }
+            out.append(.peak(row))
+            previousYear = y
+        }
+        return out
+    }
+
+    private enum ListEntry: Identifiable {
+        case peak(PeakListRowModel)
+        case year(Int)
+
+        var id: String {
+            switch self {
+            case .peak(let row): return row.id
+            case .year(let year): return "year-\(year)"
+            }
+        }
     }
 
     private var rows: [PeakListRowModel] {
@@ -186,6 +243,16 @@ struct PeakListsView: View {
     }
 }
 
+/// A 1 pt horizontal line, stroked dashed by the caller — the year boundary.
+private struct DashedHairline: Shape {
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        p.move(to: CGPoint(x: rect.minX, y: rect.midY))
+        p.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
+        return p
+    }
+}
+
 private struct PeakListRowModel: Identifiable {
     let saved: SavedPeak
     let distanceMeters: Double?
@@ -194,18 +261,29 @@ private struct PeakListRowModel: Identifiable {
     var id: String { saved.id }
 }
 
-/// A template list row: "name ……… elevation", both tabs bare — the tab
-/// itself already says which list this is. Hairline below (List supplies it).
+/// A template list row: name over the quiet when-added/-been date on the
+/// left, elevation on the right — the tab itself already says which list
+/// this is, so the date needs no prefix. Hairline below (List supplies it).
 private struct PeakListRow: View {
     let row: PeakListRowModel
     let kind: PeakListKind
 
     var body: some View {
         HStack(spacing: 10) {
-            Text(row.saved.peak.displayName)
-                .font(PPFont.ui(15, .medium))
-                .foregroundStyle(TopoStyle.inkColor)
-                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(row.saved.peak.displayName)
+                    .font(PPFont.ui(15, .medium))
+                    .foregroundStyle(TopoStyle.inkColor)
+                    .lineLimit(1)
+                if let date = row.saved.date(for: kind) {
+                    // A step quieter than the mono facts (11 pt / 0.5) — it's
+                    // context, not a fact you scan for.
+                    Text(Self.dateText(date))
+                        .font(PPFont.mono(10))
+                        .foregroundStyle(TopoStyle.inkColor.opacity(0.35))
+                        .lineLimit(1)
+                }
+            }
             Spacer(minLength: 12)
             if row.saved.peak.elevationMeters > 0 {
                 Text(UnitText.elevation(meters: row.saved.peak.elevationMeters))
@@ -214,7 +292,15 @@ private struct PeakListRow: View {
                     .lineLimit(1)
             }
         }
-        .frame(minHeight: 40)
+        .frame(minHeight: 46)
         .contentShape(Rectangle())
+    }
+
+    /// "Jun 12", with the year only once it isn't this year's entry.
+    private static func dateText(_ date: Date) -> String {
+        if Calendar.current.isDate(date, equalTo: .now, toGranularity: .year) {
+            return date.formatted(.dateTime.month(.abbreviated).day())
+        }
+        return date.formatted(.dateTime.month(.abbreviated).day().year())
     }
 }
