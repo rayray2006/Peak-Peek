@@ -92,11 +92,31 @@ enum DEMFetcher {
 
     /// Reload the last region's tiers if present. Returns nil on a first-ever launch
     /// (nothing saved) or if the cache is unreadable — caller then fetches normally.
+    /// Tiles are re-run through the spike filter: snapshots saved before the filter
+    /// existed persist the artifacts, and healing on load (~ms) keeps the instant
+    /// launch path instead of invalidating it. No-op for clean tiles — which is
+    /// every tile saved after the filter shipped.
     static func loadLastRegion() -> (near: DEMTile, far: DEMTile?)? {
         let nearPath = lastRegionDir.appendingPathComponent("near.dembin").path
         guard let near = try? DEMTile.loadCached(binPath: nearPath) else { return nil }
         let far = try? DEMTile.loadCached(binPath: lastRegionDir.appendingPathComponent("far.dembin").path)
-        return (near, far)
+        return (despiked(near), far.map(despiked))
+    }
+
+    /// `despike` applied to an already-stitched tile (the last-region fast path).
+    /// Returns the tile unchanged when nothing was fixed; else rebuilds it so
+    /// `maxElevation` — the raymarcher's curvature-envelope bound — drops back to
+    /// the real terrain max instead of a 4000 m artifact.
+    private static func despiked(_ tile: DEMTile) -> DEMTile {
+        var e = tile.elevations
+        let fixed = despike(&e, ncols: tile.ncols, nrows: tile.nrows,
+                            thresholdMeters: despikeThreshold(cellMeters: tile.cellsize * 111_320.0))
+        guard fixed > 0 else { return tile }
+        NSLog("DEM despike: healed %d artifact posts in cached region", fixed)
+        return DEMTile(ncols: tile.ncols, nrows: tile.nrows,
+                       xllcorner: tile.xllcorner, yllcorner: tile.yllcorner,
+                       cellsize: tile.cellsize, nodata: tile.nodata,
+                       elevations: e, maxElevation: e.max() ?? 0)
     }
 
     private static func boxKey(lat: Double, lon: Double, radiusMeters: Double) -> String {
@@ -121,6 +141,11 @@ enum DEMFetcher {
                       onTileComplete: (@Sendable () -> Void)? = nil,
                       onTileStitched: (@Sendable () -> Void)? = nil)
         async throws -> (tile: DEMTile, complete: Bool) {
+        // Debug (-failFetches): every network fetch fails, as if offline —
+        // exercises the failed-move fallback without cutting the Mac's link.
+        if ProcessInfo.processInfo.arguments.contains("-failFetches") {
+            throw URLError(.notConnectedToInternet)
+        }
         let key = boxKey(lat: lat, lon: lon, radiusMeters: radiusMeters) + "_g\(maxGrid)"
         if let hit = memoryCache.object(forKey: key as NSString) {
             // Already resident: no download or stitch, but tick both phases'
@@ -287,6 +312,9 @@ enum DEMFetcher {
         }
 
         fillVoids(&elevations, ncols: ncols, nrows: nrows)
+        let fixed = despike(&elevations, ncols: ncols, nrows: nrows,
+                            thresholdMeters: despikeThreshold(cellMeters: arcsec * 111_320.0 * Double(stride)))
+        if fixed > 0 { NSLog("DEM despike: removed %d artifact posts", fixed) }
         let maxElev = elevations.max() ?? 0
         let tile = DEMTile(
             ncols: ncols, nrows: nrows,
@@ -340,6 +368,59 @@ enum DEMFetcher {
                 }
             }
         }
+    }
+
+    /// Minimum height a post must tower over (or sink under) its EVERY neighbour
+    /// before it's declared an artifact. 150 m at native ~30 m spacing means >78°
+    /// slopes on all 8 sides at once — beyond anything in C-band SRTM, which
+    /// smooths real pinnacles far below that. Scales with cell size so the coarse
+    /// far tier (posts ~120 m apart, where large real relief between neighbours
+    /// is normal) keeps the same safety margin.
+    private static func despikeThreshold(cellMeters: Double) -> Float {
+        Float(max(150.0, 2.0 * cellMeters))
+    }
+
+    /// Remove single-post radar artifacts. The keyless skadi mirror serves
+    /// UNEDITED SRTM, which over water contains isolated posts thousands of
+    /// meters tall (a 4001 m post amid 2 m Puget Sound water) and mirror-image
+    /// wells (−5802 m); the official SRTM V3/NASADEM releases patched these, the
+    /// mirror never did, and the raymarcher faithfully renders each one as a
+    /// giant spire. A post is an artifact only if it clears EVERY 8-neighbour by
+    /// `thresholdMeters` — a test no real SRTM terrain can fail (see
+    /// `despikeThreshold`) — and snaps to its nearest surviving neighbour value.
+    /// One row-parallel in-place pass, ~16 min/max ops per cell (~ms on a
+    /// stitched grid), only on an actual stitch or a cached-region load. Border
+    /// posts are skipped (no full neighbourhood; they sit at the scene's far
+    /// edge). Runs after `fillVoids` so the void sentinel can't masquerade as a
+    /// deep neighbour. In-place is safe concurrently: writes are rare, store
+    /// plausible terrain, and aligned 4-byte stores can't tear — a racing row
+    /// reading either value still judges its own posts correctly.
+    static func despike(_ e: inout [Float], ncols: Int, nrows: Int, thresholdMeters t: Float) -> Int {
+        guard ncols >= 3, nrows >= 3 else { return 0 }
+        var rowFixes = [Int](repeating: 0, count: nrows)
+        rowFixes.withUnsafeMutableBufferPointer { fixes in
+            e.withUnsafeMutableBufferPointer { buf in
+                DispatchQueue.concurrentPerform(iterations: nrows - 2) { i in
+                    let r = i + 1
+                    var fixed = 0
+                    for c in 1..<(ncols - 1) {
+                        let idx = r * ncols + c
+                        let up = idx - ncols, dn = idx + ncols
+                        let v = buf[idx]
+                        let mx = max(max(max(buf[up - 1], max(buf[up], buf[up + 1])),
+                                         max(buf[idx - 1], buf[idx + 1])),
+                                     max(buf[dn - 1], max(buf[dn], buf[dn + 1])))
+                        if v - mx > t { buf[idx] = mx; fixed += 1; continue }
+                        let mn = min(min(min(buf[up - 1], min(buf[up], buf[up + 1])),
+                                         min(buf[idx - 1], buf[idx + 1])),
+                                     min(buf[dn - 1], min(buf[dn], buf[dn + 1])))
+                        if mn - v > t { buf[idx] = mn; fixed += 1 }
+                    }
+                    fixes[r] = fixed
+                }
+            }
+        }
+        return rowFixes.reduce(0, +)
     }
 
     // MARK: Skadi tile download (keyless)

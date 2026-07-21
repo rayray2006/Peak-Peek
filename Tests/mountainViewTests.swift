@@ -463,3 +463,48 @@ final class RingPerceptibilityTests: XCTestCase {
         XCTAssertEqual(v, false)
     }
 }
+
+final class DEMDespikeTests: XCTestCase {
+
+    func testRemovesSpikeAndWell() {
+        // The real N47W123 artifacts that rendered as spires from Indian Point:
+        // a 4001 m post and a −5802 m well amid ~2 m Puget Sound water.
+        let n = 9
+        var e = [Float](repeating: 2, count: n * n)
+        e[4 * n + 4] = 4001
+        e[2 * n + 6] = -5802
+        let fixed = DEMFetcher.despike(&e, ncols: n, nrows: n, thresholdMeters: 150)
+        XCTAssertEqual(fixed, 2)
+        XCTAssertEqual(e[4 * n + 4], 2)
+        XCTAssertEqual(e[2 * n + 6], 2)
+    }
+
+    func testKeepsSteepRealTerrainAndSharpRidge() {
+        // A sharp ridge crest climbing 120 m per 30 m post on both flanks —
+        // steeper than any real C-band SRTM relief — must survive untouched:
+        // every post has a same-height along-ridge neighbour.
+        let n = 9
+        var e = [Float](repeating: 0, count: n * n)
+        for r in 0..<n {
+            for c in 0..<n { e[r * n + c] = Float(min(c, n - 1 - c)) * 120 }
+        }
+        let before = e
+        XCTAssertEqual(DEMFetcher.despike(&e, ncols: n, nrows: n, thresholdMeters: 150), 0)
+        XCTAssertEqual(e, before)
+    }
+
+    func testIsolatedSummitPostJustUnderThresholdSurvives() {
+        // An isolated post 150 m above flat surroundings sits exactly AT the
+        // threshold — the filter requires strictly more before it intervenes.
+        let n = 5
+        var e = [Float](repeating: 100, count: n * n)
+        e[2 * n + 2] = 250
+        XCTAssertEqual(DEMFetcher.despike(&e, ncols: n, nrows: n, thresholdMeters: 150), 0)
+        XCTAssertEqual(e[2 * n + 2], 250)
+    }
+
+    func testTinyGridIsLeftAlone() {
+        var e: [Float] = [0, 9000, 0, 0, 9000, 0]   // 3x2: no interior posts
+        XCTAssertEqual(DEMFetcher.despike(&e, ncols: 3, nrows: 2, thresholdMeters: 150), 0)
+    }
+}
