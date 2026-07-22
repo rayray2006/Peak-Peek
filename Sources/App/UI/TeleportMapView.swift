@@ -363,18 +363,24 @@ private struct SavedPeakDot: View {
 
     var body: some View {
         Image(systemName: kind.systemImage)
-            .font(.system(size: isSelected ? 10 : 8, weight: .bold))
+            .font(.system(size: 8, weight: .bold))
             .foregroundStyle(.white)
-            .frame(width: isSelected ? 22 : 16, height: isSelected ? 22 : 16)
+            .frame(width: 16, height: 16)
             .background(kind == .climbed ? TopoStyle.visibleColor : TopoStyle.goldColor,
                         in: Circle())
-            .overlay(Circle().stroke(.white, lineWidth: isSelected ? 2.5 : 1.5))
+            .overlay(Circle().stroke(.white, lineWidth: isSelected ? 1.8 : 1.5))
             .overlay {
                 if isSelected {
-                    Circle().stroke(.white.opacity(0.45), lineWidth: 2).padding(-4)
+                    Circle().stroke(.white.opacity(0.45), lineWidth: 1.5).padding(-3)
                 }
             }
-            .shadow(radius: isSelected ? 3 : 1.5)
+            .shadow(radius: isSelected ? 2.2 : 1.5)
+            // Selection grows via scaleEffect, NOT a bigger frame: the Map
+            // positions the annotation from the bounds it laid out, so an
+            // animated frame change kept the top-left pinned and the badge
+            // grew toward the bottom-right. scaleEffect never changes layout
+            // bounds — the badge breathes about its own center, in place.
+            .scaleEffect(isSelected ? 22.0 / 16.0 : 1)
             .animation(.spring(response: 0.25, dampingFraction: 0.8), value: isSelected)
     }
 }

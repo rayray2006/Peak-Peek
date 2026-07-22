@@ -914,6 +914,9 @@ struct TerrainMetalView: UIViewRepresentable {
             let usesCamera = newMode.usesCamera
             // Sun/moon arcs only belong to the terrain views; "Points" is camera + peaks.
             container?.skyArc.isHidden = (newMode == .arLabels)
+            // Stars only belong to the 3D panorama — over the live camera the
+            // real sky is already there and painted points read as noise.
+            container?.skyArc.showsStars = (newMode == .threeD)
 
             if usesCamera {
                 // ARKit path shows its own display layer; AVCapture the preview.

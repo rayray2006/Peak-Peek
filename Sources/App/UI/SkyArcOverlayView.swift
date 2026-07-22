@@ -52,6 +52,10 @@ final class SkyArcOverlayView: UIView {
     /// Stars (white, brightness-tiered, unnamed) + planets (coloured, sized, named)
     /// + the day→night fade (0 = day, hidden; 1 = full night). The fade also
     /// restyles the moon disc to keep it visible against either sky.
+    /// Starfield (stars + planets + halos) drawn only when true — the 3D
+    /// panorama. AR modes keep the arcs and sun/moon discs but no painted
+    /// stars over the live camera (see project(...)).
+    var showsStars = true
     var stars: [StarSample] = []
     var planets: [StarSample] = []
     var nightOpacity: Float = 0 {
@@ -327,8 +331,10 @@ final class SkyArcOverlayView: UIView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
 
-        // Stars (behind the arcs), faded in/out with night.
-        if nightOpacity > 0.001 {
+        // Stars (behind the arcs), faded in/out with night. 3D only: in the
+        // AR modes the REAL night sky is on camera, and painted points over
+        // it read as noise (and sit wherever DEM-vs-reality alignment drifts).
+        if showsStars, nightOpacity > 0.001 {
             let glowPath = CGMutablePath()
             // Stars: white points split into brightness tiers (faint = small + dim).
             let starPaths = Self.starTiers.map { _ in CGMutablePath() }
@@ -471,8 +477,11 @@ final class SkyArcOverlayView: UIView {
         }
 
         // Record named-object screen positions (for taps) + show the selected tag.
+        // With the starfield off (AR modes) only the sun/moon stay tappable —
+        // a tap must never name a star that isn't drawn.
         namedScreen.removeAll(keepingCapacity: true)
         for o in namedObjects {
+            if !showsStars, o.name != "Sun", !o.name.hasPrefix("Moon") { continue }
             if simd_dot(o.dir, forward) <= 0.05 { continue }
             guard let p = screen(o.dir) else { continue }
             if p.x < -24 || p.x > W + 24 || p.y < -24 || p.y > H + 24 { continue }
