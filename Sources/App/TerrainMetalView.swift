@@ -93,6 +93,9 @@ struct TerrainMetalView: UIViewRepresentable {
     var onForceManual: () -> Void = { }
     /// Incremented by the HUD's "Recenter" button to clear the AR drag calibration.
     var arRecenterToken: Int = 0
+    /// Incremented by the switching card's ✕: abandon the in-flight viewpoint
+    /// move (the model re-requests the previous spot in the same update).
+    var cancelMoveToken: Int = 0
     /// Fired when an AR drag calibration becomes active / is cleared (drives the HUD).
     var onARAdjustedChanged: (Bool) -> Void = { _ in }
     /// Fired at the END of every alignment-changing drag (yaw calibration or
@@ -117,11 +120,15 @@ struct TerrainMetalView: UIViewRepresentable {
     var captureIncludesCompass: Bool = false
     /// Fired when a capture finishes (true = saved) — drives the shutter flash.
     var onPhotoCaptured: (Bool) -> Void = { _ in }
-    /// Immersive view (double tap): RootScreen hides its chrome; the compass +
+    /// Immersive view (empty tap): RootScreen hides its chrome; the compass +
     /// zoom readout live inside this view, so they're hidden here.
     var immersive: Bool = false
-    /// Fired on a double tap anywhere on the terrain — toggles immersive.
-    var onToggleImmersive: () -> Void = { }
+    /// Fired on a single tap that hit NO feature (no label dot, no sky
+    /// object). RootScreen arbitrates: a tap with something dismissible open
+    /// dismisses it; only a truly idle tap toggles immersive. The Bool says
+    /// this tap already cleared a sky-object name tag (that counts as
+    /// dismissing something).
+    var onEmptyTap: (Bool) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(onStatus: onStatus, onEyeElevation: onEyeElevation,
@@ -156,21 +163,15 @@ struct TerrainMetalView: UIViewRepresentable {
         let pan = UIPanGestureRecognizer(target: context.coordinator,
                                          action: #selector(Coordinator.handlePan(_:)))
         view.addGestureRecognizer(pan)
+        // One single-tap recognizer for everything: label/sky selection when
+        // the tap lands on a feature, and (via onEmptyTap) dismiss-or-immersive
+        // when it doesn't — RootScreen decides which, since it owns the
+        // menus/cards a tap might be dismissing. The old separate double-tap
+        // recognizer for immersive is gone; selection stays instant because
+        // nothing waits on a double-tap window.
         let tap = UITapGestureRecognizer(target: context.coordinator,
                                          action: #selector(Coordinator.handleTap(_:)))
         view.addGestureRecognizer(tap)
-        // Double tap = immersive view: hide the HUD chrome (footer, mini-map,
-        // controls, compass), double tap again to restore. Deliberately NOT
-        // `tap.require(toFail: doubleTap)`: that made every selection tap wait
-        // ~0.35 s for the double-tap window to lapse — a visible label lag.
-        // Instead both run: the first tap of a double selects/clears instantly
-        // as usual, and the second toggles immersive — with taps that land ON
-        // a dot or star excluded in handleDoubleTap, so quickly re-tapping
-        // labels never flips the chrome.
-        let doubleTap = UITapGestureRecognizer(target: context.coordinator,
-                                               action: #selector(Coordinator.handleDoubleTap(_:)))
-        doubleTap.numberOfTapsRequired = 2
-        view.addGestureRecognizer(doubleTap)
 
         let container = TerrainContainerView(metalView: view)
         container.previewLayer.session = context.coordinator.session
@@ -200,7 +201,7 @@ struct TerrainMetalView: UIViewRepresentable {
         context.coordinator.captureIncludesCompass = captureIncludesCompass
         context.coordinator.setPhotoFraming(photoFraming)
         context.coordinator.setCaptureToken(captureToken)
-        context.coordinator.onToggleImmersive = onToggleImmersive
+        context.coordinator.onEmptyTap = onEmptyTap
         context.coordinator.setImmersive(immersive)
         context.coordinator.setPeaks(peaks)
         context.coordinator.setLakes(lakes)
@@ -212,6 +213,10 @@ struct TerrainMetalView: UIViewRepresentable {
         context.coordinator.onDEMTiles = onDEMTiles
         context.coordinator.onSunTimes = onSunTimes
         context.coordinator.setSelectedPeak(selectedPeak)
+        // BEFORE the viewpoint resubmission below: a cancel arrives in the
+        // same update pass as the model's revert-teleport, and the abandoned
+        // move must be dropped before the old spot is re-requested.
+        context.coordinator.setCancelMoveToken(cancelMoveToken)
         if let vp = viewpoint {
             context.coordinator.requestViewpoint(lat: vp.latitude, lon: vp.longitude,
                                                  snapToSummit: vp.snapToSummit)
@@ -536,7 +541,7 @@ struct TerrainMetalView: UIViewRepresentable {
         var onVisibleFeatures: (Set<String>) -> Void = { _ in }
         var onDEMTiles: (DEMTile?, DEMTile?) -> Void = { _, _ in }
         var onSunTimes: (PanoramaViewModel.SunTimes?) -> Void = { _ in }
-        var onToggleImmersive: () -> Void = { }
+        var onEmptyTap: (Bool) -> Void = { _ in }
         private var selectedPeakID: String?
 
         // Viewpoint bookkeeping.
@@ -550,6 +555,51 @@ struct TerrainMetalView: UIViewRepresentable {
         /// The latest viewpoint requested while a reload was in flight; run when
         /// the current bake settles instead of being silently dropped.
         private var queuedRequest: (lat: Double, lon: Double, snap: Bool)?
+        /// Generation stamp for viewpoint moves: every requestViewpoint bumps
+        /// it, and every completion (fetch install, failure report, bake
+        /// onReady, progress tick) is guarded on it — so a cancelled or
+        /// superseded move's late completions drop silently instead of
+        /// installing tiles, flipping status, or re-animating progress.
+        private var moveGeneration = 0
+        private var cancelMoveToken = 0
+        /// The dedupe memory as it stood before the in-flight move — restored
+        /// on a mid-fetch cancel so the revert-teleport's resubmission of the
+        /// still-displayed spot dedupes to a no-op instead of re-baking it.
+        private var requestBeforeMove: (lat: Double, lon: Double)?
+        /// True once the in-flight move has retargeted scene state (refLat,
+        /// ground, sky). Fetch moves stay false until install; reuse-fast-path
+        /// moves flip immediately — that's the case a cancel must re-bake.
+        private var moveMutatedScene = false
+
+        /// The switching card's ✕: abandon the in-flight move. The scene on
+        /// screen still shows the PREVIOUS viewpoint (a new panorama only
+        /// installs when its bake completes), so cancelling means dropping the
+        /// pending work — the generation bumps orphan the in-flight fetch and
+        /// bake — and settling back into the old scene.
+        func setCancelMoveToken(_ token: Int) {
+            guard token != cancelMoveToken else { return }
+            cancelMoveToken = token
+            guard isReloading else { return }
+            moveGeneration &+= 1
+            bakeGeneration &+= 1
+            queuedRequest = nil
+            isReloading = false
+            if moveMutatedScene {
+                // The move already retargeted the scene state (a reuse-move
+                // mid-bake): the model's revert-teleport (same update pass)
+                // must re-request and re-bake the old spot.
+                lastRequested = nil
+            } else {
+                // Cancelled mid-fetch: nothing was touched — the displayed
+                // scene IS the previous viewpoint. Restore the dedupe memory
+                // so the revert resubmission no-ops, and stand ready NOW: no
+                // re-bake, and no waiting out the orphaned fetch's stitch
+                // (which starves the cores for seconds after a heavy cancel).
+                lastRequested = requestBeforeMove
+                report(.ready)
+                onEyeElevation(Double(groundElev) + 1.6)
+            }
+        }
 
         /// Every reload exit path funnels here so a queued mid-bake move is
         /// never lost (main thread only, like all reload state).
@@ -629,8 +679,16 @@ struct TerrainMetalView: UIViewRepresentable {
             container?.labelOverlay.anchors = anchors
             onVisibleFeatures(visibleIDs)
             view?.setNeedsDisplay()
-            pendingOnReady?()
+            // Capture-then-clear, in that order: the completion below runs
+            // finishReload, which starts a QUEUED move synchronously — and that
+            // move's bakeProgressive stores ITS onReady into `pendingOnReady`.
+            // Clearing after the call wiped the new move's completion, so its
+            // swap later landed with no one to report .ready — the "Switching
+            // location" card then hung forever and every further move queued
+            // behind the stuck isReloading (chained-teleport soft lock).
+            let onReady = pendingOnReady
             pendingOnReady = nil
+            onReady?()
         }
         private var bundledTileCache: DEMTile?
 
@@ -877,6 +935,8 @@ struct TerrainMetalView: UIViewRepresentable {
                     arZoom = 1
                     container?.cameraZoom = 1
                     pendingARZoomMatch = true
+                    fovBeforeAR = fov          // restored on exit if the match clamps
+                    arEntryMatchClamped = false
                     // Arm the FOV ramp: with the crop matched the target FOV ≈
                     // the 3D FOV and the ramp is a no-op; when the match clamps
                     // (3D wider than the camera, or past the 4x crop cap) the
@@ -895,12 +955,26 @@ struct TerrainMetalView: UIViewRepresentable {
             } else {
                 // AR→3D: opaque immediately (renders the sky — no gap), drop the camera.
                 // Adopt the AR view's magnification into the 3D fov first (clamped
-                // to the pinch range) so the switch BACK is seamless too.
+                // to the pinch range) so the switch BACK is seamless too — UNLESS
+                // the AR entry clamped (the camera couldn't show the 3D zoom) and
+                // the user never re-zoomed in AR: then AR displayed the clamp, not
+                // a choice, and adopting it silently ate the wider/narrower 3D
+                // zoom. Restore that zoom instead, eased from the AR view's
+                // magnification so it transitions rather than pops.
                 if wasCamera, let v = view,
                    let tanV = arVerticalTanHalfFov(drawableW: Int(v.drawableSize.width),
                                                    drawableH: Int(v.drawableSize.height)) {
-                    fov = max(15, min(90, atanf(tanV) * 360 / .pi))
+                    if arEntryMatchClamped, let saved = fovBeforeAR {
+                        fov = saved
+                        arFovRampFrom = tanV
+                        arFovRampStart = nil
+                    } else {
+                        fov = max(15, min(90, atanf(tanV) * 360 / .pi))
+                        arFovRampFrom = 0      // same magnification: nothing to ease
+                    }
                 }
+                fovBeforeAR = nil
+                arEntryMatchClamped = false
                 pendingARZoomMatch = false
                 setAwaitingFirstFrame(false)
                 cameraRevealed = false
@@ -1226,14 +1300,19 @@ struct TerrainMetalView: UIViewRepresentable {
                 queuedRequest = (lat: lat, lon: lon, snap: snapToSummit)
                 return
             }
+            requestBeforeMove = lastRequested
             lastRequested = (lat, lon)
             pendingSummitSnap = snapToSummit
             isReloading = true
+            moveGeneration &+= 1
+            let gen = moveGeneration
+            moveMutatedScene = false
             report(.preparingTerrain(progress: nil))
 
             // Reuse fast-path: both tiers already cover this viewpoint.
             if let tile = dem, tile.contains(lat: lat, lon: lon, marginMeters: 18_000),
                let far = demFar, far.contains(lat: lat, lon: lon, marginMeters: 18_000) {
+                moveMutatedScene = true
                 let eye = summitSnappedEye(lat: lat, lon: lon, tile: tile)
                 let ground = eye.elev
                 refLat = eye.lat; refLon = eye.lon
@@ -1245,6 +1324,7 @@ struct TerrainMetalView: UIViewRepresentable {
                 updateFarHorizon()
                 NSLog("Viewpoint reused current tile (no fetch)")
                 bakeProgressive(progressFrom: 0) {
+                    guard gen == self.moveGeneration else { return }   // cancelled
                     self.report(.ready)
                     self.onEyeElevation(Double(ground) + 1.6)
                     self.finishReload()
@@ -1285,7 +1365,8 @@ struct TerrainMetalView: UIViewRepresentable {
                         }
                         let onUnit: @Sendable () -> Void = { [weak self] in
                             DispatchQueue.main.async {
-                                guard let self, self.loadUnitsTotal > 0 else { return }
+                                guard let self, gen == self.moveGeneration,
+                                      self.loadUnitsTotal > 0 else { return }
                                 self.loadUnitsDone = min(self.loadUnitsDone + 1, self.loadUnitsTotal)
                                 self.report(.preparingTerrain(progress:
                                     Self.loadShare * Double(self.loadUnitsDone) / Double(self.loadUnitsTotal)))
@@ -1319,24 +1400,32 @@ struct TerrainMetalView: UIViewRepresentable {
                 }
                 guard let tile = nearTile else {
                     await MainActor.run {
+                        guard let self, gen == self.moveGeneration else { return }  // cancelled
                         // Clear the dedupe memory: a retry of the SAME spot after
                         // a failure must re-attempt, not silently no-op — but
                         // stamp the failure so the passive resubmission path
                         // cools down instead of looping (see requestViewpoint).
-                        self?.lastRequested = nil
-                        self?.lastFailedRequest = (lat, lon, Date())
-                        self?.report(.failed(failure))
-                        self?.finishReload()
+                        self.lastRequested = nil
+                        self.lastFailedRequest = (lat, lon, Date())
+                        self.report(.failed(failure))
+                        self.finishReload()
                     }
                     return
                 }
+                // Cancelled while fetching? Stop before the expensive tail: no
+                // texture upload, and — critically — no last-region snapshot
+                // (a cancelled move must not overwrite the instant-launch
+                // cache with a region the user backed out of).
+                let stillWanted = await MainActor.run { [weak self] in gen == self?.moveGeneration }
+                guard stillWanted else { return }
                 let tex = tile.makeTexture(device: device)
                 let farTex = (farTile?.makeTexture(device: device))
                 NSLog("DEM ready in %.0f ms (%@)", Self.ms(since: t0), fromNetwork ? "fetch" : "snapshot")
                 // Snapshot a freshly fetched region for an instant next launch.
                 if fromNetwork { DEMFetcher.saveLastRegion(near: tile, far: farTile) }
                 await MainActor.run {
-                    guard let self else { return }
+                    guard let self, gen == self.moveGeneration else { return }  // cancelled
+                    self.moveMutatedScene = true
                     self.dem = tile
                     self.demFar = farTile
                     self.onDEMTiles(tile, farTile)
@@ -1351,6 +1440,7 @@ struct TerrainMetalView: UIViewRepresentable {
                     self.rebuildSky()
                     self.updateFarHorizon()
                     self.bakeProgressive(progressFrom: Self.loadShare) {
+                        guard gen == self.moveGeneration else { return }        // cancelled
                         self.report(.ready)
                         self.onEyeElevation(Double(ground) + 1.6)
                         self.finishReload()
@@ -2463,14 +2553,6 @@ struct TerrainMetalView: UIViewRepresentable {
             return (peaksOut + lakesOut, Set(all.map(\.peak.id)).union(ringVisibleIDs))
         }
 
-        /// March the DEM along the eye→summit bearing; if any nearer terrain rises
-        /// above the sightline to the summit, the peak is occluded.
-        ///
-        /// PRECISION: the step is kept ≤ ~0.8 of the DEM cell at the current distance
-        /// (≈30 m in the near tier, ≈90 m in the far tier). The old fixed 120 m cap
-        /// over-stepped the 30 m near grid by ~4 cells in the 10–40 km band, marching
-        /// clean over intervening ridges and leaving occluded peaks visible. Sampling
-        /// at sub-cell spacing means no ridge between two samples can be missed.
         /// Debug: `-labelDebug` logs every cull (with the blocking terrain for
         /// occlusions) for anchors within 10 km — for diagnosing missing labels.
         static let labelDebug = ProcessInfo.processInfo.arguments.contains("-labelDebug")
@@ -2497,7 +2579,7 @@ struct TerrainMetalView: UIViewRepresentable {
         /// skipped (its own shore cells sit ± a DEM cell around water height and
         /// would self-occlude), as are the first 60 m (the eye's own crest —
         /// `summitSnappedEye` guarantees nothing above the eye within ~45 m).
-        private static func waterSightlineOccluded(
+        static func waterSightlineOccluded(
             eyeLat: Double, eyeLon: Double, featLat: Double, featLon: Double,
             horiz: Double, apparentUp: Double, camElevMeters: Double,
             heightScale: Double, curvatureK: Double, dem: DEMTile, far: DEMTile?
@@ -2670,13 +2752,19 @@ struct TerrainMetalView: UIViewRepresentable {
                 if pendingARZoomMatch,
                    let tan1x = arVerticalTanHalfFov1x(drawableW: width, drawableH: height) {
                     pendingARZoomMatch = false
-                    arZoom = Self.matchedARZoom(cameraTanHalf1x: tan1x,
-                                                tanHalf3D: tanf(fov * .pi / 360))
+                    let tanHalf3D = tanf(fov * .pi / 360)
+                    arZoom = Self.matchedARZoom(cameraTanHalf1x: tan1x, tanHalf3D: tanHalf3D)
+                    arEntryMatchClamped = Self.arZoomMatchClamps(cameraTanHalf1x: tan1x,
+                                                                 tanHalf3D: tanHalf3D)
                     container?.cameraZoom = CGFloat(arZoom)
                 }
                 if let tanV = arVerticalTanHalfFov(drawableW: width, drawableH: height) {
                     u.tanHalfFovY = arRampedTanHalf(target: tanV)
                 }
+            } else if width > 2, height > 2, arFovRampFrom > 0 {
+                // Eased restore of a clamp-eaten 3D zoom on AR exit (see
+                // setMode): same ramp, target = the restored 3D fov.
+                u.tanHalfFovY = arRampedTanHalf(target: tanf(fov * .pi / 360))
             }
             return u
         }
@@ -2684,6 +2772,23 @@ struct TerrainMetalView: UIViewRepresentable {
         /// True from a 3D→AR switch until the camera intrinsics are known and the
         /// magnification-matching crop has been applied (makeUniforms above).
         private var pendingARZoomMatch = false
+
+        /// The 3D fov at AR entry, and whether the entry match hit the crop
+        /// clamp (3D wider than the lens, or past the 4x crop). When it did,
+        /// the AR view showed the CLAMP, not the user's zoom — and the exit
+        /// adoption then made that permanent (the one-time "my zoom became
+        /// 0.8x" report). An exit now restores the fov the clamp ate instead —
+        /// unless the user pinched in AR and took ownership of the zoom.
+        private var fovBeforeAR: Float?
+        private var arEntryMatchClamped = false
+
+        /// True when the 3D magnification lies outside what the AR crop can
+        /// reproduce (wider than the 1x lens / past the 4x crop) — the entry
+        /// pops to the clamp bound. Pure math, unit-tested.
+        static func arZoomMatchClamps(cameraTanHalf1x: Float, tanHalf3D: Float) -> Bool {
+            let raw = cameraTanHalf1x / max(1e-4, tanHalf3D)
+            return raw < 1 || raw > 4
+        }
 
         /// The camera's native (1x) on-screen tan(½ vertical FOV) — the matched-
         /// zoom baseline. `arVerticalTanHalfFov` bakes the current crop in.
@@ -2865,6 +2970,9 @@ struct TerrainMetalView: UIViewRepresentable {
             guard let v = view else { return }
             if mode.usesCamera {
                 if g.state == .began { pinchStartARZoom = arZoom }
+                // The user re-zoomed in AR: the magnification is now a choice,
+                // so the exit adopts it — no clamp-restore (see setMode).
+                arEntryMatchClamped = false
                 arZoom = max(1, min(4, pinchStartARZoom * Float(g.scale)))
                 container?.cameraZoom = CGFloat(arZoom)
                 v.setNeedsDisplay()
@@ -2875,21 +2983,9 @@ struct TerrainMetalView: UIViewRepresentable {
             v.setNeedsDisplay()
         }
 
-        /// Immersive toggle — but only on EMPTY terrain/sky. A double tap on a
-        /// label dot or sky object is someone interacting with features (its
-        /// first tap already selected instantly); flipping the chrome under
-        /// them would read as a glitch.
-        @objc func handleDoubleTap(_ g: UITapGestureRecognizer) {
-            if let overlay = container?.labelOverlay,
-               overlay.peak(at: g.location(in: overlay)) != nil { return }
-            if let sky = container?.skyArc,
-               sky.skyObjectName(at: g.location(in: sky)) != nil { return }
-            onToggleImmersive()
-        }
-
         /// Immersive chrome-hide: the compass + zoom readout are drawn inside
         /// this view (not RootScreen), so they hide here.
-        /// Chrome-hiding inputs: immersive (double tap) and photo framing.
+        /// Chrome-hiding inputs: immersive (empty tap) and photo framing.
         private var immersiveChrome = false
         private var photoFraming = false
 
@@ -2941,8 +3037,13 @@ struct TerrainMetalView: UIViewRepresentable {
                 view?.setNeedsDisplay()
                 return
             }
+            // Nothing under the tap: clearing a sky-object tag counts as the
+            // tap's job — RootScreen only toggles immersive on a tap that
+            // dismissed nothing at all.
+            let clearedSkyTag = container?.skyArc.selectedSkyName != nil
             container?.skyArc.selectedSkyName = nil
-            onSelectPeak(nil)
+            if clearedSkyTag { view?.setNeedsDisplay() }
+            onEmptyTap(clearedSkyTag)
         }
 
         /// The cached terrain skyline (ring included), interpolated at an

@@ -121,6 +121,7 @@ struct RootScreen: View {
             onEyeElevation: { model.eyeElevationResolved($0) },
             onForceManual: { manualAlignment = true },
             arRecenterToken: arRecenterToken,
+            cancelMoveToken: model.moveCancelToken,
             onARAdjustedChanged: { arAdjusted = $0 },
             onAlignmentNudged: { alignmentNudges &+= 1 },
             onNightChanged: { isNight = $0 },
@@ -138,8 +139,25 @@ struct RootScreen: View {
                 }
             },
             immersive: immersive,
-            onToggleImmersive: {
-                withAnimation(.easeInOut(duration: 0.22)) { immersive.toggle() }
+            onEmptyTap: { clearedSkyTag in
+                // A tap on nothing: its first job is dismissing whatever is
+                // open — the reading every open surface already trained. Only
+                // a tap with NOTHING to dismiss toggles the immersive
+                // chrome-hide (this replaced the old double tap: same
+                // feature-tap exclusions, one less gesture to discover).
+                var consumed = clearedSkyTag
+                if model.selectedPeak != nil { model.select(nil); consumed = true }
+                if showLocationCard { showLocationCard = false; consumed = true }
+                cardReturnSheet = nil
+                if showActionMenu { collapseActionMenu(); consumed = true }
+                if let sheet = activeSheet, sheet != .map, sheet != .directory {
+                    activeSheet = nil
+                    consumed = true
+                }
+                guard !showPhotoShutter else { return }   // framing owns the chrome
+                if !consumed {
+                    withAnimation(.easeInOut(duration: 0.22)) { immersive.toggle() }
+                }
             }
         )
     }
@@ -347,6 +365,17 @@ struct RootScreen: View {
                                                  latitude: parts[0], longitude: parts[1]),
                                        manual: true)
                     }
+                }
+            }
+            // Debug: tap the switching card's ✕ after a delay — exercises the
+            // mid-move cancel headlessly (pair with -viewpoint/-viewpointDelay:
+            // the delay must land while that move's fetch is still running).
+            if let i = args.firstIndex(of: "-cancelMoveAfter"), i + 1 < args.count,
+               let delay = Double(args[i + 1]) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    NSLog("debug -cancelMoveAfter: cancelling (canCancel=%d)",
+                          model.canCancelMove ? 1 : 0)
+                    model.cancelLocationChange()
                 }
             }
             // Debug: "Stand here" on a named peak/lake once the render is up —
@@ -892,7 +921,10 @@ struct RootScreen: View {
                     // In landscape the OPEN action menu reaches down into the
                     // mini-map's corner — yield it while the menu is up rather
                     // than stacking the two.
-                    if let viewpoint = model.viewpoint,
+                    // `renderedViewpoint`, not `viewpoint`: the map pin moves
+                    // when the scene actually swaps, not the moment a move
+                    // starts loading.
+                    if let viewpoint = model.renderedViewpoint ?? model.viewpoint,
                        !(showActionMenu && isChromeLandscape) {
                         MiniMapView(viewpoint: viewpoint, isManualViewpoint: model.isManualViewpoint) {
                             activeSheet = .map
@@ -1519,6 +1551,21 @@ struct RootScreen: View {
             PPProgressLine(progress: progress, width: 180, height: 2)
             WhimsyLine(style: .card)
         }
+        // ✕ = abandon the move and stand back at the previous scene. Only
+        // offered when there IS one (a first launch load can't go back).
+        .overlay(alignment: .topTrailing) {
+            if model.canCancelMove {
+                Button { model.cancelLocationChange() } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(TopoStyle.inkColor.opacity(0.5))
+                        .frame(width: 30, height: 30)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(1)
+            }
+        }
     }
 }
 
@@ -1594,11 +1641,11 @@ private enum LoadingWhimsy {
 /// each branch is a fresh structural identity) — every recreation reshuffled
 /// and swapped the line immediately, so lines visibly rotated early. One
 /// process-wide cursor instead: a recreated instance shows the line already
-/// up and waits out the REMAINDER of its 3.2 s, and the timestamp guard means
-/// even two live instances can't double-advance the rotation.
+/// up and waits out the REMAINDER of its interval, and the timestamp guard
+/// means even two live instances can't double-advance the rotation.
 @MainActor
 private enum WhimsyClock {
-    static let interval: TimeInterval = 3.2
+    static let interval: TimeInterval = 2.0
     /// Random per-launch palette start, so the first line isn't always coral.
     static let colorOffset = Int.random(in: 0..<6)
     private(set) static var order = LoadingWhimsy.lines.shuffled()
@@ -1631,7 +1678,7 @@ private enum WhimsyClock {
 }
 
 /// One cycling whimsy line ("Carving the valleys…"), in the template's IBM
-/// Plex Mono. Cross-fades to the next line every ~3.2 s through the shared
+/// Plex Mono. Cross-fades to the next line every ~2 s through the shared
 /// WhimsyClock order. Colors rotate through the soft warm-to-cool set —
 /// pastels on dark, deeper siblings on paper so they read on white.
 private struct WhimsyLine: View {

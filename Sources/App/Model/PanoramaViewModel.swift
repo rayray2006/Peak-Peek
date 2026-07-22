@@ -318,6 +318,34 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     private var lastGoodViewpoint: (viewpoint: Viewpoint, manual: Bool)?
     private var failedMoveRevertTask: Task<Void, Never>?
 
+    /// The viewpoint whose scene is actually rendered on screen (set on every
+    /// `.ready`). UI that depicts "where you ARE" (the mini-map) binds to this;
+    /// `viewpoint` flips to the TARGET at the start of a move.
+    @Published private(set) var renderedViewpoint: Viewpoint?
+
+    /// Bumped by the switching card's ✕: tells the renderer (via
+    /// TerrainMetalView) to abandon its in-flight fetch/bake for the move
+    /// being cancelled, in the same update pass that re-requests the old spot.
+    @Published private(set) var moveCancelToken = 0
+
+    /// A previously rendered scene exists to return to — the switching card
+    /// offers its ✕ only then (a first launch load has nowhere to go back to).
+    var canCancelMove: Bool { lastGoodViewpoint != nil }
+
+    /// User tapped ✕ on the switching card: abandon the in-flight move and
+    /// stand back at the last scene that actually rendered. The renderer drops
+    /// the pending work (token above); the teleport home then re-bakes from
+    /// the still-resident tiles — the fast no-fetch path, so cancel is quick
+    /// even when the abandoned fetch had many tiles left to download.
+    func cancelLocationChange() {
+        guard let prior = lastGoodViewpoint else { return }
+        failedMoveRevertTask?.cancel()
+        moveCancelToken += 1
+        lastGoodViewpoint = nil
+        isManualViewpoint = prior.manual
+        teleport(to: prior.viewpoint)
+    }
+
     /// Jump the eye anywhere. A user-initiated jump (map / peak visit / debug) also
     /// stops GPS auto-follow.
     func teleport(to viewpoint: Viewpoint, manual: Bool = false) {
@@ -424,7 +452,14 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     /// is capped (+5 pts over the last real value, ≤97%) — it can trail reality
     /// slightly, never race ahead of it.
     func renderStatusChanged(_ status: Status) {
-        if status == .ready { hasRenderedOnce = true }
+        if status == .ready {
+            hasRenderedOnce = true
+            // The scene for the CURRENT viewpoint is now on screen — the
+            // mini-map tracks this, not `viewpoint`: a teleport retargets
+            // `viewpoint` the moment the load starts, and the map pin jumping
+            // while "Switching location" was still up read as already-arrived.
+            renderedViewpoint = viewpoint
+        }
         switch status {
         case let .preparingTerrain(progress?):
             setProgressTarget(progress, rendering: false)
@@ -638,7 +673,16 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         // record for this same feature says saddle, or the name itself says
         // low point ("… Gap"/"… Pass"), the point IS the destination — never
         // climb the neighboring hill.
+        // `nearbyLakes` only reaches 160 km from the CURRENT viewpoint, so a
+        // lake teleported to from farther away (global search) classified as
+        // a peak and summit-snapped onto its shoreline ridge — you arrived
+        // ABOVE the lake you asked for (the Wing Lake bug). The bundled
+        // global lakes file is the offline truth at any distance: one
+        // cell-indexed lookup in the memory-mapped file (~µs, once per tap).
         let isWater = nearbyLakes.contains { $0.id == peak.id }
+            || (GlobalPeakDatabase.lakes?.peaks(
+                    nearLatitude: peak.latitude, longitude: peak.longitude,
+                    withinMeters: 500).contains { $0.id == peak.id } ?? false)
         let liveSaddle = allNearbyPeaks.contains {
             ($0.id == peak.id
              || ($0.name.localizedCaseInsensitiveCompare(peak.name) == .orderedSame
