@@ -1820,7 +1820,7 @@ private struct InitialLoadingScreen: View {
             if !isCompact {
                 VStack {
                     Spacer()
-                    PPMicroLabel(text: "v1.0 · surveying the range", opacity: 0.3)
+                    PPMicroLabel(text: "v1.0", opacity: 0.3)
                         .padding(.bottom, 34)
                 }
             }

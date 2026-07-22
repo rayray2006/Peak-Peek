@@ -37,6 +37,9 @@ struct TeleportMapView: View {
         MapReader { proxy in
             Map(initialPosition: startPosition) { mapAnnotations }
             .mapStyle(.hybrid(elevation: .realistic))
+            // No compass/scale chrome: they pop in during rotation right where
+            // the floating title and ✕ live, and a pin-drop picker needs neither.
+            .mapControlVisibility(.hidden)
             .onTapGesture { screenPoint in
                 if let coordinate = proxy.convert(screenPoint, from: .local) {
                     selectedPeak = nil
@@ -85,6 +88,13 @@ struct TeleportMapView: View {
                 .frame(maxWidth: .infinity)
                 .padding()
                 .background(.regularMaterial)
+            } else {
+                // With no card up, .ignoresSafeArea leaves the map thinking it
+                // has zero bottom inset, so its Legal/logo attribution hugged
+                // the physical edge and got clipped by the rounded corner. A
+                // clear inset restores the margin; tiles still bleed beneath it.
+                Color.clear.frame(height: 24)
+                    .allowsHitTesting(false)
             }
         }
     }
