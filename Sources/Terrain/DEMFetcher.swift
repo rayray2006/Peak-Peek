@@ -80,10 +80,19 @@ enum DEMFetcher {
 
     /// Persist the freshly stitched near/far tiers for an instant next launch.
     /// Heavy (~80 MB) but rare (only on an actual fetch, not tile reuse), off-main.
+    /// Deferred a few seconds: it used to kick off right as the new scene swapped
+    /// in, adding disk + allocation churn to the first second of panning it. An
+    /// app killed inside the window just refetches next launch — same as before
+    /// the snapshot existed.
+    /// Serial home for snapshot writes: chained fetches inside the defer window
+    /// must not interleave their near/far file pairs.
+    private static let snapshotQueue = DispatchQueue(
+        label: "com.peakpeek.demsnapshot", qos: .utility)
+
     static func saveLastRegion(near: DEMTile, far: DEMTile?) {
         let nearPath = lastRegionDir.appendingPathComponent("near.dembin").path
         let farPath = lastRegionDir.appendingPathComponent("far.dembin").path
-        DispatchQueue.global(qos: .utility).async {
+        snapshotQueue.asyncAfter(deadline: .now() + 4) {
             try? near.saveBinary(to: nearPath)
             if let far { try? far.saveBinary(to: farPath) }
             else { try? FileManager.default.removeItem(atPath: farPath) }
@@ -380,23 +389,48 @@ enum DEMFetcher {
         Float(max(150.0, 2.0 * cellMeters))
     }
 
-    /// Remove single-post radar artifacts. The keyless skadi mirror serves
-    /// UNEDITED SRTM, which over water contains isolated posts thousands of
-    /// meters tall (a 4001 m post amid 2 m Puget Sound water) and mirror-image
-    /// wells (−5802 m); the official SRTM V3/NASADEM releases patched these, the
-    /// mirror never did, and the raymarcher faithfully renders each one as a
-    /// giant spire. A post is an artifact only if it clears EVERY 8-neighbour by
-    /// `thresholdMeters` — a test no real SRTM terrain can fail (see
-    /// `despikeThreshold`) — and snaps to its nearest surviving neighbour value.
-    /// One row-parallel in-place pass, ~16 min/max ops per cell (~ms on a
-    /// stitched grid), only on an actual stitch or a cached-region load. Border
-    /// posts are skipped (no full neighbourhood; they sit at the scene's far
-    /// edge). Runs after `fillVoids` so the void sentinel can't masquerade as a
-    /// deep neighbour. In-place is safe concurrently: writes are rare, store
-    /// plausible terrain, and aligned 4-byte stores can't tear — a racing row
-    /// reading either value still judges its own posts correctly.
+    /// Remove radar-artifact posts — singles AND small clusters. The keyless
+    /// skadi mirror serves UNEDITED SRTM, which over water contains posts
+    /// thousands of meters tall (a 4001 m post amid 2 m Puget Sound water) and
+    /// mirror-image wells (−5802 m); the official SRTM V3/NASADEM releases
+    /// patched these, the mirror never did, and the raymarcher faithfully
+    /// renders each one as a giant spire.
+    ///
+    /// Artifacts come in PAIRS as well: the Snohomish delta has 1459 m and
+    /// 2913 m posts diagonally adjacent over ~5 m river flats. Against an
+    /// all-8-neighbours test each spike protected the other, and healing one
+    /// to its MAX neighbour copied the other spike's height — leaving a twin
+    /// 1459 m spire. So a post is judged against its SECOND-highest neighbour:
+    /// real terrain is connected — a ridge or pinnacle line running through a
+    /// post leaves ≥2 similar-height neighbours — while an artifact pair
+    /// musters exactly one. Clearing even the second-highest by
+    /// `thresholdMeters` means >78° slopes on 7 of 8 sides at once, beyond
+    /// anything in C-band SRTM (verified: zero fixes across the whole bundled
+    /// Cascades grid). Spikes snap DOWN to that second-highest neighbour;
+    /// wells mirror with the second-lowest.
+    ///
+    /// Up to 4 passes: healing a cluster's outer posts exposes the inner ones,
+    /// so short chains dissolve end-first; clean tiles exit after one pass
+    /// (~ms on a stitched grid). Runs only on an actual stitch or a
+    /// cached-region load. Border posts are skipped (no full neighbourhood;
+    /// they sit at the scene's far edge). Runs after `fillVoids` so the void
+    /// sentinel can't masquerade as a deep neighbour. In-place is safe
+    /// concurrently: writes are rare, store plausible terrain, and aligned
+    /// 4-byte stores can't tear — a racing row reading either value still
+    /// judges its own posts correctly.
     static func despike(_ e: inout [Float], ncols: Int, nrows: Int, thresholdMeters t: Float) -> Int {
         guard ncols >= 3, nrows >= 3 else { return 0 }
+        var total = 0
+        for _ in 0..<4 {
+            let fixed = despikePass(&e, ncols: ncols, nrows: nrows, thresholdMeters: t)
+            total += fixed
+            if fixed == 0 { break }
+        }
+        return total
+    }
+
+    private static func despikePass(_ e: inout [Float], ncols: Int, nrows: Int,
+                                    thresholdMeters t: Float) -> Int {
         var rowFixes = [Int](repeating: 0, count: nrows)
         rowFixes.withUnsafeMutableBufferPointer { fixes in
             e.withUnsafeMutableBufferPointer { buf in
@@ -407,14 +441,18 @@ enum DEMFetcher {
                         let idx = r * ncols + c
                         let up = idx - ncols, dn = idx + ncols
                         let v = buf[idx]
-                        let mx = max(max(max(buf[up - 1], max(buf[up], buf[up + 1])),
-                                         max(buf[idx - 1], buf[idx + 1])),
-                                     max(buf[dn - 1], max(buf[dn], buf[dn + 1])))
-                        if v - mx > t { buf[idx] = mx; fixed += 1; continue }
-                        let mn = min(min(min(buf[up - 1], min(buf[up], buf[up + 1])),
-                                         min(buf[idx - 1], buf[idx + 1])),
-                                     min(buf[dn - 1], min(buf[dn], buf[dn + 1])))
-                        if mn - v > t { buf[idx] = mn; fixed += 1 }
+                        // Two largest / two smallest of the 8 neighbours.
+                        var m1 = -Float.greatestFiniteMagnitude, m2 = m1
+                        var n1 = Float.greatestFiniteMagnitude, n2 = n1
+                        func acc(_ w: Float) {
+                            if w > m1 { m2 = m1; m1 = w } else if w > m2 { m2 = w }
+                            if w < n1 { n2 = n1; n1 = w } else if w < n2 { n2 = w }
+                        }
+                        acc(buf[up - 1]); acc(buf[up]); acc(buf[up + 1])
+                        acc(buf[idx - 1]); acc(buf[idx + 1])
+                        acc(buf[dn - 1]); acc(buf[dn]); acc(buf[dn + 1])
+                        if v - m2 > t { buf[idx] = m2; fixed += 1; continue }
+                        if n2 - v > t { buf[idx] = n2; fixed += 1 }
                     }
                     fixes[r] = fixed
                 }
@@ -457,6 +495,16 @@ enum DEMFetcher {
     }
     private static let inflight = InflightDownloads()
 
+    /// Tile-download session. The shared session's default of 6 connections per
+    /// host serialized a cold 16-tile fetch into ~3 waves against the S3 mirror
+    /// (which handles wide parallelism fine) — the limit, not bandwidth, was the
+    /// long pole of a cold move. One connection per tile of a worst-case fetch.
+    private static let tileSession: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.httpMaximumConnectionsPerHost = 16
+        return URLSession(configuration: cfg)
+    }()
+
     private static func loadHGTData(tLat: Int, tLon: Int) async -> TileLoad {
         let (folder, name) = tileName(tLat: tLat, tLon: tLon)
         // Downloaded offline regions first (persistent), then the runtime cache.
@@ -473,7 +521,7 @@ enum DEMFetcher {
             NSLog("DEM tile download: %@", name)
             var req = URLRequest(url: url)
             req.timeoutInterval = 60
-            guard let (data, resp) = try? await URLSession.shared.data(for: req) else {
+            guard let (data, resp) = try? await tileSession.data(for: req) else {
                 return .failed                          // offline / timeout: retryable
             }
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
@@ -533,7 +581,7 @@ enum DEMFetcher {
         guard let url = URL(string:
             "https://elevation-tiles-prod.s3.amazonaws.com/skadi/\(folder)/\(name).hgt.gz") else { return nil }
         var req = URLRequest(url: url); req.timeoutInterval = 60
-        guard let (data, resp) = try? await URLSession.shared.data(for: req) else { return nil }
+        guard let (data, resp) = try? await tileSession.data(for: req) else { return nil }
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         if code == 404 { return 0 }                       // ocean tile — nothing to store
         guard code == 200, !data.isEmpty else { return nil }

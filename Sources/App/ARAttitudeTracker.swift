@@ -44,6 +44,52 @@ final class ARAttitudeTracker: NSObject, ARSessionDelegate {
     private var azOffset: Float?
     private var reportedInfo = false
     private var running = false
+
+    // MARK: Yaw-anchor robustness
+    //
+    // The anchor used to be a SINGLE CoreMotion sample at the first `.normal`
+    // frame, and was never revisited. Two real-world failures:
+    // - Backgrounding drops the anchor; the re-anchor's one compass read can
+    //   be degrees off (or mid-recalibration garbage) — the whole view (and
+    //   the user's hand-tuned trim on top of it) lands rotated.
+    // - Fast device rotation blurs the camera; VIO tracking goes `.limited`
+    //   and can recover with its world yawed a few degrees. A fixed anchor
+    //   makes that slip PERMANENT.
+    // So: anchor only on a STABLE compass (≥1 s of samples agreeing within
+    // 3°, circular mean), and afterwards run a watchdog — a sustained, firm
+    // disagreement between the anchored yaw and a stable compass slews the
+    // anchor closed at 2°/s. The user's drag calibration is applied by the
+    // Coordinator ON TOP of this and measures the COMPASS's own error, so it
+    // stays valid across every re-anchor and correction.
+
+    /// Anchor-delta samples (compassYaw − vioYaw) while unanchored.
+    private var anchorSamples: [(t: TimeInterval, d: Float)] = []
+    /// Divergence samples (compassYaw − anchoredYaw) while anchored.
+    private var divergenceSamples: [(t: TimeInterval, d: Float)] = []
+    /// Watchdog hysteresis: currently slewing the anchor closed.
+    private var slewing = false
+    private var lastFrameTime: TimeInterval = 0
+
+    /// Circular mean of angles (radians). Zero-safe: returns 0 for empty input.
+    static func circularMean(_ xs: [Float]) -> Float {
+        guard !xs.isEmpty else { return 0 }
+        var s: Float = 0, c: Float = 0
+        for x in xs { s += sin(x); c += cos(x) }
+        return atan2(s, c)
+    }
+
+    /// Largest absolute wrapped deviation from `mean` (radians).
+    static func circularSpread(_ xs: [Float], about mean: Float) -> Float {
+        xs.map { abs(Self.wrappedAngle($0 - mean)) }.max() ?? 0
+    }
+
+    /// Wrap to (−π, π].
+    static func wrappedAngle(_ a: Float) -> Float {
+        var x = a.truncatingRemainder(dividingBy: 2 * .pi)
+        if x > .pi { x -= 2 * .pi }
+        if x <= -.pi { x += 2 * .pi }
+        return x
+    }
     /// run()/pause() happen here, not on main: the FIRST session.run pays
     /// ARKit's daemon + VIO + camera bring-up (hundreds of ms), which froze the
     /// UI for the whole 3D→AR switch. Serial, so a quick start→stop→start stays
@@ -56,6 +102,10 @@ final class ARAttitudeTracker: NSObject, ARSessionDelegate {
         azOffset = nil
         basis = nil
         reportedInfo = false
+        anchorSamples.removeAll()
+        divergenceSamples.removeAll()
+        slewing = false
+        lastFrameTime = 0
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravity          // yaw anchored by US, not the compass
         config.planeDetection = []
@@ -106,15 +156,65 @@ final class ARAttitudeTracker: NSObject, ARSessionDelegate {
         var up = enu0(devTop)
         var forward = -enu0(devToViewer)
 
+        let now = frame.timestamp
+        let dt = lastFrameTime > 0 ? Float(min(0.25, now - lastFrameTime)) : 0
+        lastFrameTime = now
+        // VIO yaw in the un-anchored frame (yaw source flips to `up` at steep
+        // pitch, same as the original one-shot anchor).
+        let yawSource = abs(forward.z) < 0.95 ? forward : up
+        let yawLen = simd_length(SIMD2(yawSource.x, yawSource.y))
+        let vioYaw: Float? = yawLen > 1e-4 ? atan2(yawSource.x, yawSource.y) : nil
+
         if azOffset == nil {
-            // One-time yaw anchor, only once VIO has settled and CoreMotion has
-            // a heading: rotate ARKit's arbitrary heading onto true north.
-            if case .normal = frame.camera.trackingState, let cmYaw = referenceYaw() {
-                let v = abs(forward.z) < 0.95 ? forward : up   // yaw source at steep pitch
-                let len = simd_length(SIMD2(v.x, v.y))
-                if len > 1e-4 { azOffset = cmYaw - atan2(v.x, v.y) }
+            // Anchor on a STABLE compass: ≥1 s of (compass − VIO) deltas that
+            // agree within 3°, anchored at their circular mean. The delta is
+            // the buffered quantity (not the raw heading) so panning the phone
+            // while the buffer fills doesn't smear it. Fallback: after 5 s of
+            // steady disagreement (magnetic mess), take the mean anyway —
+            // never strand the AR view on CoreMotion forever.
+            if case .normal = frame.camera.trackingState,
+               let cmYaw = referenceYaw(), let vioYaw {
+                anchorSamples.append((now, Self.wrappedAngle(cmYaw - vioYaw)))
+                anchorSamples.removeAll { now - $0.t > 1.5 }
+                let ds = anchorSamples.map(\.d)
+                let mean = Self.circularMean(ds)
+                let span = now - (anchorSamples.first?.t ?? now)
+                if span >= 1.0, Self.circularSpread(ds, about: mean) <= 3 * .pi / 180 {
+                    azOffset = mean
+                } else if span >= 5.0 {
+                    azOffset = mean
+                }
+                if azOffset != nil {
+                    anchorSamples.removeAll()
+                    divergenceSamples.removeAll()
+                    slewing = false
+                }
+            }
+        } else if case .normal = frame.camera.trackingState,
+                  let cmYaw = referenceYaw(), let vioYaw, let anchor = azOffset {
+            // Watchdog: a STABLE compass firmly disagreeing with the anchored
+            // yaw for ≥2 s means either VIO slipped (fast rotation) or the
+            // anchor itself was bad — slew it closed at 2°/s (invisible, and
+            // the drag trim on top stays valid). Hysteresis: keep slewing
+            // until the residual is under 1.5°.
+            let d = Self.wrappedAngle(cmYaw - (vioYaw + anchor))
+            divergenceSamples.append((now, d))
+            divergenceSamples.removeAll { now - $0.t > 2.5 }
+            let ds = divergenceSamples.map(\.d)
+            let mean = Self.circularMean(ds)
+            let span = now - (divergenceSamples.first?.t ?? now)
+            let stable = span >= 2.0 && Self.circularSpread(ds, about: mean) <= 3 * .pi / 180
+            if stable, abs(mean) > 6 * .pi / 180 { slewing = true }
+            if slewing {
+                if abs(mean) < 1.5 * .pi / 180 { slewing = false }
+                else if stable, dt > 0 {
+                    let rate: Float = 2 * .pi / 180              // 2°/s
+                    let step = max(-rate * dt, min(rate * dt, mean))
+                    azOffset = anchor + step
+                }
             }
         }
+
         if let d = azOffset {
             right = Self.rotateAz(right, d)
             up = Self.rotateAz(up, d)
@@ -127,9 +227,13 @@ final class ARAttitudeTracker: NSObject, ARSessionDelegate {
     func sessionInterruptionEnded(_ session: ARSession) {
         // Backgrounding interrupts the session and the VIO world can resume
         // ROTATED. Drop the yaw anchor: CoreMotion bridges (basis nil) until a
-        // fresh anchor lands against the current compass heading.
+        // fresh STABLE anchor lands (see didUpdate) — the stability gate is
+        // what makes reopen land on the same alignment the user left.
         basis = nil
         azOffset = nil
+        anchorSamples.removeAll()
+        divergenceSamples.removeAll()
+        slewing = false
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
@@ -137,6 +241,9 @@ final class ARAttitudeTracker: NSObject, ARSessionDelegate {
         // attitude; frames stop too, leaving the last displayed image.
         basis = nil
         azOffset = nil
+        anchorSamples.removeAll()
+        divergenceSamples.removeAll()
+        slewing = false
         NSLog("ARKit session failed: %@", error.localizedDescription)
     }
 

@@ -43,7 +43,13 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     /// True once the first panorama has finished rendering — gates the full-screen
     /// loading cover (later loads use the small status pill instead).
     @Published private(set) var hasRenderedOnce = false
-    @Published private(set) var viewpoint: Viewpoint?
+    @Published private(set) var viewpoint: Viewpoint? {
+        didSet {
+            guard viewpoint?.latitude != oldValue?.latitude
+                || viewpoint?.longitude != oldValue?.longitude else { return }
+            resolveViewedTimeZone()
+        }
+    }
     /// When following GPS and the device has moved far enough that the (frozen)
     /// panorama is stale, this holds the latest fix and the HUD shows a "Recenter"
     /// prompt — instead of re-baking on every GPS update (which made the app reload
@@ -69,8 +75,35 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     /// on a US-Pacific phone, so sunrise looked later than sunset). Falls back to the
     /// device zone only before a viewpoint exists.
     var displayTimeZone: TimeZone {
-        guard let lon = viewpoint?.longitude else { return .current }
-        return Self.approxTimeZone(longitudeDeg: lon)
+        guard let vp = viewpoint else { return .current }
+        // Standing at the viewed location (GPS-follow): the device clock IS
+        // local civil time, DST included — exact, no lookup needed.
+        if !isManualViewpoint { return .current }
+        return viewedTimeZone ?? Self.approxTimeZone(longitudeDeg: vp.longitude)
+    }
+
+    /// The tz-DATABASE zone of the viewed location (DST-correct), resolved by
+    /// reverse geocode after each viewpoint change; nil while unknown/offline
+    /// (approxTimeZone then fills in). The approximation alone has no DST: at
+    /// Black Peak in July it formatted every sun time an hour early (UTC−8
+    /// where the clock says PDT).
+    @Published private(set) var viewedTimeZone: TimeZone?
+    private let timeZoneGeocoder = CLGeocoder()
+
+    private func resolveViewedTimeZone() {
+        viewedTimeZone = nil
+        guard let vp = viewpoint else { return }
+        timeZoneGeocoder.cancelGeocode()
+        let loc = CLLocation(latitude: vp.latitude, longitude: vp.longitude)
+        timeZoneGeocoder.reverseGeocodeLocation(loc) { [weak self] placemarks, _ in
+            let tz = placemarks?.first?.timeZone
+            Task { @MainActor [weak self] in
+                guard let self, let tz,
+                      self.viewpoint?.latitude == vp.latitude,
+                      self.viewpoint?.longitude == vp.longitude else { return }
+                self.viewedTimeZone = tz
+            }
+        }
     }
 
     /// Approximate civil timezone for a longitude, OFFLINE from the coordinate alone
@@ -139,6 +172,11 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     /// they don't join the peak directory/search.
     @Published private(set) var nearbyLakes: [Peak] = []
     @Published var selectedPeak: AnnotatedPeak?
+    /// Labels pinned open on the terrain: tapping a dot expands its name label
+    /// and keeps it up; tapping it again collapses it, and a tap on empty
+    /// terrain clears every pin (see select/tapLabel). Only `selectedPeak` —
+    /// the one whose card is up — gets the highlighted dot.
+    @Published private(set) var pinnedPeakIDs: Set<String> = []
     /// Feature ids with a clear line of sight from the current viewpoint, reported
     /// by the renderer's occlusion pass. nil until the first pass completes, so the
     /// info card can withhold judgment rather than claim "occluded" while loading.
@@ -619,7 +657,20 @@ final class PanoramaViewModel: NSObject, ObservableObject {
                 // record. The old id-only dedup let both through — tapping
                 // the pack's copy summit-snapped "Stand here" uphill of the
                 // gap (Dip Top Gap bug).
-                let merged = Peak.dedupedKeepingFirst(global + bundled + packs + osm)
+                var merged = Peak.dedupedKeepingFirst(global + bundled + packs + osm)
+                // Normalize the saddle flag by NAME too (whole-word "pass" /
+                // "gap" / "col" / …): OSM occasionally tags a gap as
+                // natural=peak, and legacy pack/cache records predate the
+                // flag — "Easy Pass" drew a plain ink summit dot and summit-
+                // snapped its anchor. One sweep at load time, off-main, so
+                // every consumer (dot tint, anchor snap, stand-here, cards)
+                // sees the same truth.
+                merged = merged.map { p in
+                    guard !p.isSaddle, p.nameSuggestsSaddle else { return p }
+                    var q = p
+                    q.isSaddle = true
+                    return q
+                }
                 // Lakes: label range only (the far-tile radius — matches the
                 // anchor cull), so the published set stays small even in lake
                 // country.
@@ -636,9 +687,14 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     }
 
     /// Resolve a peak against the current viewpoint (distance / bearing / apparent
-    /// elevation), for the info panel and selection.
+    /// elevation), pin its label open, and show its card. nil clears the card
+    /// AND every pinned label (the empty-terrain tap dismisses everything).
     func select(_ peak: Peak?) {
-        guard let peak, let viewpoint else { selectedPeak = nil; return }
+        guard let peak, let viewpoint else {
+            selectedPeak = nil
+            pinnedPeakIDs = []
+            return
+        }
         let distance = GeoMath.distanceMeters(
             fromLatitude: viewpoint.latitude, fromLongitude: viewpoint.longitude,
             toLatitude: peak.latitude, toLongitude: peak.longitude
@@ -653,14 +709,32 @@ final class PanoramaViewModel: NSObject, ObservableObject {
             distanceMeters: distance, exaggeration: terrainExaggeration
         )
         let angle = atan2(apparent, max(1, distance)) * 180 / .pi
+        pinnedPeakIDs.insert(peak.id)
         selectedPeak = AnnotatedPeak(
             peak: peak, azimuthDeg: bearing, elevationAngleDeg: angle, distanceMeters: distance
         )
     }
 
+    /// A terrain tap on a label: an unpinned label pins open (and shows its
+    /// card, like select); a pinned one collapses — losing its card if it was
+    /// the selected one. Programmatic picks (search, debug args) use
+    /// select(_:), which never collapses.
+    func tapLabel(_ peak: Peak) {
+        if pinnedPeakIDs.contains(peak.id) {
+            pinnedPeakIDs.remove(peak.id)
+            if selectedPeak?.peak.id == peak.id { selectedPeak = nil }
+        } else {
+            select(peak)
+        }
+    }
+
+    /// The card's ✕: close the card; its label stays pinned on the terrain.
+    func closeCard() { selectedPeak = nil }
+
     /// Stand on a peak: teleport the eye to the summit coordinate.
     func standOnPeak(_ annotated: AnnotatedPeak) {
         selectedPeak = nil
+        pinnedPeakIDs = []
         let peak = annotated.peak
         // Saddles/gaps are LOW points: standing "here" means the pass itself,
         // never the neighboring summit the snap would climb to. Lakes are water:

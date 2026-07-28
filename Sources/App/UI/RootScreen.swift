@@ -22,8 +22,14 @@ struct RootScreen: View {
     @State private var chromeVisible = true
     /// Immersive view (double tap on the terrain): the whole HUD — footer,
     /// mini-map, controls, compass — fades out for an unobstructed panorama.
-    /// Double tap again to bring it back.
+    /// Double tap again to bring it back. A per-viewing choice, not a mode:
+    /// returning from the background always restores the chrome (see the
+    /// scenePhase observer).
     @State private var immersive = false
+    @Environment(\.scenePhase) private var scenePhase
+    /// The scene has actually been to the background (not just .inactive) —
+    /// gates the show-the-chrome-on-return reset above.
+    @State private var wasBackgrounded = false
     @State private var showActionMenu = false
     /// The tapped location card's info card, for viewpoints that are NOT a
     /// catalog feature (GPS spots, map pins): name + coordinates + Save Spot.
@@ -92,6 +98,7 @@ struct RootScreen: View {
             viewpoint: model.viewpoint,
             exaggeration: model.terrainExaggeration,
             displayDate: model.displayDate,
+            displayTimeZone: model.displayTimeZone,
             mode: mode,
             manualAlignment: manualAlignment,
             labelDensity: labelDensity,
@@ -100,10 +107,13 @@ struct RootScreen: View {
             peaks: model.allNearbyPeaks,
             lakes: model.nearbyLakes,
             selectedPeak: model.selectedPeak,
+            pinnedPeakIDs: model.pinnedPeakIDs,
             onSelectPeak: { peak in
                 // A terrain tap (select or deselect) breaks the panel round-trip.
                 cardReturnSheet = nil
-                model.select(peak)
+                // Label taps TOGGLE the pin (open ↔ collapse); a sky-object
+                // tap (nil) clears the card and every pinned label at once.
+                if let peak { model.tapLabel(peak) } else { model.select(nil) }
                 // Terrain taps are also the way OUT of floating chrome: the
                 // tap-outside scrims are gone (they blocked pinch/pan on the
                 // terrain), so collapse the menu and inline panels here. The
@@ -146,7 +156,10 @@ struct RootScreen: View {
                 // chrome-hide (this replaced the old double tap: same
                 // feature-tap exclusions, one less gesture to discover).
                 var consumed = clearedSkyTag
-                if model.selectedPeak != nil { model.select(nil); consumed = true }
+                if model.selectedPeak != nil || !model.pinnedPeakIDs.isEmpty {
+                    model.select(nil)   // card + every pinned label
+                    consumed = true
+                }
                 if showLocationCard { showLocationCard = false; consumed = true }
                 cardReturnSheet = nil
                 if showActionMenu { collapseActionMenu(); consumed = true }
@@ -249,6 +262,22 @@ struct RootScreen: View {
         // this together with the panel's activeSheet dismissal above).
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: model.selectedPeak?.peak.id)
         .statusBarHidden()
+        // Coming back FROM THE BACKGROUND always shows the UI: immersive is a
+        // per-viewing choice (reopening hidden read as a broken app), and a
+        // rotation interrupted by backgrounding can strand the rotation fade
+        // (`chromeVisible` false with no didRotate left to restore it). Only
+        // after a real background pass — the initial activation must not
+        // override the `-immersive` debug arg (app start is visible by
+        // default), and control-center dips (.inactive) don't count.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background { wasBackgrounded = true }
+            guard phase == .active, wasBackgrounded else { return }
+            wasBackgrounded = false
+            withAnimation(.easeInOut(duration: 0.22)) {
+                immersive = false
+                chromeVisible = true
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: RotationAnimationDisabler.willRotate)) { _ in
             var t = Transaction(); t.disablesAnimations = true
             withTransaction(t) { chromeVisible = false }
@@ -327,16 +356,20 @@ struct RootScreen: View {
                     }
                 }
             }
-            // Debug: auto-select a NAMED peak/lake for the info card —
+            // Debug: auto-select NAMED peaks/lakes for the info card —
             // e.g. -select "Diablo Lake" (lakes have no other headless path).
+            // Comma-separated names stack multiple cards in the deck.
             if let i = args.firstIndex(of: "-select"), i + 1 < args.count {
-                let needle = args[i + 1].lowercased()
+                let needles = args[i + 1].lowercased().split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 9) {
-                    if let hit = (model.allNearbyPeaks + model.nearbyLakes)
-                        .first(where: { $0.name.lowercased() == needle }) {
-                        model.select(hit)
-                    } else {
-                        NSLog("select debug: no feature named '\(needle)' nearby")
+                    for needle in needles {
+                        if let hit = (model.allNearbyPeaks + model.nearbyLakes)
+                            .first(where: { $0.name.lowercased() == needle }) {
+                            model.select(hit)
+                        } else {
+                            NSLog("select debug: no feature named '\(needle)' nearby")
+                        }
                     }
                 }
             }
@@ -872,7 +905,9 @@ struct RootScreen: View {
                             model.standOnPeak(selected)
                         },
                         onDismiss: {
-                            model.select(nil)
+                            // ✕ closes the card only — the label stays pinned
+                            // until a background tap (or its dot) collapses it.
+                            model.closeCard()
                             // Return to the panel the pick came from — unless some
                             // other panel opened in the meantime.
                             if activeSheet == nil, let back = cardReturnSheet {
@@ -1579,59 +1614,37 @@ private enum LoadingWhimsy {
     static let lines: [String] = [
         "Stitching tiles",
         "Carving valleys",
-        "Raising the mountains",
+        "Raising mountains",
         "Dropping shadows",
-        "Filling the lakes",
-        "Sharpening the ridgelines",
-        "Untangling contour lines",
+        "Filling lakes",
+        "Sharpening ridgelines",
         "Consulting a marmot",
         "Aligning the compass",
-        "Measuring the prominence",
-        "Naming the peaks",
+        "Measuring prominence",
+        "Naming peaks",
         "Placing the sun",
-        "Shooing the clouds",
-        "Smoothing the foothills",
         "Counting the switchbacks",
-        "Pitching base camp",
-        "Sliding down glaciers",
         "Polishing the horizon",
-        "Herding stray boulders",
-        "Triangulating the summits",
         "Tuning the alpenglow",
         "Lifting the fog",
         "Fluffing the clouds",
         "Seeding the meadows",
-        "Planting wildflowers",
-        "Bridging creeks",
         "Stacking cairns",
-        "Charting the ridges",
+        "Charting ridges",
         "Combing the treeline",
         "Growing the forests",
         "Raking the scree",
-        "Rolling the moraine",
         "Deepening the gorges",
-        "Widening the vistas",
-        "Aging the granite",
-        "Triggering the avalanches",
-        "Chilling the snowfields",
         "Hanging the stars",
         "Feeding the chipmunks",
         "Petting the goats",
         "Calibrating the altimeter",
         "Drawing the map",
-        "Brewing summit coffee",
         "Tightening guylines",
-        "Skipping some stones",
         "Flagging false summits",
-        "Dusting the peaks",
-        "Booping mushrooms",
-        "Picking berries",
-        "Losing the trail",
         "Trusting the cairns",
-        "Swatting mosquitos",
         "Spraying dew",
         "Following the bootpack",
-        "Going glissading",
     ]
 }
 

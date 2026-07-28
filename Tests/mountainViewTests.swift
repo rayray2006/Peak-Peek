@@ -158,47 +158,40 @@ final class EphemerisTests: XCTestCase {
     }
 }
 
+// (The AR magnification-matching crop and its tests are gone: AR is locked to
+// the camera's native 1x so the overlay projects through one exact pinhole —
+// see TerrainMetalView.setMode.)
+
 @MainActor
-final class ARZoomMatchTests: XCTestCase {
-    // Entering AR must reproduce the 3D view's magnification: crop = camera's
-    // native on-screen tan(½FOV) over the 3D one, clamped to the 1–4x pinch range.
-    func testMatchedARZoomReproduces3DMagnification() {
-        let cam = tanf(66 * .pi / 360)           // ~a phone camera's vertical FOV
-        // 3D at the camera's own FOV → 1x (no crop).
-        XCTAssertEqual(TerrainMetalView.Coordinator.matchedARZoom(
-            cameraTanHalf1x: cam, tanHalf3D: cam), 1, accuracy: 1e-5)
-        // 3D zoomed to a 30° FOV → crop by the exact tan ratio.
-        let tan30 = tanf(30 * .pi / 360)
-        XCTAssertEqual(TerrainMetalView.Coordinator.matchedARZoom(
-            cameraTanHalf1x: cam, tanHalf3D: tan30), cam / tan30, accuracy: 1e-5)
+final class ARYawAnchorMathTests: XCTestCase {
+    // The stable-anchor gate and the divergence watchdog both run on circular
+    // statistics — the wrap cases are exactly where naive means break.
+    func testWrappedAngle() {
+        XCTAssertEqual(ARAttitudeTracker.wrappedAngle(0), 0)
+        // ±π are the same angle; float rounding at the exact boundary may
+        // yield either sign — only the magnitude is contractual.
+        XCTAssertEqual(abs(ARAttitudeTracker.wrappedAngle(3 * .pi)), .pi, accuracy: 1e-5)
+        XCTAssertEqual(abs(ARAttitudeTracker.wrappedAngle(-3 * .pi)), .pi, accuracy: 1e-5)
+        XCTAssertEqual(ARAttitudeTracker.wrappedAngle(0.5), 0.5, accuracy: 1e-6)
+        XCTAssertEqual(ARAttitudeTracker.wrappedAngle(-0.5), -0.5, accuracy: 1e-6)
     }
 
-    func testMatchedARZoomClamps() {
-        let cam = tanf(66 * .pi / 360)
-        // 3D wider than the camera (90°) → can't zoom out past the lens: 1x.
-        XCTAssertEqual(TerrainMetalView.Coordinator.matchedARZoom(
-            cameraTanHalf1x: cam, tanHalf3D: tanf(90 * .pi / 360)), 1)
-        // 3D zoomed way past the crop cap (15°) → 4x.
-        XCTAssertEqual(TerrainMetalView.Coordinator.matchedARZoom(
-            cameraTanHalf1x: cam, tanHalf3D: tanf(15 * .pi / 360)), 4)
+    func testCircularMeanHandlesNorthWrap() {
+        // Headings straddling north: +179° and −179° average to ±180°, not 0°.
+        let d = Float.pi / 180
+        let mean = ARAttitudeTracker.circularMean([179 * d, -179 * d])
+        XCTAssertEqual(abs(mean), .pi, accuracy: 1e-4)
+        // And a plain cluster averages normally.
+        XCTAssertEqual(ARAttitudeTracker.circularMean([10 * d, 20 * d]),
+                       15 * d, accuracy: 1e-4)
     }
 
-    // The clamp DETECTOR drives the AR-exit restore: a clamped entry showed
-    // the lens/crop bound rather than the user's zoom, so exiting must give
-    // the original 3D fov back instead of adopting the clamp (the one-time
-    // "my zoom permanently became 0.8x after visiting AR" bug).
-    func testClampDetectionMatchesTheClampBounds() {
-        let cam = tanf(66 * .pi / 360)
-        // Within the 1–4x crop range: not clamped (exit keeps adopting).
-        XCTAssertFalse(TerrainMetalView.Coordinator.arZoomMatchClamps(
-            cameraTanHalf1x: cam, tanHalf3D: cam))
-        XCTAssertFalse(TerrainMetalView.Coordinator.arZoomMatchClamps(
-            cameraTanHalf1x: cam, tanHalf3D: tanf(30 * .pi / 360)))
-        // Wider than the lens, and past the 4x crop: clamped (exit restores).
-        XCTAssertTrue(TerrainMetalView.Coordinator.arZoomMatchClamps(
-            cameraTanHalf1x: cam, tanHalf3D: tanf(90 * .pi / 360)))
-        XCTAssertTrue(TerrainMetalView.Coordinator.arZoomMatchClamps(
-            cameraTanHalf1x: cam, tanHalf3D: tanf(15 * .pi / 360)))
+    func testCircularSpreadAcrossWrap() {
+        let d = Float.pi / 180
+        let xs: [Float] = [178 * d, -178 * d]     // 4° apart across the wrap
+        let mean = ARAttitudeTracker.circularMean(xs)
+        XCTAssertEqual(ARAttitudeTracker.circularSpread(xs, about: mean),
+                       2 * d, accuracy: 1e-4)
     }
 }
 

@@ -44,6 +44,9 @@ enum TopoStyle {
     static let savedGold = UIColor(red: 0xf0 / 255, green: 0xb4 / 255, blue: 0x29 / 255, alpha: 1)
     /// Water features keep a deep lake blue that reads against snow and paper.
     static let waterBlue = UIColor(red: 0x2b / 255, green: 0x6c / 255, blue: 0xb0 / 255, alpha: 1)
+    /// Passes/saddles: a deep muted pine green — darker and duller than
+    /// visibleGreen so a gap's dot never reads as a sightline verdict.
+    static let saddleGreen = UIColor(red: 0x2d / 255, green: 0x6a / 255, blue: 0x4f / 255, alpha: 1)
 
     // MARK: SwiftUI colors
 
@@ -53,6 +56,7 @@ enum TopoStyle {
     static let occludedColor = Color(occludedRed)
     static let goldColor = Color(savedGold)
     static let waterColor = Color(waterBlue)
+    static let saddleColor = Color(saddleGreen)
 
     /// Hairline strokes on paper: 1 px at the template's opacities.
     static func hairline(_ opacity: Double = 0.14) -> Color { inkColor.opacity(opacity) }

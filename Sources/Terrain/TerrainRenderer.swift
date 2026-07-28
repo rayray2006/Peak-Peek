@@ -11,6 +11,8 @@ import simd
 final class TerrainRenderer {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
+    /// Queue for offline bake/mask work — see init. Never used by per-frame paths.
+    let bakeQueue: MTLCommandQueue
     private let raymarchPipeline: MTLRenderPipelineState
     private let downsamplePipeline: MTLRenderPipelineState
     private let panoramaBakePipeline: MTLRenderPipelineState
@@ -61,6 +63,16 @@ final class TerrainRenderer {
             throw RendererError.noCommandQueue
         }
         self.commandQueue = queue
+        // Offline work (bake bands, AA, depth/sky masks) runs on its OWN queue.
+        // draw(in:) blocks the main thread on waitUntilScheduled (the label-sync
+        // transaction), and on a shared queue every live frame during a re-bake
+        // queued behind the in-flight ~10 ms band — the "first second after a
+        // move" pan jitter. Cross-queue hazards don't arise: every consumer of a
+        // baked texture waits for its command buffer's completion handler on the
+        // CPU before touching the result. (-sharedBakeQueue: debug A/B switch
+        // to restore the old single-queue behavior for comparison.)
+        self.bakeQueue = ProcessInfo.processInfo.arguments.contains("-sharedBakeQueue")
+            ? queue : (device.makeCommandQueue() ?? queue)
 
         let library: MTLLibrary
         if !preferSource,
@@ -185,7 +197,7 @@ final class TerrainRenderer {
         }
         // Color-only bake (depth output dropped): one render target, not two.
         guard let bakeColor = make(Self.colorFormat),
-              let cb = commandQueue.makeCommandBuffer() else { return nil }
+              let cb = bakeQueue.makeCommandBuffer() else { return nil }
         var u = uniforms
 
         // Equirectangular raymarch -> the panorama color texture.
@@ -215,7 +227,7 @@ final class TerrainRenderer {
         d.usage = [.renderTarget, .shaderRead]
         d.storageMode = .shared                  // CPU-readable via getBytes
         guard let tex = device.makeTexture(descriptor: d),
-              let cb = commandQueue.makeCommandBuffer() else { return nil }
+              let cb = bakeQueue.makeCommandBuffer() else { return nil }
         var u = uniforms
         let pa = MTLRenderPassDescriptor()
         pa.colorAttachments[0].texture = tex
@@ -265,7 +277,7 @@ final class TerrainRenderer {
         let bands = max(1, (w + 511) / 512)
         let bandW = (w + bands - 1) / bands
         for i in 0..<bands {
-            guard let cb = commandQueue.makeCommandBuffer() else { return nil }
+            guard let cb = bakeQueue.makeCommandBuffer() else { return nil }
             let pa = MTLRenderPassDescriptor()
             pa.colorAttachments[0].texture = tex
             pa.colorAttachments[0].loadAction = i == 0 ? .clear : .load
@@ -279,6 +291,11 @@ final class TerrainRenderer {
             enc.endEncoding()
             cb.commit()
             cb.waitUntilCompleted()
+            // An aborted buffer (app backgrounded mid-pass) leaves the texture
+            // part-zeroed — and depth 0 reads as "terrain right in front of
+            // the eye", so every label would judge occluded and the scene
+            // shows NO labels at all. Fail loud instead; the caller retries.
+            guard cb.status == .completed else { return nil }
         }
         var depth = [Float](repeating: 0, count: w * h)
         depth.withUnsafeMutableBytes { ptr in
@@ -298,7 +315,7 @@ final class TerrainRenderer {
         d.usage = [.renderTarget, .shaderRead]
         d.storageMode = .private
         guard let dst = device.makeTexture(descriptor: d),
-              let cb = commandQueue.makeCommandBuffer() else { return nil }
+              let cb = bakeQueue.makeCommandBuffer() else { return nil }
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = dst
         pass.colorAttachments[0].loadAction = .clear
@@ -341,7 +358,14 @@ final class TerrainRenderer {
     /// `onProgress` (main queue) ticks once per completed band with 0…1 — the
     /// bands give the readout a genuinely continuous signal during the bake
     /// (the readout used to freeze at a constant until the whole bake landed).
+    /// `paced: true` = leave a display frame's gap between bands. For SILENT
+    /// top-ups (the far-horizon ring landing right as a move's scene swaps in):
+    /// they run at the exact moment the user starts panning the new scene, and
+    /// back-to-back bands kept the GPU saturated for the first second. The gap
+    /// halves the bake's GPU duty cycle at the cost of ~2× its (invisible)
+    /// wall time. Latency-critical bakes (a move's main bake) stay unpaced.
     func bakePanoramaAsync(uniforms: Uniforms,
+                           paced: Bool = false,
                            onProgress: ((Double) -> Void)? = nil,
                            completion: @escaping (MTLTexture?) -> Void) {
         let panoW = panoramaWidth
@@ -364,7 +388,7 @@ final class TerrainRenderer {
         var u = uniforms
 
         func encodeBand(_ i: Int) {
-            guard let cb = commandQueue.makeCommandBuffer() else {
+            guard let cb = bakeQueue.makeCommandBuffer() else {
                 DispatchQueue.main.async { completion(nil) }; return
             }
             let pa = MTLRenderPassDescriptor()
@@ -399,7 +423,15 @@ final class TerrainRenderer {
                     DispatchQueue.main.async { onProgress(f) }
                 }
                 if i + 1 < bands {
-                    encodeBand(i + 1)
+                    if paced {
+                        // Next band after a frame's breather — the live view
+                        // gets a clean GPU slot between bands.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) {
+                            encodeBand(i + 1)
+                        }
+                    } else {
+                        encodeBand(i + 1)
+                    }
                     return
                 }
                 // AA runs in its own command buffer, kicked off only once the bake

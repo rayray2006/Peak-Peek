@@ -43,7 +43,17 @@ final class PeakLabelOverlayView: UIView {
         /// Water feature (lake/reservoir): blue dot + tinted name instead of the
         /// summit red. Same declutter/tap behavior as peaks.
         var isWater: Bool = false
+        /// TRUE-summit direction for the camera (AR) modes: anchored at the
+        /// catalog elevation with NO silhouette clamp. The DEM (and the drawn
+        /// crest the clamp pins to) loses sharp spire tops, so against the
+        /// LIVE camera the standard anchor sits below the real rock. nil for
+        /// water/ring anchors — their drawn position is the honest one.
+        var directionTrue: SIMD3<Float>? = nil
     }
+
+    /// Camera (AR) modes: project `directionTrue` where present, so dots sit
+    /// on the real summits rather than the rendered DEM crest.
+    var usesTrueSummits = false
 
     /// Visible (non-occluded) anchors for the current viewpoint. Set off-main, then
     /// assigned on main; projection reads it each frame.
@@ -53,6 +63,10 @@ final class PeakLabelOverlayView: UIView {
 
     /// Currently selected peak (highlighted with a white outline).
     var selectedPeakID: String?
+
+    /// Labels pinned open by taps: their name capsules stay up at any zoom.
+    /// The highlight ring stays reserved for `selectedPeakID` alone.
+    var pinnedPeakIDs: Set<String> = []
 
     /// A searched/selected peak shown as an accent-colored DIRECTION marker when it is not already
     /// an on-screen label (off to the side, behind the camera, or occluded). Points
@@ -132,12 +146,15 @@ final class PeakLabelOverlayView: UIView {
     private static let capsuleHeight: CGFloat = 5 + 17 + 1 + 13 + 5
     private static let hPad: CGFloat = 9
     /// Quiet little points on the terrain; the selected one scales up and
-    /// gains its ring, so small stays legible.
-    private static let dotRadius: CGFloat = 2.5
+    /// gains its ring, so small stays legible. 2.0 (was 2.5): at 2.5 the dot
+    /// covered the very summit it marked — especially over the live camera.
+    private static let dotRadius: CGFloat = 2.0
     private static let tierLeaderHeights: [CGFloat] = [30, 74, 118]
     /// Water-feature styling: lake-blue dot + name tint (fixed, both themes).
     private static let waterFill = TopoStyle.waterBlue.cgColor
     private static let waterTint = TopoStyle.waterBlue
+    /// Pass/saddle dots: light green (fixed, both themes); the name stays ink.
+    private static let saddleFill = TopoStyle.saddleGreen.cgColor
     /// Saved-mode tints, matching the info-card badges: climbed = green,
     /// bookmarked = gold (climbed wins when a peak is somehow both).
     private static let climbedFill = TopoStyle.visibleGreen.cgColor
@@ -482,7 +499,7 @@ final class PeakLabelOverlayView: UIView {
         hitTargets.removeAll(keepingCapacity: true)
         for i in selection.dots {
             let a = anchors[i]
-            let d = a.direction
+            let d = usesTrueSummits ? (a.directionTrue ?? a.direction) : a.direction
             let f = simd_dot(d, forward)
             if f <= 0 { continue }                       // behind the camera
             let r = simd_dot(d, right), u = simd_dot(d, up)
@@ -504,9 +521,12 @@ final class PeakLabelOverlayView: UIView {
             // left the screen and the direction marker took over).
             node.dot.fillColor = isClimbed ? Self.climbedFill
                 : isBookmarked ? Self.bookmarkFill
-                : a.isWater ? Self.waterFill : inkResolved.cgColor
+                : a.isWater ? Self.waterFill
+                : peak.isSaddle ? Self.saddleFill : inkResolved.cgColor
             node.dot.strokeColor = paperResolved.cgColor
             // The ring is the SELECTION mark — everything else is a bare dot.
+            // Pinned-but-unselected labels announce themselves via their open
+            // capsule, not the dot.
             node.dot.lineWidth = selected ? 1.5 : 0
             node.dot.transform = selected
                 ? CATransform3DMakeScale(1.4, 1.4, 1) : CATransform3DIdentity
@@ -547,6 +567,7 @@ final class PeakLabelOverlayView: UIView {
             // the centered direction marker (arrow-to-side) below, instead of
             // leaving a label stuck against the edge with a bent stem.
             var wantsCapsule = selection.capsules.contains(i) || selected
+                || pinnedPeakIDs.contains(peak.id)
             if selected,
                !(point.x >= 0 && point.x <= W && point.y >= 0 && point.y <= H) {
                 wantsCapsule = false
