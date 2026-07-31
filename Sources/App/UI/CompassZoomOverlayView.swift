@@ -32,6 +32,15 @@ final class CompassZoomOverlayView: UIView {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) not implemented") }
 
+    /// AR modes are locked to the camera's native 1x lens — there's no zoom the
+    /// user can change, so the flat "1.0x" readout just adds noise. Hide it there.
+    var showsZoom = true {
+        didSet {
+            guard showsZoom != oldValue else { return }
+            zoomIndicatorLayer.isHidden = !showsZoom
+        }
+    }
+
     func update(headingDeg: Double, zoom: Double) {
         // draw() calls this every frame; reassigning CATextLayer strings and
         // per-cardinal colors forces layer re-renders even when nothing moved.
@@ -204,6 +213,6 @@ final class CompassZoomOverlayView: UIView {
         let top = max(safeAreaInsets.top + 12, 16)
         zoomIndicatorLayer.position = CGPoint(x: bounds.midX, y: top + 58)
         zoomIndicatorText.string = String(format: "%.1f×", zoomFactor)
-        zoomIndicatorLayer.isHidden = bounds.isEmpty
+        zoomIndicatorLayer.isHidden = bounds.isEmpty || !showsZoom
     }
 }

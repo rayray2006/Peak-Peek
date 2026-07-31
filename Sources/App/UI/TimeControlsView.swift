@@ -14,6 +14,9 @@ struct TimeControlsView: View {
     /// Landscape: identical content in a narrower, height-capped scroll.
     var compact = false
     @Environment(\.dismiss) private var dismiss
+    /// Observed only so the clock (and rise/set times) re-render the instant the
+    /// menu's 12/24h toggle flips; the formatter reads the value via ClockText.
+    @AppStorage(ClockText.overrideKey) private var clockOverride = ""
 
     /// Everything here is expressed in the VIEWED location's timezone (offline, from
     /// its longitude), so "noon" on the slider is noon where you're standing and the
@@ -45,6 +48,7 @@ struct TimeControlsView: View {
     private var timeFormatter: DateFormatter {
         let f = Self.sharedTimeFormatter
         f.timeZone = model.displayTimeZone
+        ClockText.applyTimeStyle(to: f)   // 12/24h per the menu override or locale
         return f
     }
     private var dateFormatter: DateFormatter {
@@ -194,6 +198,23 @@ struct TimeControlsView: View {
             RoundedRectangle(cornerRadius: 14)
                 .strokeBorder(TopoStyle.hairline(0.10), lineWidth: 1)
         )
+        // Swipe pages months, matching the chevrons: left/up → next month,
+        // right/down → previous (finger-up reads as scrolling toward later
+        // dates). Dominant-axis pick, 25 pt threshold — day taps unaffected,
+        // and the compact-landscape ScrollView still wins slow vertical drags.
+        .gesture(
+            DragGesture(minimumDistance: 25)
+                .onEnded { v in
+                    let dx = v.translation.width, dy = v.translation.height
+                    let months = abs(dx) > abs(dy)
+                        ? (dx < 0 ? 1 : -1)
+                        : (dy < 0 ? 1 : -1)
+                    if let d = calendar.date(byAdding: .month, value: months,
+                                             to: model.displayDate) {
+                        model.setDisplayDate(d)
+                    }
+                }
+        )
     }
 
     private func monthChevron(_ systemName: String, by months: Int) -> some View {
@@ -222,12 +243,28 @@ struct TimeControlsView: View {
 
     // MARK: - Time readout + scrubber
 
+    /// The viewed location's zone code ("PDT", "CEST", "GMT+5:30"), shown ONLY
+    /// when its clock actually differs from the device's — every time on the
+    /// card is in the PIN-DROP location's zone, and without the code a remote
+    /// viewpoint's times read as nonsense against the user's own clock.
+    private var timeZoneCode: String? {
+        let tz = model.displayTimeZone
+        guard tz.secondsFromGMT(for: model.displayDate)
+            != TimeZone.current.secondsFromGMT(for: model.displayDate) else { return nil }
+        return tz.abbreviation(for: model.displayDate)
+    }
+
     /// "6:42 PM        now" — the current scrub position, baseline-aligned.
     private var timeReadout: some View {
         HStack(alignment: .firstTextBaseline) {
             Text(timeFormatter.string(from: model.displayDate))
                 .font(PPFont.ui(15, .semibold))
                 .foregroundStyle(TopoStyle.inkColor)
+            if let code = timeZoneCode {
+                Text(code)
+                    .font(PPFont.mono(10))
+                    .foregroundStyle(TopoStyle.inkColor.opacity(0.45))
+            }
             Spacer()
             Text(model.usesSimulatedTime ? "simulated" : "now")
                 .font(PPFont.mono(11))

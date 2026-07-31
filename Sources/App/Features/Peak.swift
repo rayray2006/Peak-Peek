@@ -55,14 +55,21 @@ struct Peak: Identifiable, Codable, Hashable, Sendable {
     /// friends. A snap guard of last resort: legacy pack/cache records lost
     /// the `isSaddle` flag, and OSM occasionally mis-tags a gap as a peak —
     /// standing on a gap must never climb the neighboring hill. Whole-word
-    /// match, so "Compass Rose" doesn't trip on "pass".
+    /// match, so "Compass Rose" doesn't trip on "pass" — and a SUMMIT word
+    /// anywhere wins: "Heather Pass Peak" is the peak BESIDE Heather Pass
+    /// (the saddle word is attributive), not a pass itself.
     var nameSuggestsSaddle: Bool {
         let saddleWords: Set<String> = ["gap", "pass", "saddle", "col", "notch",
                                         "joch", "sattel", "colle", "forcella",
                                         "bocchetta", "furka", "scharte"]
-        return name.lowercased()
+        let summitWords: Set<String> = ["peak", "mountain", "mount", "mt",
+                                        "butte", "spire", "point", "dome",
+                                        "horn", "rock", "tower", "needle",
+                                        "pinnacle", "summit"]
+        let words = name.lowercased()
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .contains { saddleWords.contains($0) }
+        guard !words.contains(where: { summitWords.contains($0) }) else { return false }
+        return words.contains { saddleWords.contains($0) }
     }
 
     /// Order-preserving dedup across SOURCES: drops exact-id duplicates and

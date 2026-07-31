@@ -118,6 +118,17 @@ final class PeakListStore: ObservableObject {
         }
     }
 
+    /// User-created "Saved spot" locations — synthetic `loc_…` peaks dropped by
+    /// the Save Spot flow (see RootScreen.saveCurrentLocation). Surfaced as their
+    /// own yellow look-around dots, so they show wherever you stand near them.
+    /// Deduped across both lists (a spot can be both Been and Saved).
+    var savedSpots: [Peak] {
+        // Sorted by id: `saved.values` has no stable order, and the render path
+        // diffs this by id every frame — an unsorted array churned rebuilds.
+        saved.values.map(\.peak).filter { $0.id.hasPrefix("loc_") }
+            .sorted { $0.id < $1.id }
+    }
+
     func peaks(in kind: PeakListKind) -> [SavedPeak] {
         saved.values
             .filter { $0.date(for: kind) != nil }

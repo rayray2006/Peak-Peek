@@ -147,7 +147,8 @@ enum DEMFetcher {
     /// not persist it, or a Wi-Fi hiccup becomes flat ocean across launches.
     static func fetch(lat: Double, lon: Double, radiusMeters: Double = 120_000,
                       maxGrid: Int = defaultMaxGrid,
-                      onTileComplete: (@Sendable () -> Void)? = nil,
+                      onTileComplete: (@Sendable (String) -> Void)? = nil,
+                      onTileDownloadProgress: (@Sendable (String, Double) -> Void)? = nil,
                       onTileStitched: (@Sendable () -> Void)? = nil)
         async throws -> (tile: DEMTile, complete: Bool) {
         // Debug (-failFetches): every network fetch fails, as if offline —
@@ -159,8 +160,8 @@ enum DEMFetcher {
         if let hit = memoryCache.object(forKey: key as NSString) {
             // Already resident: no download or stitch, but tick both phases'
             // tiles so a combined progress counter still reaches its total.
-            for _ in 0..<tileCount(lat: lat, lon: lon, radiusMeters: radiusMeters) {
-                onTileComplete?()
+            for t in neededTiles(lat: lat, lon: lon, radiusMeters: radiusMeters) {
+                onTileComplete?(tileName(tLat: t.tLat, tLon: t.tLon).name)
                 onTileStitched?()
             }
             return (hit.tile, true)
@@ -169,6 +170,7 @@ enum DEMFetcher {
         let (tile, complete) = try await assemble(
             lat: lat, lon: lon, radiusMeters: radiusMeters,
             maxGrid: maxGrid, onTileComplete: onTileComplete,
+            onTileDownloadProgress: onTileDownloadProgress,
             onTileStitched: onTileStitched)
         if complete {
             memoryCache.setObject(Box(tile), forKey: key as NSString,
@@ -209,7 +211,8 @@ enum DEMFetcher {
     // MARK: Assembly
 
     private static func assemble(lat: Double, lon: Double, radiusMeters: Double, maxGrid: Int,
-                                 onTileComplete: (@Sendable () -> Void)? = nil,
+                                 onTileComplete: (@Sendable (String) -> Void)? = nil,
+                                 onTileDownloadProgress: (@Sendable (String, Double) -> Void)? = nil,
                                  onTileStitched: (@Sendable () -> Void)? = nil)
         async throws -> (tile: DEMTile, complete: Bool) {
         let mLat = 111_320.0
@@ -250,7 +253,12 @@ enum DEMFetcher {
                     if let hit = decodedCache.object(forKey: "\(t.tLat),\(t.tLon)" as NSString) {
                         return (t.tLat, t.tLon, .decoded(hit as Data))
                     }
-                    return (t.tLat, t.tLon, await loadHGTData(tLat: t.tLat, tLon: t.tLon))
+                    let name = tileName(tLat: t.tLat, tLon: t.tLon).name
+                    return (t.tLat, t.tLon, await loadHGTData(
+                        tLat: t.tLat, tLon: t.tLon,
+                        onProgress: onTileDownloadProgress.map { cb in
+                            { frac in cb(name, frac) }
+                        }))
                 }
             }
             var out = Loads()
@@ -261,7 +269,7 @@ enum DEMFetcher {
                 case .ocean: break
                 case .failed: out.failures += 1
                 }
-                onTileComplete?()
+                onTileComplete?(tileName(tLat: tLat, tLon: tLon).name)
             }
             return out
         }
@@ -505,7 +513,39 @@ enum DEMFetcher {
         return URLSession(configuration: cfg)
     }()
 
-    private static func loadHGTData(tLat: Int, tLon: Int) async -> TileLoad {
+    /// One dataTask with byte-level progress via KVO on `task.progress` — the
+    /// tiles are ~10 MB apiece, and completion-only ticking left the loading
+    /// bar frozen for the many seconds each tile spends in flight. Throttled
+    /// to ≥3% steps so the observer doesn't spam the main queue.
+    private static func downloadReportingProgress(
+        _ req: URLRequest, onProgress: (@Sendable (Double) -> Void)?
+    ) async -> (Data, URLResponse)? {
+        await withCheckedContinuation { cont in
+            final class Box: @unchecked Sendable {
+                var obs: NSKeyValueObservation?
+                var lastReported = 0.0
+            }
+            let box = Box()
+            let task = tileSession.dataTask(with: req) { data, resp, _ in
+                box.obs = nil
+                if let data, let resp { cont.resume(returning: (data, resp)) }
+                else { cont.resume(returning: nil) }
+            }
+            if let onProgress {
+                box.obs = task.progress.observe(\.fractionCompleted) { p, _ in
+                    let f = p.fractionCompleted
+                    guard f - box.lastReported >= 0.03 else { return }
+                    box.lastReported = f
+                    onProgress(f)
+                }
+            }
+            task.resume()
+        }
+    }
+
+    private static func loadHGTData(tLat: Int, tLon: Int,
+                                    onProgress: (@Sendable (Double) -> Void)? = nil)
+        async -> TileLoad {
         let (folder, name) = tileName(tLat: tLat, tLon: tLon)
         // Downloaded offline regions first (persistent), then the runtime cache.
         if let d = try? Data(contentsOf: regionStoreDir.appendingPathComponent("\(name).hgt.gz")) { return .data(d) }
@@ -521,7 +561,10 @@ enum DEMFetcher {
             NSLog("DEM tile download: %@", name)
             var req = URLRequest(url: url)
             req.timeoutInterval = 60
-            guard let (data, resp) = try? await tileSession.data(for: req) else {
+            // NOTE: concurrent requesters share this deduped task, so only the
+            // FIRST caller's progress closure streams — the other tier's copy
+            // of a shared tile still ticks its completion unit as ever.
+            guard let (data, resp) = await downloadReportingProgress(req, onProgress: onProgress) else {
                 return .failed                          // offline / timeout: retryable
             }
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0

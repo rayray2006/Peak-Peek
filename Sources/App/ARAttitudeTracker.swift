@@ -109,6 +109,22 @@ final class ARAttitudeTracker: NSObject, ARSessionDelegate {
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravity          // yaw anchored by US, not the compass
         config.planeDetection = []
+        // Blown-out skies at sunrise/sunset: ARKit's default video format is
+        // SDR — auto-exposure holds for the (dark) terrain and the bright
+        // background clips hard. Prefer an HDR-capable format (nearest in
+        // resolution to the default, so tracking cost stays comparable) and
+        // allow HDR delivery; intrinsics/FOV adapt automatically since we
+        // read them per-session from the delivered frames.
+        if !config.videoFormat.isVideoHDRSupported {
+            let want = config.videoFormat.imageResolution.width
+            if let hdr = ARWorldTrackingConfiguration.supportedVideoFormats
+                .filter({ $0.isVideoHDRSupported })
+                .min(by: { abs($0.imageResolution.width - want)
+                         < abs($1.imageResolution.width - want) }) {
+                config.videoFormat = hdr
+            }
+        }
+        config.videoHDRAllowed = config.videoFormat.isVideoHDRSupported
         session.delegate = self                   // callbacks on main
         sessionQueue.async { [session] in
             session.run(config, options: [.resetTracking, .removeExistingAnchors])

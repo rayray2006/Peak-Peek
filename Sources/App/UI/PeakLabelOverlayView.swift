@@ -43,6 +43,10 @@ final class PeakLabelOverlayView: UIView {
         /// Water feature (lake/reservoir): blue dot + tinted name instead of the
         /// summit red. Same declutter/tap behavior as peaks.
         var isWater: Bool = false
+        /// A user-saved custom spot (`loc_…`): yellow dot, anchored at its exact
+        /// coordinate (no summit snap), and forced through the declutter so your
+        /// saved places always show when you look their way.
+        var isSavedSpot: Bool = false
         /// TRUE-summit direction for the camera (AR) modes: anchored at the
         /// catalog elevation with NO silhouette clamp. The DEM (and the drawn
         /// crest the clamp pins to) loses sharp spire tops, so against the
@@ -155,6 +159,9 @@ final class PeakLabelOverlayView: UIView {
     private static let waterTint = TopoStyle.waterBlue
     /// Pass/saddle dots: light green (fixed, both themes); the name stays ink.
     private static let saddleFill = TopoStyle.saddleGreen.cgColor
+    /// User saved-spot dots: a bright yellow (fixed, both themes) — distinct from
+    /// the gold "bookmarked" wash, so your dropped places read at a glance.
+    private static let savedSpotFill = UIColor(red: 1.0, green: 0.85, blue: 0.10, alpha: 1).cgColor
     /// Saved-mode tints, matching the info-card badges: climbed = green,
     /// bookmarked = gold (climbed wins when a peak is somehow both).
     private static let climbedFill = TopoStyle.visibleGreen.cgColor
@@ -214,7 +221,22 @@ final class PeakLabelOverlayView: UIView {
     /// Invalidates an in-flight chunked build when `anchors` changes again.
     private var poolGeneration = 0
 
+    /// `-labelWatch <needle>` extends into the overlay: logs whether a watched
+    /// feature's anchor ARRIVED here and how the declutter judged it — the
+    /// missing half of the anchor-build chain when a dot silently no-shows.
+    private static let watchNeedle: String? = {
+        let args = ProcessInfo.processInfo.arguments
+        guard let i = args.firstIndex(of: "-labelWatch"), i + 1 < args.count else { return nil }
+        return args[i + 1].lowercased()
+    }()
+
     private func rebuildPool() {
+        if let needle = Self.watchNeedle {
+            for a in anchors where a.peak.name.lowercased().contains(needle) {
+                NSLog("labelWatch %@: OVERLAY anchored (water=%d, dist=%.0f m)",
+                      a.peak.name, a.isWater ? 1 : 0, a.distanceMeters)
+            }
+        }
         // Configuring a node measures two strings and touches five layers; doing
         // all ~600 anchors in one synchronous pass stalled the main thread — a
         // visible hitch right as the freshly loaded view became interactive.
@@ -366,6 +388,18 @@ final class PeakLabelOverlayView: UIView {
     /// Unit direction + azimuth per anchor (parallel to `anchors`).
     private var unitDirs: [SIMD3<Float>] = []
     private var anchorAz: [Float] = []
+    /// Per-anchor angular CLEARANCE: distance to the nearest HIGHER-priority
+    /// anchor in the current contest (∞ for the top dog), capped at ~4.6°
+    /// (beyond every spacing knob). A dot shows iff clearance ≥ the zoom-
+    /// scaled spacing — a fixed per-anchor threshold, so zooming in only ADDS
+    /// dots and zooming out only removes them. The old greedy re-ran from
+    /// scratch per zoom step: a newly admitted mid-priority dot could EVICT a
+    /// lower-priority neighbour that was already showing — dots visibly
+    /// vanished while zooming IN.
+    private var dotClearance: [Float] = []
+    /// Cache key for `dotClearance` (recomputed when the contest's membership
+    /// changes — never on zoom alone).
+    private var clearanceKey: (gen: Int, configured: Int, density: Int, saved: Int) = (-1, -1, -1, -1)
 
     private func selectionIsCurrent(pixelsPerRadian: CGFloat, capsulesOn: Bool) -> Bool {
         selection.generation == poolGeneration
@@ -412,24 +446,51 @@ final class PeakLabelOverlayView: UIView {
             let pa = anchors[$0].peak.priority, pb = anchors[$1].peak.priority
             return pa == pb ? $0 < $1 : pa > pb
         }
-        // The selected peak contests first, so its label always survives.
-        if let selID = selectedPeakID,
-           let pos = order.firstIndex(where: { anchors[$0].peak.id == selID }) {
-            order.insert(order.remove(at: pos), at: 0)
+
+        // Refresh the clearances when the CONTEST changes (new anchors,
+        // density flip, saved-list edits) — never on zoom alone. Chord ≈
+        // angle at these sizes; the azimuth early-out (wider than the 4.6°
+        // clearance cap) skips the vector math for almost every pair.
+        let key = (poolGeneration, configuredCount, density.rawValue, savedListsStamp)
+        if clearanceKey != key || dotClearance.count != anchors.count {
+            clearanceKey = key
+            dotClearance = [Float](repeating: .greatestFiniteMagnitude, count: anchors.count)
+            for (oi, i) in order.enumerated() {
+                let az = anchorAz[i], dir = unitDirs[i]
+                var cmin = Float.greatestFiniteMagnitude
+                for oj in 0..<oi {
+                    let j = order[oj]
+                    if azDelta(az, anchorAz[j]) >= 0.105 { continue }   // 6° window
+                    cmin = min(cmin, simd_distance(dir, unitDirs[j]))
+                }
+                dotClearance[i] = cmin
+            }
         }
 
-        // Dots: greedy keep-if-separated in 3D angle (chord ≈ angle at these
-        // sizes, and it handles summits stacked in elevation too). The cheap
-        // azimuth early-out skips the vector math for the vast majority of
-        // pairs (window widened ×1.3 to stay conservative at high elevations).
-        for i in order {
-            let az = anchorAz[i], dir = unitDirs[i]
-            var ok = true
-            for k in sel.dots {
-                if azDelta(az, anchorAz[k]) >= angDot * 1.3 { continue }
-                if simd_distance(dir, unitDirs[k]) < angDot { ok = false; break }
+        // Dots: monotone hierarchical culling — show every anchor whose fixed
+        // clearance beats the zoom-scaled spacing; the SELECTED peak always
+        // survives. (Suppression counts hidden higher-priority anchors too;
+        // that slight extra sparseness in dense chains is the price of dots
+        // never blinking while you zoom.) `order` is priority-sorted, so
+        // sel.dots stays priority-ordered for the capsule stage below.
+        for i in order where dotClearance[i] >= angDot
+            || anchors[i].peak.id == selectedPeakID
+            || anchors[i].isSavedSpot {          // your saved spots never declutter away
+            sel.dots.append(i)
+        }
+        if let needle = Self.watchNeedle {
+            for i in order where anchors[i].peak.name.lowercased().contains(needle) {
+                NSLog("labelWatch %@: DECLUTTER %@ (clearance %.4f vs spacing %.4f rad)",
+                      anchors[i].peak.name,
+                      sel.dots.contains(i) ? "kept" : "dropped",
+                      dotClearance[i], angDot)
             }
-            if ok { sel.dots.append(i) }
+        }
+        // The selected peak contests the capsule stage first, so its name
+        // always survives that fight too.
+        if let selID = selectedPeakID,
+           let pos = sel.dots.firstIndex(where: { anchors[$0].peak.id == selID }) {
+            sel.dots.insert(sel.dots.remove(at: pos), at: 0)
         }
 
         guard capsulesOn else { return }
@@ -519,7 +580,8 @@ final class PeakLabelOverlayView: UIView {
             // The SELECTED feature's dot grows and carries a halo ring the
             // whole time it's on screen (it used to stay plain until the summit
             // left the screen and the direction marker took over).
-            node.dot.fillColor = isClimbed ? Self.climbedFill
+            node.dot.fillColor = a.isSavedSpot ? Self.savedSpotFill
+                : isClimbed ? Self.climbedFill
                 : isBookmarked ? Self.bookmarkFill
                 : a.isWater ? Self.waterFill
                 : peak.isSaddle ? Self.saddleFill : inkResolved.cgColor
@@ -568,6 +630,12 @@ final class PeakLabelOverlayView: UIView {
             // leaving a label stuck against the edge with a bent stem.
             var wantsCapsule = selection.capsules.contains(i) || selected
                 || pinnedPeakIDs.contains(peak.id)
+            // Stacking among open labels: the SELECTED (last-tapped) capsule
+            // rides above every other, pinned ones above the ambient zoom-in
+            // capsules — a fresh tap can't come up buried under neighbours.
+            // Fractional steps stay below the direction marker's 4–6 band.
+            node.capsule.zPosition = selected ? 3.9
+                : pinnedPeakIDs.contains(peak.id) ? 3.5 : 3
             if selected,
                !(point.x >= 0 && point.x <= W && point.y >= 0 && point.y <= H) {
                 wantsCapsule = false

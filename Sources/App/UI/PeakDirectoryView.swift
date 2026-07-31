@@ -74,11 +74,6 @@ struct PeakDirectoryView: View {
             _globalWaterIDs = State(initialValue: cached.globalWaterIDs)
         }
     }
-    /// A rows recompute is in flight. With no rows to show yet it renders as
-    /// a quiet spinner ("Searching…") — the same height as the "No matches"
-    /// block, so fast typing never collapses/expands the card, and a stale
-    /// "No matches" is never claimed for a query still being searched.
-    @State private var searchPending = false
     @State private var searchTask: Task<Void, Never>?
     @State private var indexTask: Task<Void, Never>?
     @State private var rowsTask: Task<Void, Never>?
@@ -219,30 +214,14 @@ struct PeakDirectoryView: View {
     private var resultsArea: some View {
         if trimmedQuery.isEmpty {
             EmptyView()
-        } else if rows.isEmpty && searchPending {
-            // In-flight with nothing to show yet: a quiet spinner — never a
-            // stale "No matches" for a query still being searched. Same block
-            // height as "No matches" so fast typing doesn't pump the card.
-            VStack(spacing: 8) {
-                ProgressView()
-                    .controlSize(.small)
-                    .tint(TopoStyle.inkColor)
-                Text("Searching…")
-                    .font(PPFont.mono(11))
-                    .foregroundStyle(TopoStyle.inkColor.opacity(0.5))
-            }
-            .padding(.top, 2)
-            .padding(.bottom, 20)
-            .padding(.horizontal, 20)
-            .frame(maxWidth: .infinity)
         } else if rows.isEmpty {
+            // (No "Searching…" spinner: the local-index searches resolve in
+            // milliseconds, so the spinner only ever FLASHED before this block
+            // replaced it — reading as flicker, not progress.)
             VStack(spacing: 5) {
                 Text("No matches")
                     .font(PPFont.ui(15, .semibold))
                     .foregroundStyle(TopoStyle.inkColor)
-                Text("Peaks and lakes worldwide are searched.")
-                    .font(PPFont.mono(11))
-                    .foregroundStyle(TopoStyle.inkColor.opacity(0.5))
             }
             .padding(.top, 2)
             .padding(.bottom, 20)
@@ -400,10 +379,9 @@ struct PeakDirectoryView: View {
         rowsTask?.cancel()
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !needle.isEmpty else {
-            rows = []; searchPending = false
+            rows = []
             return
         }
-        searchPending = true
         // Base first (dedup keeps the first occurrence), so local results win ties
         // against the whole-world matches.
         let base = baseIndex, global = globalIndex, globalWater = globalWaterIDs
@@ -489,7 +467,6 @@ struct PeakDirectoryView: View {
             }.value
             guard !Task.isCancelled else { return }
             rows = computed
-            searchPending = false
             // Seed for the next open: reopening with this query renders these
             // rows synchronously (see init).
             Self.lastSession = (needle, sort, computed, global, globalWater)

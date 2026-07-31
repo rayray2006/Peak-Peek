@@ -27,6 +27,9 @@ struct TeleportMapView: View {
     @State private var pin: CLLocationCoordinate2D?
     @State private var selectedPeak: Peak?
     @State private var resolving = false
+    /// Dropped-pin card phase: naming the spot before saving it.
+    @State private var namingPin = false
+    @State private var pinName = ""
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -44,50 +47,35 @@ struct TeleportMapView: View {
                 if let coordinate = proxy.convert(screenPoint, from: .local) {
                     selectedPeak = nil
                     pin = coordinate
+                    namingPin = false
+                    pinName = ""
                 }
             }
         }
         .ignoresSafeArea()
-        .overlay(alignment: .top) {
-            Text("Drop a viewpoint")
-                .font(PPFont.ui(15, .semibold))
-                .foregroundStyle(.white)
-                .shadow(color: .black.opacity(0.55), radius: 3, y: 1)
-                .frame(maxWidth: .infinity)
-                .overlay(alignment: .trailing) {
-                    Button { dismiss() } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .shadow(color: .black.opacity(0.55), radius: 3, y: 1)
-                            .frame(width: 34, height: 34)
-                            .contentShape(Circle().inset(by: -8))
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Close map")
-                    .padding(.trailing, 10)
-                }
-                .padding(.top, 22)      // clears the sheet's drag indicator
+        // No floating title — the map speaks for itself; just the ✕.
+        .overlay(alignment: .topTrailing) {
+            Button { dismiss() } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .shadow(color: .black.opacity(0.55), radius: 3, y: 1)
+                    .frame(width: 34, height: 34)
+                    .contentShape(Circle().inset(by: -8))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close map")
+            .padding(.trailing, 10)
+            .padding(.top, 22)          // clears the sheet's drag indicator
         }
         .safeAreaInset(edge: .bottom) {
             if let selectedPeak {
                 peakCard(for: selectedPeak)
             } else if let pin {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(String(format: "Selected %.4f°, %.4f°", pin.latitude, pin.longitude))
-                        .font(PPFont.mono(11))
-                        .foregroundStyle(TopoStyle.inkColor.opacity(0.5))
-                    Button { go(to: pin) } label: {
-                        standHereLabel
-                    }
-                    .disabled(resolving)
-                }
-                // Landscape: don't stretch the confirm button across the whole
-                // (wide) screen — cap the content and center it in the bar.
-                .frame(maxWidth: 560)
-                .frame(maxWidth: .infinity)
-                .padding()
-                .background(.regularMaterial)
+                pinCard(for: pin)
+                    .frame(maxWidth: 560)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
             } else {
                 // With no card up, .ignoresSafeArea leaves the map thinking it
                 // has zero bottom inset, so its Legal/logo attribution hugged
@@ -161,7 +149,6 @@ struct TeleportMapView: View {
                                 elevationAngleDeg: 0, distanceMeters: distance),
             isVisible: visibility(peak),
             isClimbed: lists.contains(peak, in: .climbed),
-            beenDate: lists.peaks(in: .climbed).first { $0.peak.id == peak.id }?.climbedAt,
             isBookmarked: lists.contains(peak, in: .wantToClimb),
             onToggleClimbed: { lists.toggle(peak, in: .climbed) },
             onToggleBookmark: { lists.toggle(peak, in: .wantToClimb) },
@@ -173,22 +160,135 @@ struct TeleportMapView: View {
         .padding(.bottom, 8)
     }
 
-    /// The black "View" confirm button (template button language),
-    /// shared by the pin and peak cards.
-    private var standHereLabel: some View {
-        HStack {
-            if resolving { ProgressView().tint(.white) }
-            Text(resolving ? "Naming location..." : "View")
-                .font(PPFont.ui(15, .semibold))
-                .lineLimit(1)
-            Spacer()
-            Image(systemName: "eye")
+    /// Dropped-pin card in the SAME language as the panorama's location card:
+    /// paper card, mono coordinates line, pill actions — Save (names the spot
+    /// into the Saved list, whose gold badge then marks it on the map) or
+    /// View (teleport the eye there). Save flips the card into the naming
+    /// phase, mirroring the Save Spot sheet's field + black Save button.
+    private func pinCard(for pin: CLLocationCoordinate2D) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if namingPin {
+                TextField("Name this spot", text: $pinName)
+                    .font(PPFont.ui(15))
+                    .autocorrectionDisabled()
+                    .padding(.horizontal, 14)
+                    .frame(height: 44)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12)
+                            .strokeBorder(TopoStyle.hairline(0.18), lineWidth: 1)
+                    )
+                    .padding(.trailing, 28)
+                Text(coordsLine(pin))
+                    .font(PPFont.mono(12))
+                    .foregroundStyle(TopoStyle.inkColor.opacity(0.55))
+                Button {
+                    savePin(pin)
+                } label: {
+                    Text("Save")
+                        .font(PPFont.ui(15, .semibold))
+                        .foregroundStyle(TopoStyle.paperColor)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 46)
+                        .background(TopoStyle.inkColor, in: RoundedRectangle(cornerRadius: 12))
+                }
+                .buttonStyle(.plain)
+            } else {
+                Text("Dropped Pin")
+                    .font(PPFont.ui(18, .semibold))
+                    .foregroundStyle(TopoStyle.inkColor)
+                    .padding(.trailing, 28)
+                Text(coordsLine(pin))
+                    .font(PPFont.mono(12))
+                    .foregroundStyle(TopoStyle.inkColor.opacity(0.55))
+                HStack(spacing: 8) {
+                    pinAction("Save", systemImage: "bookmark") { namingPin = true }
+                    pinAction(resolving ? "Naming location..." : "View",
+                              systemImage: "figure.stand") { go(to: pin) }
+                        .disabled(resolving)
+                }
+            }
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 14)
-        .padding(.horizontal, 16)
-        .background(TopoStyle.inkColor, in: RoundedRectangle(cornerRadius: 12))
-        .foregroundStyle(TopoStyle.paperColor)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 16)
+        .padding(.horizontal, 18)
+        .background(TopoStyle.paperColor, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .strokeBorder(TopoStyle.hairline(0.12), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.10), radius: 14, y: 8)
+        .overlay(alignment: .topTrailing) {
+            Button {
+                self.pin = nil
+                namingPin = false
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(TopoStyle.inkColor.opacity(0.5))
+                    .frame(width: 32, height: 32)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(2)
+        }
+    }
+
+    /// The location-card pill button: icon + label, 46 pt, hairline outline.
+    private func pinAction(_ title: String, systemImage: String,
+                           action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(TopoStyle.inkColor.opacity(0.8))
+                Text(title)
+                    .font(PPFont.ui(14, .semibold))
+                    .foregroundStyle(TopoStyle.inkColor)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 46)
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .strokeBorder(TopoStyle.hairline(0.18), lineWidth: 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// "48.5000° N, 121.0800° W" for the pin card.
+    private func coordsLine(_ pin: CLLocationCoordinate2D) -> String {
+        String(format: "%.4f° %@, %.4f° %@",
+               abs(pin.latitude), pin.latitude >= 0 ? "N" : "S",
+               abs(pin.longitude), pin.longitude >= 0 ? "E" : "W")
+    }
+
+    /// Save the pinned spot into the Saved list (the same entry Save Spot
+    /// makes): the typed name, or the reverse-geocoded one when left blank
+    /// (falling back to bare coordinates offline). The pin clears on save —
+    /// the gold saved badge takes over marking the spot.
+    private func savePin(_ pin: CLLocationCoordinate2D) {
+        let typed = pinName.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task {
+            let fallback = String(format: "%.3f°, %.3f°", pin.latitude, pin.longitude)
+            let name: String
+            if typed.isEmpty {
+                let loc = CLLocation(latitude: pin.latitude, longitude: pin.longitude)
+                name = await Self.friendlyName(for: loc, deadlineSeconds: 2.5) ?? fallback
+            } else {
+                name = typed
+            }
+            lists.toggle(Peak(
+                id: "loc_\(UUID().uuidString)", name: name,
+                latitude: pin.latitude, longitude: pin.longitude,
+                elevationMeters: 0, prominenceMeters: nil
+            ), in: .wantToClimb)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            namingPin = false
+            pinName = ""
+            self.pin = nil
+        }
     }
 
     private var startPosition: MapCameraPosition {
@@ -298,11 +398,10 @@ struct MiniMapView: View {
                 .annotationTitles(.hidden)
             }
         }
-        .mapStyle(.standard(elevation: .realistic))
-        // The template's pale cartography: wash most of the color out of the
-        // map tiles. The peek follows the day/night theme (dark tiles after
-        // sunset) via the scene-wide scheme.
-        .saturation(0.25)
+        // Same cartography as the full teleport map — one map style app-wide.
+        // (No saturation wash: it was tuned for the pale standard tiles and
+        // just greyed the hybrid imagery.)
+        .mapStyle(.hybrid(elevation: .realistic))
         .frame(width: 104, height: 104)
         .clipShape(RoundedRectangle(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(TopoStyle.hairline(0.12), lineWidth: 1))

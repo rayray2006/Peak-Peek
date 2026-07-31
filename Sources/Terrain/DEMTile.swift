@@ -318,6 +318,108 @@ struct DEMTile {
         return (mn, mx, lat, lon)
     }
 
+    /// The label-anchor summit snap: like `highestNear`, but steerable — used
+    /// by the deterministic summit CLAIMING in buildAnchors.
+    /// - `targetElev`: the peak's surveyed height. Cells above it score a 2×
+    ///   overshoot penalty, so a shoulder peak (Pic Tyndall, 4241 m) prefers a
+    ///   cell of its own height over the main summit's higher cell next door.
+    ///   nil = pure highest (unknown elevation).
+    /// - `isExcluded`: cells already claimed by a higher peak are skipped.
+    /// Falls back to the center cell if everything in range is excluded.
+    func summitCellNear(lat: Double, lon: Double, radiusMeters: Double,
+                        targetElev: Float?,
+                        isExcluded: ((Double, Double) -> Bool)? = nil)
+        -> (lat: Double, lon: Double, elev: Float) {
+        let (mLon, mLat) = metersPerDegree(atLat: lat)
+        let dCol = Int((radiusMeters / mLon) / cellsize) + 1
+        let dRow = Int((radiusMeters / mLat) / cellsize) + 1
+        let cCenter = min(ncols - 1, max(0, Int((lon - xllcorner) / cellsize)))
+        let rCenter = min(nrows - 1, max(0, (nrows - 1) - Int((lat - yllcorner) / cellsize)))
+        var bestScore: Float = -.greatestFiniteMagnitude
+        var bc = cCenter, br = rCenter
+        var bestElev = elevations[rCenter * ncols + cCenter]
+        for r in max(0, rCenter - dRow)...min(nrows - 1, rCenter + dRow) {
+            for c in max(0, cCenter - dCol)...min(ncols - 1, cCenter + dCol) {
+                let v = elevations[r * ncols + c]
+                var score = v
+                if let targetElev { score -= 2 * max(0, v - targetElev) }
+                guard score > bestScore else { continue }
+                if let isExcluded {
+                    let cellLon = xllcorner + (Double(c) + 0.5) * cellsize
+                    let cellLat = yllcorner + (Double(nrows - 1 - r) + 0.5) * cellsize
+                    if isExcluded(cellLat, cellLon) { continue }
+                }
+                bestScore = score; bestElev = v; bc = c; br = r
+            }
+        }
+        let outLon = xllcorner + (Double(bc) + 0.5) * cellsize
+        let outLat = yllcorner + (Double(nrows - 1 - br) + 0.5) * cellsize
+        return (outLat, outLon, bestElev)
+    }
+
+    /// Candidate WATER-surface anchor cells for a lake label, nearest first.
+    /// Lake catalog points are sometimes placed well off the water (Ross
+    /// Lake's sits ~1 km up the eastern shore, 430 m ABOVE the surface — its
+    /// dot rode the mountainside), and the single nearest surface cell can
+    /// hide behind the shore ridge. Water in SRTM is FLAT, so: search in
+    /// GROWING rings for cells that are low (≤ the label cell's height + 5 m)
+    /// and flat (≥5 of 8 neighbours within ±2 m), returning ONE candidate per
+    /// ring — each ring's nearest — so the caller can walk deeper into open
+    /// water until one passes its visibility judgment. The ring growth keeps a
+    /// small tarn snapping to ITS OWN surface long before a deeper valley two
+    /// ridges over enters the search. A label already on flat water returns
+    /// just itself; nothing water-like in reach falls back to the label point.
+    func waterSurfaceCandidates(lat: Double, lon: Double)
+        -> [(lat: Double, lon: Double, elev: Float)] {
+        let (mLon, mLat) = metersPerDegree(atLat: lat)
+        let cCenter = min(ncols - 2, max(1, Int((lon - xllcorner) / cellsize)))
+        let rCenter = min(nrows - 2, max(1, (nrows - 1) - Int((lat - yllcorner) / cellsize)))
+        func isFlat(_ r: Int, _ c: Int) -> Bool {
+            guard r >= 1, r <= nrows - 2, c >= 1, c <= ncols - 2 else { return false }
+            let v = elevations[r * ncols + c]
+            var near = 0
+            for dr in -1...1 {
+                for dc in -1...1 where dr != 0 || dc != 0 {
+                    if abs(elevations[(r + dr) * ncols + (c + dc)] - v) <= 2 { near += 1 }
+                }
+            }
+            return near >= 5
+        }
+        let e0 = elevations[rCenter * ncols + cCenter]
+        if isFlat(rCenter, cCenter) {
+            return [(lat, lon, e0)]           // already on the water
+        }
+        // True ANNULI (prev, radius]: each candidate is the nearest flat cell
+        // strictly deeper than the previous ring's, so the list steps
+        // genuinely further into open water rather than one cell sideways.
+        var out: [(lat: Double, lon: Double, elev: Float)] = []
+        var prev = 0.0
+        for radius in [150.0, 300.0, 600.0, 1200.0] {
+            let dCol = Int((radius / mLon) / cellsize) + 1
+            let dRow = Int((radius / mLat) / cellsize) + 1
+            var best: (d2: Double, r: Int, c: Int)?
+            for r in max(1, rCenter - dRow)...min(nrows - 2, rCenter + dRow) {
+                for c in max(1, cCenter - dCol)...min(ncols - 2, cCenter + dCol) {
+                    let v = elevations[r * ncols + c]
+                    guard v <= e0 + 5, v > nodata else { continue }
+                    let dy = Double(r - rCenter) * mLat * cellsize
+                    let dx = Double(c - cCenter) * mLon * cellsize
+                    let d2 = dx * dx + dy * dy
+                    guard d2 > prev * prev else { continue }
+                    if let b = best, d2 >= b.d2 { continue }
+                    if isFlat(r, c) { best = (d2, r, c) }
+                }
+            }
+            prev = radius
+            if let best {
+                let outLon = xllcorner + (Double(best.c) + 0.5) * cellsize
+                let outLat = yllcorner + (Double(nrows - 1 - best.r) + 0.5) * cellsize
+                out.append((outLat, outLon, elevations[best.r * ncols + best.c]))
+            }
+        }
+        return out.isEmpty ? [(lat, lon, e0)] : out
+    }
+
     /// Find the highest cell within `radiusMeters` of (lat,lon). Used to snap a
     /// camera onto the nearby summit despite coordinate imprecision + grid sampling.
     func highestNear(lat: Double, lon: Double, radiusMeters: Double) -> (lat: Double, lon: Double, elev: Float) {

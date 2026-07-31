@@ -4,7 +4,6 @@ import simd
 import CoreMotion
 import CoreLocation
 @preconcurrency import AVFoundation
-import Photos
 
 /// SwiftUI wrapper around an `MTKView` that renders the raymarched terrain and
 /// lets the user look around by turning the phone (full device attitude, incl.
@@ -77,6 +76,8 @@ struct TerrainMetalView: UIViewRepresentable {
     var peaks: [Peak] = []
     /// Named lakes/reservoirs to label (blue water labels at surface elevation).
     var lakes: [Peak] = []
+    /// User-saved custom spots (`loc_…`) to label as yellow look-around dots.
+    var savedSpots: [Peak] = []
     /// Currently selected peak (highlighted; also shown as an accent direction marker when
     /// off-view), and the tap callback (nil = a tap that hit no label).
     var selectedPeak: AnnotatedPeak?
@@ -113,20 +114,12 @@ struct TerrainMetalView: UIViewRepresentable {
     /// theme with zero lag — sunrise/sunset times arrive seconds later from
     /// the async celestial pass and are not needed for this.
     var onNightChanged: (Bool) -> Void = { _ in }
-    /// Incremented by the HUD's shutter button to capture a photo of the view.
-    var captureToken: Int = 0
     /// Changes when the ft↔m preference flips — the label overlay re-bakes
     /// its elevation strings.
     var unitsStamp: String = ""
-    /// Photo framing mode: the shutter is up — chrome hides and the toggles
-    /// below preview live on screen.
-    var photoFraming: Bool = false
-    /// Photo toggles: composite (and, while framing, SHOW) the peak labels /
-    /// compass strip in the captured image.
-    var captureIncludesLabels: Bool = true
-    var captureIncludesCompass: Bool = false
-    /// Fired when a capture finishes (true = saved) — drives the shutter flash.
-    var onPhotoCaptured: (Bool) -> Void = { _ in }
+    /// Changes when the 12h↔24h preference flips — the sky overlay re-formats
+    /// its rise/set (↑/↓) time tags.
+    var clockStamp: String = ""
     /// Immersive view (empty tap): RootScreen hides its chrome; the compass +
     /// zoom readout live inside this view, so they're hidden here.
     var immersive: Bool = false
@@ -166,21 +159,14 @@ struct TerrainMetalView: UIViewRepresentable {
                                              action: #selector(Coordinator.handlePinch(_:)))
         view.addGestureRecognizer(pinch)
         // Pan is always available now (manual-alignment look-around); it only moves
-        // the view when manual alignment is on, or as the no-IMU fallback.
-        // Capped at one finger so the two-finger pitch trim below can't also
-        // drive the yaw drag.
+        // the view when manual alignment is on, or as the no-IMU fallback. On
+        // device-tracked views the one-finger drag is the ALIGN drag: axis-
+        // locked to yaw (horizontal) or pitch trim (vertical), never both.
+        // Capped at one finger so pinch can't also drive it.
         let pan = UIPanGestureRecognizer(target: context.coordinator,
                                          action: #selector(Coordinator.handlePan(_:)))
         pan.maximumNumberOfTouches = 1
         view.addGestureRecognizer(pan)
-        // Two-finger vertical drag (AR only): pitch TRIM — corrects the small
-        // vertical offset left by elevation-data error at the eye (SRTM canopy
-        // bias, GPS-on-slope), which no camera-geometry fix can remove.
-        let trim = UIPanGestureRecognizer(target: context.coordinator,
-                                          action: #selector(Coordinator.handlePitchTrim(_:)))
-        trim.minimumNumberOfTouches = 2
-        trim.maximumNumberOfTouches = 2
-        view.addGestureRecognizer(trim)
         // One single-tap recognizer for everything: label/sky selection when
         // the tap lands on a feature, and (via onEmptyTap) dismiss-or-immersive
         // when it doesn't — RootScreen decides which, since it owns the
@@ -215,17 +201,14 @@ struct TerrainMetalView: UIViewRepresentable {
         context.coordinator.setManualAlignment(manualAlignment)
         context.coordinator.setMode(mode)
         context.coordinator.setARRecenterToken(arRecenterToken)
-        context.coordinator.onPhotoCaptured = onPhotoCaptured
-        context.coordinator.captureIncludesLabels = captureIncludesLabels
-        context.coordinator.captureIncludesCompass = captureIncludesCompass
-        context.coordinator.setPhotoFraming(photoFraming)
-        context.coordinator.setCaptureToken(captureToken)
         context.coordinator.onEmptyTap = onEmptyTap
         context.coordinator.setImmersive(immersive)
         context.coordinator.setPeaks(peaks)
         context.coordinator.setLakes(lakes)
+        context.coordinator.setSavedSpots(savedSpots)
         context.coordinator.setLabelDensity(labelDensity)
         context.coordinator.setUnitsStamp(unitsStamp)
+        context.coordinator.setClockStamp(clockStamp)
         context.coordinator.setSavedPeaks(climbed: climbedPeakIDs, bookmarked: bookmarkedPeakIDs)
         context.coordinator.onSelectPeak = onSelectPeak
         context.coordinator.onVisibleFeatures = onVisibleFeatures
@@ -363,6 +346,9 @@ struct TerrainMetalView: UIViewRepresentable {
             rebuildCelestial()   // the rise/set tags carry formatted times
         }
         private var cachedHorizon: [Float]?
+        /// The `farProfileGen` (ring generation) `cachedHorizon` was built against
+        /// — so a celestial pass can record which ring its star-occlusion reflects.
+        private var cachedHorizonRingGen = 0
         /// Real sun direction (ENU) at `displayDate`, for the dynamic sky colour.
         /// Sun for the DISPLAYED panorama — drives the live sky colour. On a
         /// location change this holds the OLD location's sun until the new
@@ -378,6 +364,13 @@ struct TerrainMetalView: UIViewRepresentable {
         /// against the GPU bake, and without this check the old stars kept
         /// shining through the new terrain until that pass landed.
         private var celestialRef: (lat: Double, lon: Double)?
+        /// The ring generation (`farProfileGen`) the CURRENTLY displayed celestial
+        /// content was culled against. The far-horizon ring lands mid-move and
+        /// tops the panorama up with distant silhouettes — a SAME-location re-bake,
+        /// so the lat/lon staleness guard alone keeps the pre-ring stars, which
+        /// were occluded against a ring-less horizon and then shine THROUGH the
+        /// newly drawn far ridges. Comparing this at the swap clears them.
+        private var celestialRingGen = -1
         /// Stamped with the viewpoint it was computed FOR: a reload-window
         /// rebuild can still describe the OLD location (a live-clock tick
         /// firing before the new DEM installs refLat/refLon), and applying
@@ -385,7 +378,7 @@ struct TerrainMetalView: UIViewRepresentable {
         /// the "wrong sky for a second after a teleport" flash.
         /// Celestial overlay content (stars/arcs/discs) computed for a scene
         /// that hasn't installed yet — applied atomically with the swap.
-        private var pendingCelestialApply: (lat: Double, lon: Double, run: () -> Void)?
+        private var pendingCelestialApply: (lat: Double, lon: Double, ringGen: Int, run: () -> Void)?
 
         /// Run the held celestial content if it matches the CURRENT viewpoint;
         /// drop it if it was computed for another one (the real content for
@@ -491,9 +484,6 @@ struct TerrainMetalView: UIViewRepresentable {
             }
             t.onFrame = { [weak self] pb in
                 guard let self else { return }
-                self.pixelBufferLock.lock()
-                self.latestPixelBuffer = pb        // photo capture, same as AVCapture
-                self.pixelBufferLock.unlock()
                 self.container?.arDisplayLayer.enqueue(pixelBuffer: pb)
                 if self.awaitingFirstFrame { self.revealCamera() }
             }
@@ -518,11 +508,12 @@ struct TerrainMetalView: UIViewRepresentable {
         // horizontal alignment harder. Persists across viewpoints; cleared by
         // `recenterAR()`.
         private var arYawOffsetDeg: Double = 0
-        /// AR PITCH trim (degrees, + = look up): a small vertical calibration on
-        /// the two-finger drag, for when elevation-data error at the eye (SRTM
-        /// canopy bias, GPS sampling a steep slope) leaves the whole overlay
-        /// sitting slightly above/below the real terrain. Clamped to ±8° — a
-        /// trim, not look-around. Cleared with the yaw offset by `recenterAR()`.
+        /// AR PITCH trim (degrees, + = look up): the align drag's VERTICAL
+        /// axis (one finger, axis-locked — see applyAlignDrag), for when
+        /// elevation-data error at the eye (SRTM canopy bias, GPS sampling a
+        /// steep slope) leaves the whole overlay sitting slightly above/below
+        /// the real terrain. Clamped to ±8° — a trim, not look-around.
+        /// Cleared with the yaw offset by `recenterAR()`.
         private var arPitchOffsetDeg: Double = 0
         private var arRecenterToken = 0
         /// Reports whether a non-zero AR adjustment is currently applied (drives the
@@ -549,6 +540,7 @@ struct TerrainMetalView: UIViewRepresentable {
         // Peak labels.
         private var peaks: [Peak] = []
         private var lakes: [Peak] = []
+        private var savedSpots: [Peak] = []
         private var labelGeneration = 0
         var onSelectPeak: (Peak?) -> Void = { _ in }
         var onVisibleFeatures: (Set<String>) -> Void = { _ in }
@@ -647,6 +639,17 @@ struct TerrainMetalView: UIViewRepresentable {
         /// only (reset before the fetch, ticked from the per-tile callbacks).
         private var loadUnitsDone = 0
         private var loadUnitsTotal = 0
+        /// Fractional byte progress of tiles still in flight (keyed by tile
+        /// name); a tile's entry clears when its completion unit ticks.
+        private var loadPartialDownloads: [String: Double] = [:]
+
+        /// Combined download+stitch readout: whole units plus in-flight bytes.
+        private func reportLoadProgress() {
+            guard loadUnitsTotal > 0 else { return }
+            let partial = loadPartialDownloads.values.reduce(0, +)
+            let fraction = min(1, (Double(loadUnitsDone) + partial) / Double(loadUnitsTotal))
+            report(.preparingTerrain(progress: Self.loadShare * fraction))
+        }
         /// Download + stitch span 0…loadShare of the readout; the bake then
         /// sweeps loadShare…0.95 on its per-band completions (see
         /// `bakeProgressive`), holds at 0.95 while the labels land, and `.ready`
@@ -666,6 +669,12 @@ struct TerrainMetalView: UIViewRepresentable {
         /// linger over the new terrain, nor new labels float over the old.
         private var pendingPanoTex: MTLTexture?
         private var pendingAnchors: ([PeakLabelOverlayView.Anchor], Set<String>)?
+        /// The staged anchors are the SAME set already installed (a reuse top-up):
+        /// the swap must NOT reassign them onto the overlay. Reassigning an
+        /// identical set still fires `anchors.didSet` → `rebuildPool()`, which
+        /// resets the chunked build and re-streams every dot — the "dots flash a
+        /// few seconds after open" when the far-horizon ring lands mid-bake.
+        private var pendingAnchorsUnchanged = false
         private var pendingOnReady: (() -> Void)?
 
         private func maybeCompleteSwap() {
@@ -675,6 +684,8 @@ struct TerrainMetalView: UIViewRepresentable {
             pendingPanoTex = nil
             pendingAnchors = nil
             rebakePending = false
+            let anchorsUnchanged = pendingAnchorsUnchanged
+            pendingAnchorsUnchanged = false
             renderer.installPanorama(tex)
             // Sky joins the swap: the sun the panorama was baked with becomes
             // the live sky sun, the theme flips with it, and any celestial
@@ -682,25 +693,37 @@ struct TerrainMetalView: UIViewRepresentable {
             // colour, theme, labels, stars: one frame.
             skySunENU = bakeSunENU
             reportNight()
+            // Held content is only good for THIS swap if it matches the new
+            // viewpoint AND was culled against the ring now baked into the
+            // panorama — a ring top-up bakes distant silhouettes in, and stars
+            // occluded against the pre-ring horizon otherwise shine through them.
+            let ringNow = farProfileGen
             if let pending = pendingCelestialApply,
-               abs(pending.lat - refLat) < 1e-6, abs(pending.lon - refLon) < 1e-6 {
+               abs(pending.lat - refLat) < 1e-6, abs(pending.lon - refLon) < 1e-6,
+               pending.ringGen == ringNow {
                 pending.run()
                 pendingCelestialApply = nil
             } else {
-                // No held content for THIS scene (none, or stale content for
-                // another location — dropped, never applied over the fresh
-                // sky sun). If the overlay still shows another location's
-                // sky, clear it rather than let those stars shine through
-                // the new terrain; the real pass applies moments later.
+                // No content valid for THIS scene yet (none, wrong location, or
+                // computed against a stale ring). Drop it and, if the overlay
+                // still shows another location's OR a pre-ring sky, clear it so
+                // those stars don't shine through the new terrain; the correct
+                // pass (already scheduled) applies a beat later.
                 pendingCelestialApply = nil
                 if let ref = celestialRef,
-                   abs(ref.lat - refLat) > 1e-6 || abs(ref.lon - refLon) > 1e-6 {
+                   abs(ref.lat - refLat) > 1e-6 || abs(ref.lon - refLon) > 1e-6
+                    || celestialRingGen != ringNow {
                     container?.skyArc.clearCelestial()
                     celestialRef = nil
+                    celestialRingGen = -1
                 }
             }
-            container?.labelOverlay.anchors = anchors
-            onVisibleFeatures(visibleIDs)
+            // Reused anchors are already on the overlay and unchanged — leave its
+            // dots untouched (reassigning would rebuild the pool and flash them).
+            if !anchorsUnchanged {
+                container?.labelOverlay.anchors = anchors
+                onVisibleFeatures(visibleIDs)
+            }
             view?.setNeedsDisplay()
             // Capture-then-clear, in that order: the completion below runs
             // finishReload, which starts a QUEUED move synchronously — and that
@@ -957,6 +980,9 @@ struct TerrainMetalView: UIViewRepresentable {
             // Stars only belong to the 3D panorama — over the live camera the
             // real sky is already there and painted points read as noise.
             container?.skyArc.showsStars = (newMode == .threeD)
+            // AR is locked to the camera's native 1x lens — no user zoom, so drop
+            // the flat "1.0×" readout there and keep it only in the 3D view.
+            container?.compassZoom.showsZoom = !usesCamera
 
             if usesCamera {
                 // ARKit path shows its own display layer; AVCapture the preview.
@@ -1041,154 +1067,19 @@ struct TerrainMetalView: UIViewRepresentable {
             pixelBufferLock.unlock()
         }
 
-        // Every camera frame: retain the newest pixel buffer (photo capture composites
-        // it); the first frame also reveals the preview.
+        // Every camera frame: the first one reveals the preview.
         func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
                            from connection: AVCaptureConnection) {
             let needsReveal: Bool
             pixelBufferLock.lock()
-            if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
-                latestPixelBuffer = pb
-            }
             needsReveal = awaitingFirstFrame
             pixelBufferLock.unlock()
             guard needsReveal else { return }
             DispatchQueue.main.async { [weak self] in self?.revealCamera() }
         }
 
-        // MARK: Photo capture
-
-        /// Newest camera frame, retained for photo capture (written on the video
-        /// queue, read on main at capture time).
-        private var latestPixelBuffer: CVPixelBuffer?
+        /// Guards `awaitingFirstFrame` (set on main, read on the video queue).
         private let pixelBufferLock = NSLock()
-        private static let ciContext = CIContext()
-        /// Reports capture success (drives the HUD shutter flash).
-        var onPhotoCaptured: (Bool) -> Void = { _ in }
-        /// Photo-sheet toggles (see the representable's fields of the same name).
-        var captureIncludesLabels = true
-        var captureIncludesCompass = false
-        private var captureRequestToken = 0
-
-        /// RootScreen bumps a token to request a capture (one-way action input,
-        /// same pattern as the AR recenter button).
-        func setCaptureToken(_ token: Int) {
-            guard token != captureRequestToken else { return }
-            captureRequestToken = token
-            capturePhoto()
-        }
-
-        /// Capture what the user currently sees and save it to the photo library:
-        /// the metal render (opaque terrain in 3D; transparent relief/edges in AR)
-        /// composited over the live camera frame (AR modes), with the sky + label
-        /// overlays drawn on top. The metal pass is RE-RENDERED offscreen with the
-        /// same uniforms `draw` would build — presented drawables can't be read back.
-        private func capturePhoto() {
-            guard let v = view, let renderer, let container else { onPhotoCaptured(false); return }
-            let w = Int(v.drawableSize.width), h = Int(v.drawableSize.height)
-            guard w > 0, h > 0 else { onPhotoCaptured(false); return }
-
-            // Same uniforms + mode switch as draw(in:) — shared helpers, so the
-            // captured image can never drift from what's on screen.
-            let uniforms = currentUniformsWithDeviceBasis(width: w, height: h)
-            let effectiveMode = self.effectiveMode
-
-            // Offscreen metal pass → CGImage (readable .shared texture).
-            var metalCG: CGImage?
-            let desc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: TerrainRenderer.colorFormat, width: w, height: h, mipmapped: false)
-            desc.usage = [.renderTarget, .shaderRead]
-            desc.storageMode = .shared
-            if let tex = renderer.device.makeTexture(descriptor: desc),
-               let cb = renderer.commandQueue.makeCommandBuffer() {
-                encodeScene(uniforms: uniforms, into: tex, commandBuffer: cb, renderer: renderer)
-                cb.commit()
-                cb.waitUntilCompleted()
-                // Read straight into a Data — the old [UInt8] → Data(bytes) path
-                // copied the ~12 MB frame a second time.
-                var data = Data(count: w * h * 4)
-                data.withUnsafeMutableBytes { buf in
-                    tex.getBytes(buf.baseAddress!, bytesPerRow: w * 4,
-                                 from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
-                }
-                metalCG = CGDataProvider(data: data as CFData).flatMap {
-                    CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
-                            bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
-                            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
-                            provider: $0, decode: nil, shouldInterpolate: false,
-                            intent: .defaultIntent)
-                }
-            }
-
-            // Camera frame (AR modes): newest buffer, rotated to portrait.
-            var cameraCG: CGImage?
-            if effectiveMode.usesCamera, cameraRevealed {
-                pixelBufferLock.lock()
-                let pb = latestPixelBuffer
-                pixelBufferLock.unlock()
-                if let pb {
-                    // Full frame, no crop: AR displays the native 1x feed.
-                    let ci = CIImage(cvPixelBuffer: pb).oriented(.right)
-                    cameraCG = Self.ciContext.createCGImage(ci, from: ci.extent)
-                }
-            }
-
-            // Composite at drawable resolution: camera → metal → overlays.
-            let fmt = UIGraphicsImageRendererFormat()
-            fmt.scale = 1
-            fmt.opaque = true
-            let size = CGSize(width: w, height: h)
-            let image = UIGraphicsImageRenderer(size: size, format: fmt).image { ctx in
-                let rect = CGRect(origin: .zero, size: size)
-                UIColor.black.setFill()
-                ctx.fill(rect)
-                if let cameraCG {                              // aspect-fill, like the preview layer
-                    let cw = CGFloat(cameraCG.width), ch = CGFloat(cameraCG.height)
-                    let s = max(rect.width / cw, rect.height / ch)
-                    UIImage(cgImage: cameraCG).draw(in: CGRect(
-                        x: (rect.width - cw * s) / 2, y: (rect.height - ch * s) / 2,
-                        width: cw * s, height: ch * s))
-                }
-                if let metalCG { UIImage(cgImage: metalCG).draw(in: rect) }
-                let cg = ctx.cgContext                          // overlays are in points → scale up
-                cg.saveGState()
-                cg.scaleBy(x: size.width / max(1, container.labelOverlay.bounds.width),
-                           y: size.height / max(1, container.labelOverlay.bounds.height))
-                container.skyArc.layer.render(in: cg)
-                if captureIncludesLabels {
-                    container.labelOverlay.layer.render(in: cg)
-                }
-                cg.restoreGState()
-                // The compass follows the WINDOW (not the counter-rotated
-                // terrain), so it scales by its own bounds.
-                if captureIncludesCompass {
-                    cg.saveGState()
-                    cg.scaleBy(x: size.width / max(1, container.compassZoom.bounds.width),
-                               y: size.height / max(1, container.compassZoom.bounds.height))
-                    container.compassZoom.layer.render(in: cg)
-                    cg.restoreGState()
-                }
-            }
-
-            // Debug hook for automated verification: also write to Documents.
-            if ProcessInfo.processInfo.arguments.contains("-captureToDocuments"),
-               let data = image.pngData(),
-               let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
-                try? data.write(to: dir.appendingPathComponent("capture.png"))
-            }
-
-            PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
-                guard status == .authorized || status == .limited else {
-                    DispatchQueue.main.async { self?.onPhotoCaptured(false) }
-                    return
-                }
-                PHPhotoLibrary.shared().performChanges({
-                    PHAssetChangeRequest.creationRequestForAsset(from: image)
-                }) { ok, _ in
-                    DispatchQueue.main.async { self?.onPhotoCaptured(ok) }
-                }
-            }
-        }
 
         /// Device alignment vs. manual look-around. With no IMU the view is forced
         /// to manual (and the HUD is told). Switching into manual seeds the drag
@@ -1225,6 +1116,22 @@ struct TerrainMetalView: UIViewRepresentable {
                        let input = try? AVCaptureDeviceInput(device: device),
                        self.session.canAddInput(input) {
                         self.session.addInput(input)
+                        // Sunrise/sunset blowouts: keep exposure ADAPTING and
+                        // turn the format's video HDR on — the fallback path
+                        // previously took whatever the preset defaulted to,
+                        // and a bright sky behind dark terrain clipped hard.
+                        if (try? device.lockForConfiguration()) != nil {
+                            if device.isExposureModeSupported(.continuousAutoExposure) {
+                                device.exposureMode = .continuousAutoExposure
+                            }
+                            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                                device.whiteBalanceMode = .continuousAutoWhiteBalance
+                            }
+                            if device.activeFormat.isVideoHDRSupported {
+                                device.automaticallyAdjustsVideoHDREnabled = true
+                            }
+                            device.unlockForConfiguration()
+                        }
                         // Record the active format's true field of view + dimensions so
                         // the AR projection matches the camera exactly. With geometric
                         // distortion correction on (the default on supporting devices)
@@ -1378,25 +1285,48 @@ struct TerrainMetalView: UIViewRepresentable {
                             + DEMFetcher.tileCount(lat: lat, lon: lon, radiusMeters: Self.farRadius))
                         await MainActor.run {
                             self?.loadUnitsDone = 0
+                            self?.loadPartialDownloads = [:]
                             self?.loadUnitsTotal = total
                             self?.report(.preparingTerrain(progress: total > 0 ? 0 : nil))
                         }
-                        let onUnit: @Sendable () -> Void = { [weak self] in
+                        // Whole units per settled tile + FRACTIONAL bytes for
+                        // tiles in flight: each tile is ~10 MB, and unit-only
+                        // ticks left the bar frozen for the many seconds a
+                        // tile spends downloading (measured: 20+ s stalls on
+                        // a cold load over a slow link).
+                        let onStitched: @Sendable () -> Void = { [weak self] in
                             DispatchQueue.main.async {
-                                guard let self, gen == self.moveGeneration,
-                                      self.loadUnitsTotal > 0 else { return }
+                                guard let self, gen == self.moveGeneration else { return }
                                 self.loadUnitsDone = min(self.loadUnitsDone + 1, self.loadUnitsTotal)
-                                self.report(.preparingTerrain(progress:
-                                    Self.loadShare * Double(self.loadUnitsDone) / Double(self.loadUnitsTotal)))
+                                self.reportLoadProgress()
+                            }
+                        }
+                        let onTileDone: @Sendable (String) -> Void = { [weak self] name in
+                            DispatchQueue.main.async {
+                                guard let self, gen == self.moveGeneration else { return }
+                                self.loadPartialDownloads[name] = nil
+                                self.loadUnitsDone = min(self.loadUnitsDone + 1, self.loadUnitsTotal)
+                                self.reportLoadProgress()
+                            }
+                        }
+                        let onTileBytes: @Sendable (String, Double) -> Void = { [weak self] name, frac in
+                            DispatchQueue.main.async {
+                                guard let self, gen == self.moveGeneration else { return }
+                                self.loadPartialDownloads[name] = min(1, frac)
+                                self.reportLoadProgress()
                             }
                         }
                         // Near (native ~30 m, ≈40 km) + far (coarse, ≈120 km) in parallel.
                         async let near = DEMFetcher.fetch(lat: lat, lon: lon,
                                                           radiusMeters: Self.nearRadius, maxGrid: Self.nearMaxGrid,
-                                                          onTileComplete: onUnit, onTileStitched: onUnit)
+                                                          onTileComplete: onTileDone,
+                                                          onTileDownloadProgress: onTileBytes,
+                                                          onTileStitched: onStitched)
                         async let far = DEMFetcher.fetch(lat: lat, lon: lon,
                                                          radiusMeters: Self.farRadius, maxGrid: Self.farMaxGrid,
-                                                         onTileComplete: onUnit, onTileStitched: onUnit)
+                                                         onTileComplete: onTileDone,
+                                                         onTileDownloadProgress: onTileBytes,
+                                                         onTileStitched: onStitched)
                         let nearResult = try await near
                         let farResult = try await far
                         nearTile = nearResult.tile
@@ -1614,6 +1544,15 @@ struct TerrainMetalView: UIViewRepresentable {
             rebuildLabelAnchors()
         }
 
+        /// User saved spots (`loc_…`) — their own yellow look-around dots. Same
+        /// coalesced rebuild path as peaks/lakes; a fresh drop shows on the next
+        /// anchor build without a re-bake.
+        func setSavedSpots(_ s: [Peak]) {
+            guard !Self.sameIDs(s, savedSpots) else { return }
+            savedSpots = s
+            rebuildLabelAnchors()
+        }
+
         /// Anchors are density-independent (the overlay declutters per frame),
         /// so switching density is just a redraw — no anchor rebuild.
         func setLabelDensity(_ d: LabelDensity) {
@@ -1640,6 +1579,11 @@ struct TerrainMetalView: UIViewRepresentable {
         /// the first bake holds its `.ready` on this so terrain and labels
         /// reach the screen in the same frame (see bakeProgressive).
         private var onAnchorsInstalled: (() -> Void)?
+        /// One-shot: fired (and cleared) when celestial content applies to the
+        /// overlay — the first bake ALSO holds `.ready` on this (after the
+        /// anchors) so the sun/moon arcs and stars can't pop in a beat after
+        /// the reveal. Fired from the apply closure in rebuildCelestial.
+        private var onCelestialInstalled: (() -> Void)?
         /// The anchor depth pass failed while backgrounded — rebuild on activate.
         private var anchorRetryOnActivate = false
         /// Backoff for depth-pass failures while ACTIVE (transient GPU aborts);
@@ -1693,7 +1637,8 @@ struct TerrainMetalView: UIViewRepresentable {
             let far = self.demFar
             let peaks = self.peaks
             let lakes = self.lakes
-            guard !peaks.isEmpty || !lakes.isEmpty else {
+            let savedSpots = self.savedSpots
+            guard !peaks.isEmpty || !lakes.isEmpty || !savedSpots.isEmpty else {
                 installAnchors([], visibleIDs: [], ringStamp: farProfileGen)
                 return
             }
@@ -1726,7 +1671,8 @@ struct TerrainMetalView: UIViewRepresentable {
                     if Self.labelDebug { NSLog("Anchor build: %.0f ms", Self.ms(since: tB)) }
                 }
                 let (anchors, visibleIDs) = Self.buildAnchors(
-                    peaks: peaks, lakes: lakes, dem: dem, far: far, refLat: refLat, refLon: refLon,
+                    peaks: peaks, lakes: lakes, savedSpots: savedSpots,
+                    dem: dem, far: far, refLat: refLat, refLon: refLon,
                     camElevMeters: camElevM, heightScale: hs,
                     depth: depthMap?.depth ?? [], depthW: depthMap?.width ?? 0,
                     depthH: depthMap?.height ?? 0, skyDepth: skyDepth, panoElevMax: panoElevMax,
@@ -1757,7 +1703,23 @@ struct TerrainMetalView: UIViewRepresentable {
                                     visibleIDs: Set<String>, ringStamp: Int) {
             lastAnchorState = (anchors, visibleIDs, ringStamp)
             anchorBuildInFlight = false
-            if rebakePending {
+            // Hold the CURRENT labels on screen for the whole move, not just the
+            // bake tail. `teleport` republishes the new region's peaks the instant
+            // the move starts (via loadPeaks), and that fires an anchor rebuild
+            // while the DEM fetch is still in flight — built against the OLD DEM,
+            // so it resolves to nothing and wiped the labels off the still-shown
+            // old terrain. Stash any build during a move (isReloading) once a
+            // scene exists; the bake's own rebuild lands the correct set at the
+            // atomic swap. (First load has no scene to protect — install direct.)
+            // EXCEPT while the first-load `.ready` barrier waits on THIS install
+            // (onAnchorsInstalled set): the first bake just installed the pano
+            // (panoInstalled true, isReloading true until .ready), but that path
+            // never runs the swap — stashing here parked the first scene's dots
+            // in a swap that never completed, and they only appeared seconds
+            // later via the ring top-up. The barrier's install goes DIRECT.
+            let holdForSwap = rebakePending
+                || (isReloading && panoInstalled && onAnchorsInstalled == nil)
+            if holdForSwap {
                 pendingAnchors = (anchors, visibleIDs)
                 maybeCompleteSwap()
             } else {
@@ -1811,6 +1773,7 @@ struct TerrainMetalView: UIViewRepresentable {
             let lat = refLat, lon = refLon
             let camElevM = Double(camElev), hs = Double(exaggeration)
             let ringProfile = farProfile           // main-thread snapshot for the worker
+            let ringGen = farProfileGen            // which ring that profile reflects
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 let horizon = Self.buildHorizon(dem: dem, far: far, refLat: lat, refLon: lon,
                                                 camElevMeters: camElevM, heightScale: hs,
@@ -1818,6 +1781,7 @@ struct TerrainMetalView: UIViewRepresentable {
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.cachedHorizon = horizon
+                    self.cachedHorizonRingGen = ringGen
                     self.rebuildCelestial()
                 }
             }
@@ -1850,6 +1814,7 @@ struct TerrainMetalView: UIViewRepresentable {
         private func rebuildCelestial() {
             guard let horizon = cachedHorizon else { return }
             let lat = refLat, lon = refLon
+            let ringGen = cachedHorizonRingGen  // ring this pass's occlusion reflects
             let date = displayDate
             let displayTZ = displayTimeZone     // main-thread snapshot for the worker
             Self.celestialQueue.async { [weak self] in
@@ -1873,13 +1838,14 @@ struct TerrainMetalView: UIViewRepresentable {
                 // remote viewpoint shows times shifted by the UTC gap.
                 let fmt = Self.tagFormatter
                 fmt.timeZone = displayTZ
+                ClockText.applyTimeStyle(to: fmt)   // 12/24h per the menu override or locale
 
                 // Per-body: samples flagged visible (above the ridge skyline) + the
-                // ridge-crossing rise/set tags (first ↑ and first ↓), plus the
+                // ridge-crossing rise/set tags (first ↑, LAST ↓), plus the
                 // crossing INSTANTS themselves (the Time card's visibility window).
                 func build(_ path: Ephemeris.Path, color: UIColor)
                     -> (samples: [SkyArcOverlayView.Sample], tags: [SkyArcOverlayView.Tag],
-                        firstUp: Date?, firstDown: Date?) {
+                        firstUp: Date?, lastDown: Date?) {
                     // Ridge clearance per sample, computed once and shared by the
                     // arc pass and the tag pass below (which used to re-derive it).
                     let clearance = path.samples.map {
@@ -1909,25 +1875,38 @@ struct TerrainMetalView: UIViewRepresentable {
                                              visible: c >= 0))
                         prev = (az, el, c)
                     }
-                    var tags: [SkyArcOverlayView.Tag] = []
-                    var firstUp: Date?, firstDown: Date?
+                    // Collect ALL ridge crossings, then keep only the day's
+                    // OUTER pair: the FIRST rise into view and the LAST drop
+                    // out of it. The old "first ↓" broke whenever the arc
+                    // slipped behind a tall peak mid-day — that temporary dip
+                    // supplied the ↓ tag and the card's "last visible" hours
+                    // early. Dips still read on the arc itself (its hidden
+                    // segments); they're just not the day's rise/set.
+                    var crossings: [(rising: Bool, az: Double, date: Date)] = []
                     for i in 1..<path.samples.count {
                         let p0 = path.samples[i - 1].position, p1 = path.samples[i].position
                         let c0 = clearance[i - 1]
                         let c1 = clearance[i]
                         guard c0 != c1, (c0 <= 0) != (c1 <= 0) else { continue }
-                        let rising = c1 > c0
-                        if (rising && firstUp != nil) || (!rising && firstDown != nil) { continue }
                         let f = c0 / (c0 - c1)
                         let az = p0.azimuthDeg + f * shortestDelta(p0.azimuthDeg, p1.azimuthDeg)
                         let date = path.samples[i - 1].date.addingTimeInterval(
                             f * path.samples[i].date.timeIntervalSince(path.samples[i - 1].date))
-                        tags.append(.init(
-                            dir: SkyArcOverlayView.enu(azimuthDeg: az, elevationDeg: horizonAt(az)),
-                            text: "\(rising ? "↑" : "↓") \(fmt.string(from: date))", color: color))
-                        if rising { firstUp = date } else { firstDown = date }
+                        crossings.append((c1 > c0, az, date))
                     }
-                    return (samples, tags, firstUp, firstDown)
+                    var tags: [SkyArcOverlayView.Tag] = []
+                    var firstUp: Date?, lastDown: Date?
+                    let outer = [crossings.first(where: { $0.rising }),
+                                 crossings.last(where: { !$0.rising })]
+                    for cr in outer.compactMap({ $0 }) {
+                        tags.append(.init(
+                            dir: SkyArcOverlayView.enu(azimuthDeg: cr.az,
+                                                       elevationDeg: horizonAt(cr.az)),
+                            text: "\(cr.rising ? "↑" : "↓") \(fmt.string(from: cr.date))",
+                            color: color))
+                        if cr.rising { firstUp = cr.date } else { lastDown = cr.date }
+                    }
+                    return (samples, tags, firstUp, lastDown)
                 }
 
                 // TRUE (astronomical-horizon) rise/set: the sun's upper limb
@@ -1971,7 +1950,7 @@ struct TerrainMetalView: UIViewRepresentable {
                 let sunRiseSet = trueRiseSet(paths.sun)
                 let sunTimes = PanoramaViewModel.SunTimes(
                     sunrise: sunRiseSet.rise, sunset: sunRiseSet.set,
-                    firstVisible: sun.firstUp, lastVisible: sun.firstDown)
+                    firstVisible: sun.firstUp, lastVisible: sun.lastDown)
                 let sunNow = Ephemeris.sunPosition(date: date, latitude: lat, longitude: lon)
                 let moonNow = Ephemeris.moonPosition(date: date, latitude: lat, longitude: lon)
                 let sunDisc = SkyArcOverlayView.Disc(
@@ -2058,10 +2037,17 @@ struct TerrainMetalView: UIViewRepresentable {
                         so.moonIlluminated = moonIllum
                         so.moonWaxing = moonWaxing
                         self.celestialRef = (lat, lon)
+                        self.celestialRingGen = ringGen
                         self.skySunENU = skySun
                         self.reportNight()
                         self.onSunTimes(sunTimes)
                         self.view?.setNeedsDisplay()
+                        // Release a first-load `.ready` waiting on the sky
+                        // (see bakeProgressive's first-image branch).
+                        if let cb = self.onCelestialInstalled {
+                            self.onCelestialInstalled = nil
+                            cb()
+                        }
                     }
                     // A scene reload is in flight: hold the content and land
                     // it with the panorama swap, not over the still-displayed
@@ -2069,8 +2055,15 @@ struct TerrainMetalView: UIViewRepresentable {
                     // rebuild can still describe the OLD location (live-clock
                     // tick before the new DEM installs), and the swap must
                     // not apply that over the new scene.
-                    if self.isReloading || self.rebakePending {
-                        self.pendingCelestialApply = (lat, lon, apply)
+                    // EXCEPT when the first-load barrier is waiting on this very
+                    // content (onCelestialInstalled set, refs match): the pano
+                    // is already installed and no swap is coming — stashing
+                    // would deadlock the reveal. Apply directly instead.
+                    let matchesCurrent = abs(lat - self.refLat) < 1e-6
+                        && abs(lon - self.refLon) < 1e-6
+                    if (self.isReloading || self.rebakePending)
+                        && !(self.onCelestialInstalled != nil && matchesCurrent) {
+                        self.pendingCelestialApply = (lat, lon, ringGen, apply)
                     } else {
                         apply()
                     }
@@ -2149,7 +2142,8 @@ struct TerrainMetalView: UIViewRepresentable {
         }
 
         private static func buildAnchors(
-            peaks: [Peak], lakes: [Peak] = [], dem: DEMTile, far: DEMTile?, refLat: Double, refLon: Double,
+            peaks: [Peak], lakes: [Peak] = [], savedSpots: [Peak] = [],
+            dem: DEMTile, far: DEMTile?, refLat: Double, refLon: Double,
             camElevMeters: Double, heightScale: Double,
             depth: [Float], depthW: Int, depthH: Int, skyDepth: Double, panoElevMax: Double,
             ringProfile: FarHorizon.Profile?
@@ -2177,12 +2171,28 @@ struct TerrainMetalView: UIViewRepresentable {
             // (info card / search say so) but deliberately unlabeled — it never
             // becomes an anchor.
             enum Verdict: UInt8 { case skipped = 0, shown, occluded, floating, ringVisible }
-            // Per-peak summit-snap radius: 300 m by default (catalog coords are
-            // often off the rendered summit), but capped at ~45% of the distance
-            // to the NEAREST OTHER named peak — so a labelled false summit snaps
-            // to ITS OWN top instead of stealing the main summit next door (which
-            // would stack both labels on one point). Neighbors found via a coarse
-            // grid hash (one ring covers the 667 m that could cap a 300 m radius).
+            // ---- Deterministic summit CLAIMING --------------------------------
+            // The old scheme let every peak independently grab the highest cell
+            // within its radius, with a SYMMETRIC neighbor cap — two failure
+            // modes, both live on the Matterhorn: Épaule de Furggen 157 m away
+            // crushed the Matterhorn's own snap radius to 71 m, and the
+            // void-filled SRTM summit (3567 m where the mountain is 4478!) put
+            // the massif's highest DRAWN cell (4230 m) over Pic Tyndall — whose
+            // independent snap then claimed the drawn apex while the Matterhorn
+            // label sat visibly below it. Now:
+            //  1. Radius caps are ASYMMETRIC: only a HIGHER catalog peak shrinks
+            //     a neighbor's reach (a false summit must never starve the main
+            //     peak's), ties broken by id for determinism.
+            //  2. Peaks snap SERIALLY in descending catalog elevation, each
+            //     claiming its cell (plus a one-cell halo) — the dominant peak
+            //     of a cluster always gets the best cell, subordinates take the
+            //     next-best, never a race.
+            //  3. A dominant whose best cell UNDERSHOOTS its catalog height by
+            //     >150 m (the void-fill signature) extends its scan once to
+            //     600 m so it can claim the massif's true drawn apex; and
+            //     cells above a peak's own height carry an overshoot penalty
+            //     (see summitCellNear), so shoulders prefer their own tops.
+            let effElev: [Double] = peaks.map { $0.elevationMeters }
             var snapRadius = [Double](repeating: 300, count: peaks.count)
             if peaks.count > 1 {
                 let cellLat = 0.006
@@ -2199,10 +2209,12 @@ struct TerrainMetalView: UIViewRepresentable {
                     var nn = Double.infinity
                     for dla in -1...1 {
                         for dlo in -1...1 {
-                            // Saddles never snap, so they don't compete for summit cells —
-                            // don't let them shrink a real summit's snap radius.
+                            // Saddles never snap; LOWER peaks never shrink a
+                            // higher one's reach (asymmetric cap, rule 1).
                             for j in grid[cellKey(la + Int64(dla), lo + Int64(dlo)), default: []]
-                            where j != i && !peaks[j].isSaddle {
+                            where j != i && !peaks[j].isSaddle
+                                && (effElev[j] > effElev[i]
+                                    || (effElev[j] == effElev[i] && peaks[j].id < peaks[i].id)) {
                                 let q = peaks[j]
                                 let d = hypot((q.latitude - p.latitude) * mLat,
                                               (q.longitude - p.longitude) * mLon)
@@ -2213,18 +2225,72 @@ struct TerrainMetalView: UIViewRepresentable {
                     if nn * 0.45 < 300 { snapRadius[i] = max(40, nn * 0.45) }
                 }
             }
+            // Serial claim pass (rules 2–3). Cheap: one small window scan per
+            // peak (~tens of ms across the catalog), and it makes the whole
+            // assignment order-deterministic.
+            var snappedCell = [(lat: Double, lon: Double, elev: Float)?](
+                repeating: nil, count: peaks.count)
+            do {
+                var claimed = Set<Int64>()
+                func claimKey(_ la: Double, _ lo: Double) -> Int64 {
+                    // Half-arc-second bins: finer than any tier's cell grid.
+                    Int64(((la + 90) * 7200).rounded()) &* 4_000_000
+                        &+ Int64(((lo + 180) * 7200).rounded())
+                }
+                let order = peaks.indices.sorted {
+                    effElev[$0] == effElev[$1] ? peaks[$0].id < peaks[$1].id
+                                               : effElev[$0] > effElev[$1]
+                }
+                for i in order where !peaks[i].isSaddle {
+                    let p = peaks[i]
+                    let inNear = dem.contains(lat: p.latitude, lon: p.longitude)
+                    let tile = inNear ? dem : (far ?? dem)
+                    guard tile.contains(lat: p.latitude, lon: p.longitude) else { continue }
+                    let target = p.elevationMeters > 0 ? Float(p.elevationMeters) : nil
+                    let excluded: (Double, Double) -> Bool = { claimed.contains(claimKey($0, $1)) }
+                    var s = tile.summitCellNear(lat: p.latitude, lon: p.longitude,
+                                                radiusMeters: snapRadius[i],
+                                                targetElev: target, isExcluded: excluded)
+                    if let target, target - s.elev > 150, snapRadius[i] < 600 {
+                        // Void-shaved summit: reach out for the drawn apex.
+                        s = tile.summitCellNear(lat: p.latitude, lon: p.longitude,
+                                                radiusMeters: 600,
+                                                targetElev: target, isExcluded: excluded)
+                    }
+                    snappedCell[i] = s
+                    let halo = tile.cellsize
+                    for dla in -1...1 {
+                        for dlo in -1...1 {
+                            claimed.insert(claimKey(s.lat + Double(dla) * halo,
+                                                    s.lon + Double(dlo) * halo))
+                        }
+                    }
+                }
+            }
             // Peaks occupy [0, peaks.count); lakes [peaks.count, total). Lakes skip
             // the summit snap (a lake would "snap" onto its shoreline ridge!) and the
             // floating-sky cull (a surface point can't float): they anchor at the DEM
             // surface elevation of the catalog coordinate.
-            let total = peaks.count + lakes.count
+            // Combined index space: [0, peaks) peaks, [peaks, lakeEnd) lakes,
+            // [lakeEnd, total) saved spots. Saved spots anchor at their exact
+            // coordinate like lakes/saddles (no summit snap) and are never in the
+            // peaks-only summit-claiming pass above.
+            let lakeEnd = peaks.count + lakes.count
+            let total = lakeEnd + savedSpots.count
             var results = [PeakLabelOverlayView.Anchor?](repeating: nil, count: total)
             var verdicts = [UInt8](repeating: 0, count: total)
+            // Per-lake water-snap provenance, for the same-name dedup below:
+            // which candidate RING the anchor came from (0 = the label sat on
+            // or beside real water — most trustworthy) and its surface height.
+            var waterMeta = [(ring: Int32, elev: Float)](repeating: (.max, 0), count: total)
             results.withUnsafeMutableBufferPointer { res in
                 verdicts.withUnsafeMutableBufferPointer { verd in
+                    waterMeta.withUnsafeMutableBufferPointer { wm in
                     DispatchQueue.concurrentPerform(iterations: total) { i in
-                        let isWater = i >= peaks.count
-                        let peak = isWater ? lakes[i - peaks.count] : peaks[i]
+                        let isSavedSpot = i >= lakeEnd
+                        let isWater = i >= peaks.count && i < lakeEnd
+                        let peak = isSavedSpot ? savedSpots[i - lakeEnd]
+                            : isWater ? lakes[i - peaks.count] : peaks[i]
                         let watched = Self.labelWatch.map { peak.name.lowercased().contains($0) } ?? false
                         func watch(_ msg: String) {
                             if watched { NSLog("labelWatch %@: %@", peak.name, msg) }
@@ -2299,10 +2365,21 @@ struct TerrainMetalView: UIViewRepresentable {
                             // Nearer, tier-rendered terrain can still block it.
                             // The ring is NOT in the depth map, so any terrain at
                             // its pixel is in front of it — visible only on sky.
+                            // Judge at the angle the peak is DRAWN at (the ring
+                            // silhouette it gets pinned to), NOT its catalog
+                            // angle: when the max-pooled ring understates a
+                            // giant, the catalog angle samples a sky pixel just
+                            // above the front ridge while the drawn haze sits
+                            // BEHIND it — Mount Adams from Hibox Mountain read
+                            // "Visible" with its dot pinned into the front
+                            // ridge's ground. Half a texel up so an exactly
+                            // flush ridge doesn't false-occlude the boundary.
+                            let pinnedTan = min(tanEl, Double(prof.tanEl[bin]))
                             if depthW > 0 {
                                 var uu = az / (2 * .pi)
                                 uu -= floor(uu)
-                                let vv = 0.5 - 0.5 * atan(tanEl) / panoElevMax
+                                let el = atan(pinnedTan) + panoElevMax / Double(depthH)
+                                let vv = 0.5 - 0.5 * el / panoElevMax
                                 let mx = min(depthW - 1, max(0, Int(uu * Double(depthW))))
                                 let my = min(depthH - 1, max(0, Int(vv * Double(depthH))))
                                 if Double(depth[my * depthW + mx]) < skyDepth {
@@ -2320,7 +2397,6 @@ struct TerrainMetalView: UIViewRepresentable {
                             // max-pooled ETOPO crest, and an unpinned dot then
                             // floated in the sky over the drawn haze.
                             guard (peak.prominenceMeters ?? 0) >= 1500 else { return }
-                            let pinnedTan = min(tanEl, Double(prof.tanEl[bin]))
                             res[i] = .init(
                                 peak: peak,
                                 direction: SIMD3<Float>(Float(dE), Float(dN), Float(pinnedTan * d)),
@@ -2336,31 +2412,120 @@ struct TerrainMetalView: UIViewRepresentable {
                             watch(String(format: "skipped: %.0f m beyond reach %.0f m", approxHoriz, maxDist))
                             return
                         }
-                        // Snap to the highest DEM cell near the catalog coord, and use the DEM
-                        // elevation — so the label sits on the rendered summit, not the (often
-                        // offset) catalog point/height. Near peaks snap on the high-res tile.
-                        // Lakes AND saddles/gaps anchor at the DEM elevation of the point
-                        // itself, no snap: a saddle is a LOW point between summits, and the
-                        // summit snap dragged its label uphill onto the neighboring peak.
-                        let hi = isWater || peak.isSaddle
+                        // Peaks use the CLAIMED summit cell from the serial
+                        // assignment pass above (deterministic, contention-
+                        // free); the label then sits on the rendered summit,
+                        // not the (often offset) catalog point/height. Lakes
+                        // AND saddles/gaps anchor at the DEM elevation of the
+                        // point itself, no snap: a saddle is a LOW point
+                        // between summits, and a summit snap dragged its label
+                        // uphill onto the neighboring peak.
+                        // Water snaps DOWN to the actual nearby surface — some
+                        // lake catalog points sit on the shore slope (Ross
+                        // Lake's is 430 m above the water), and the dot rode
+                        // the mountainside. The march + occlusion then judge
+                        // the surface point, which is also more honest.
+                        var hi = peak.isSaddle || isWater || isSavedSpot
                             ? (lat: peak.latitude, lon: peak.longitude,
                                elev: snapTile.elevation(lat: peak.latitude, lon: peak.longitude))
-                            : snapTile.highestNear(lat: peak.latitude, lon: peak.longitude,
-                                                   radiusMeters: snapRadius[i])
+                            : (snappedCell[i]
+                               ?? (lat: peak.latitude, lon: peak.longitude,
+                                   elev: snapTile.elevation(lat: peak.latitude, lon: peak.longitude)))
                         // Forward mapping matching the shader's corrected sampling:
                         // easting scaled by cos at the FEATURE's latitude (meridian
                         // convergence), northing plus the geodesic bulge. atan2(east,
                         // north) then equals the great-circle compass bearing, so the
                         // label direction, the rendered summit and the real world agree.
-                        let east = (hi.lon - refLon) * 111_320.0 * max(cos(hi.lat * .pi / 180), 0.01)
-                        let north = (hi.lat - refLat) * mLat + east * east * tanRefOver2R
-                        let horiz = (east * east + north * north).squareRoot()
-                        if horiz < 80 || horiz > maxDist {
-                            watch(String(format: "skipped: snapped horiz %.0f m outside [80, %.0f]", horiz, maxDist))
+                        func geometry(_ pt: (lat: Double, lon: Double, elev: Float))
+                            -> (east: Double, north: Double, horiz: Double,
+                                apparentUp: Double, sightAngle: Double) {
+                            let east = (pt.lon - refLon) * 111_320.0 * max(cos(pt.lat * .pi / 180), 0.01)
+                            let north = (pt.lat - refLat) * mLat + east * east * tanRefOver2R
+                            let horiz = (east * east + north * north).squareRoot()
+                            let up = Double(pt.elev) * heightScale - curvatureK * horiz * horiz - camElevMeters
+                            return (east, north, horiz, up, atan2(up, horiz) * 180 / .pi)
+                        }
+                        var g = geometry(hi)
+                        if !isWater, g.horiz < 80 || g.horiz > maxDist {
+                            watch(String(format: "skipped: snapped horiz %.0f m outside [80, %.0f]", g.horiz, maxDist))
                             return
                         }
-                        let apparentUp = Double(hi.elev) * heightScale - curvatureK * horiz * horiz - camElevMeters
-                        let sightAngle = atan2(apparentUp, horiz) * 180 / .pi
+                        // WATER: the dot belongs on the nearest VISIBLE water.
+                        // Lake catalog points can sit on the shore slope (Ross
+                        // Lake's is 430 m above the surface — the dot rode the
+                        // mountainside), and the nearest surface cell alone can
+                        // hide behind the shore ridge. So try surface CANDIDATES
+                        // (one per search ring, stepping deeper into open
+                        // water) and anchor at the first that passes the same
+                        // depth pre-pass + exact-march judgment the single
+                        // point used to get. None visible = honestly occluded.
+                        if isWater {
+                            func visible(_ pt: (lat: Double, lon: Double, elev: Float),
+                                         _ gg: (east: Double, north: Double, horiz: Double,
+                                                apparentUp: Double, sightAngle: Double)) -> Bool {
+                                var bearing = atan2(gg.east, gg.north)
+                                if bearing < 0 { bearing += 2 * .pi }
+                                // Depth pre-pass (near tier only; see the old
+                                // water notes — far cells made the pixel lie).
+                                var drawnAtLake = depthW == 0 || farWater
+                                if depthW > 0, !farWater {
+                                    var uu = bearing / (2 * .pi)
+                                    uu -= floor(uu)
+                                    let vv = 0.5 - 0.5 * (gg.sightAngle * .pi / 180) / panoElevMax
+                                    let mx = min(depthW - 1, max(0, Int(uu * Double(depthW))))
+                                    let my = min(depthH - 1, max(0, Int(vv * Double(depthH))))
+                                    let dC = Double(depth[my * depthW + mx])
+                                    // Slant→horizontal (a summit eye looks DOWN
+                                    // at its lakes; the slant runs long).
+                                    let dH = dC * cos(gg.sightAngle * .pi / 180)
+                                    let band = max(150, gg.horiz * 0.08)
+                                    drawnAtLake = dC < skyDepth && abs(dH - gg.horiz) <= band
+                                }
+                                return drawnAtLake && !Self.waterSightlineOccluded(
+                                    eyeLat: refLat, eyeLon: refLon,
+                                    featLat: pt.lat, featLon: pt.lon,
+                                    horiz: gg.horiz, apparentUp: gg.apparentUp,
+                                    camElevMeters: camElevMeters, heightScale: heightScale,
+                                    curvatureK: curvatureK, dem: dem, far: far)
+                            }
+                            var found = false
+                            // Far-tier water is verdict-only (never dotted) —
+                            // judge just the label point and skip the ring
+                            // scans: 2,000+ far lakes × ~11k-cell scans was
+                            // ~90% of a 20 s anchor build.
+                            let candidates = farWater
+                                ? [(lat: peak.latitude, lon: peak.longitude,
+                                    elev: snapTile.elevation(lat: peak.latitude,
+                                                             lon: peak.longitude))]
+                                : snapTile.waterSurfaceCandidates(
+                                    lat: peak.latitude, lon: peak.longitude)
+                            for (ci, cand) in candidates.enumerated() {
+                                let cg = geometry(cand)
+                                guard cg.horiz >= 80, cg.horiz <= maxDist else { continue }
+                                if visible(cand, cg) {
+                                    hi = cand; g = cg; found = true
+                                    wm[i] = (Int32(ci), cand.elev)
+                                    watch(String(format: "WATER visible at candidate %.0f m out, elev %.0f",
+                                                 cg.horiz, Double(cand.elev)))
+                                    break
+                                }
+                            }
+                            if !found {
+                                verd[i] = Verdict.occluded.rawValue
+                                return
+                            }
+                            if farWater {
+                                // Visible, but no dot (far-tier water is
+                                // judged-only) — the search/card verdicts pick
+                                // this up exactly like the ring peaks.
+                                verd[i] = Verdict.ringVisible.rawValue
+                                watch("ring-visible: far-tier water, judged by the march only")
+                                return
+                            }
+                        }
+                        let east = g.east, north = g.north
+                        let horiz = g.horiz, apparentUp = g.apparentUp
+                        let sightAngle = g.sightAngle
                         // Depth-map azimuth = the anchor's own rendered azimuth (NOT a
                         // separately-derived geographic bearing), so the occlusion
                         // lookup can never sample a different column than the summit
@@ -2389,74 +2554,9 @@ struct TerrainMetalView: UIViewRepresentable {
                         // distant lakes labeled onto ridges kilometers in front of
                         // them. An exact CPU march along the sightline (same
                         // apparent-height math as this anchor) has none of that.
-                        if isWater {
-                            // Cheap conservative pre-pass: if the rendered terrain
-                            // at the lake's OWN pixel already reaches the lake's
-                            // distance, the water itself is drawn there — visible,
-                            // no march needed. (Strict center-texel + tight margin:
-                            // the old false-visibles came from a 3×3 MAX depth and
-                            // an 18% margin, not from this test.) Only the
-                            // ambiguous rim-grazing cases fall through to the
-                            // march, and those exit early at their occluder —
-                            // without this, a summit viewpoint marched hundreds of
-                            // clear sightlines end-to-end (~seconds of CPU).
-                            // Water uses the PEAKS' depth principle — which
-                            // holds up in practice — made stricter: the render
-                            // must have drawn terrain at the lake's own pixel
-                            // that reaches ABOUT the lake's distance. Center
-                            // texel only (the 3×3 let beyond-ridge texels vouch
-                            // for hidden lakes), sky neutral, no rescue walk,
-                            // and a SYMMETRIC band: much-nearer terrain is an
-                            // occluding slope, much-farther means the basin
-                            // wasn't drawn at all — either way no dot. The
-                            // exact sightline march must ALSO agree.
-                            // Far-tier water skips the depth pre-pass entirely
-                            // (its far cells are what made the pixel test lie);
-                            // the march decides alone.
-                            var drawnAtLake = depthW == 0 || farWater
-                            if depthW > 0, !farWater {
-                                var uu = bearing / (2 * .pi)
-                                uu -= floor(uu)
-                                let vv = 0.5 - 0.5 * (sightAngle * .pi / 180) / panoElevMax
-                                let mx = min(depthW - 1, max(0, Int(uu * Double(depthW))))
-                                let my = min(depthH - 1, max(0, Int(vv * Double(depthH))))
-                                let dC = Double(depth[my * depthW + mx])
-                                // The depth map stores SLANT distance along the ray;
-                                // `horiz` is horizontal. At the shallow angles peaks
-                                // live at the two agree, but a summit eye looks DOWN
-                                // at its lakes: Colchuck from Dragontail sits at −35°,
-                                // where the slant runs ~22% long — far past the 8%
-                                // band, vetoing a lake drawn dead-on at its own pixel
-                                // ("Visible" card, no dot, until you descend and the
-                                // angle flattens). Compare horizontally.
-                                let dH = dC * cos(sightAngle * .pi / 180)
-                                let band = max(150, horiz * 0.08)
-                                drawnAtLake = dC < skyDepth && abs(dH - horiz) <= band
-                            }
-                            let occluded = !drawnAtLake || Self.waterSightlineOccluded(
-                                eyeLat: refLat, eyeLon: refLon,
-                                featLat: hi.lat, featLon: hi.lon,
-                                horiz: horiz, apparentUp: apparentUp,
-                                camElevMeters: camElevMeters, heightScale: heightScale,
-                                curvatureK: curvatureK, dem: dem, far: far)
-                            if Self.labelDebug, horiz < 25_000 {
-                                NSLog("labelDebug WATER %@ at %.0f m: %@%@",
-                                      peak.name, horiz, occluded ? "OCCLUDED" : "visible",
-                                      drawnAtLake ? " (drawn at pixel)" : " (not drawn at pixel)")
-                            }
-                            if occluded {
-                                verd[i] = Verdict.occluded.rawValue
-                                return
-                            }
-                            if farWater {
-                                // Visible, but no dot (see the far-water note
-                                // above) — the search/card verdict set picks
-                                // this up exactly like the ring peaks.
-                                verd[i] = Verdict.ringVisible.rawValue
-                                watch("ring-visible: far-tier water, judged by the march only")
-                                return
-                            }
-                        } else if depthW > 0 {
+                        // (Water was judged above, candidate by candidate —
+                        // depth pre-pass + exact march; see waterSurfaceCandidates.)
+                        if !isWater, depthW > 0 {
                             var uu = bearing / (2 * .pi)
                             uu -= floor(uu)                                  // wrap to [0,1)
                             let elRad = sightAngle * .pi / 180
@@ -2591,9 +2691,46 @@ struct TerrainMetalView: UIViewRepresentable {
                             direction: SIMD3<Float>(Float(east), Float(north), Float(placedUp)),
                             distanceMeters: horiz,
                             isWater: isWater,
-                            directionTrue: isWater ? nil
+                            isSavedSpot: isSavedSpot,
+                            directionTrue: isWater || isSavedSpot ? nil
                                 : SIMD3<Float>(Float(east), Float(north), Float(trueUp)))
                     }
+                    // ---- Same-name lake dedup ---------------------------------
+                    // The catalog can carry TWO label points for one lake
+                    // (Kachess Lake: one on the water, one stray on the eastern
+                    // hillside whose water-snap latched onto a flat bench 330 m
+                    // ABOVE the surface — two dots, one riding the hill). Rank
+                    // same-named anchored lakes by how trustworthy their snap
+                    // was — the smallest candidate RING first (its label sat
+                    // nearest real water), then the lower surface, then id —
+                    // and drop later ones within 6 km of the winner when their
+                    // surfaces clearly describe the same lake (≤3 m apart:
+                    // split arms of one reservoir) or a bogus perch (>15 m
+                    // apart: a bench impostor). The 3–15 m middle band stays:
+                    // genuine same-named twin tarns at stepped surfaces.
+                    for li in peaks.count..<lakeEnd where res[li] != nil {
+                        let name = lakes[li - peaks.count].name.lowercased()
+                        for lj in peaks.count..<lakeEnd where lj != li
+                            && res[lj] != nil
+                            && lakes[lj - peaks.count].name.lowercased() == name {
+                            // Rank: (ring, elev, id) — the winner survives.
+                            let a = (wm[li].ring, wm[li].elev, lakes[li - peaks.count].id)
+                            let b = (wm[lj].ring, wm[lj].elev, lakes[lj - peaks.count].id)
+                            guard a < b, let di = res[li], let dj = res[lj] else { continue }
+                            let dx = Double(dj.direction.x - di.direction.x)
+                            let dy = Double(dj.direction.y - di.direction.y)
+                            let apart = (dx * dx + dy * dy).squareRoot()
+                            let dElev = abs(wm[lj].elev - wm[li].elev)
+                            if apart < 6_000, dElev <= 3 || dElev > 15 {
+                                NSLog("lakeDedup: would drop %@ (elev %.0f) for %@ (elev %.0f), %.0f m apart",
+                                      lakes[lj - peaks.count].name, Double(wm[lj].elev),
+                                      lakes[li - peaks.count].name, Double(wm[li].elev), apart)
+                                res[lj] = nil
+                                verd[lj] = Verdict.skipped.rawValue
+                            }
+                        }
+                    }
+                }
                 }
             }
             let all = results.compactMap { $0 }
@@ -2602,7 +2739,8 @@ struct TerrainMetalView: UIViewRepresentable {
             // among them also carry anchors (in `all`).
             let ringVisibleIDs = (0..<total).lazy
                 .filter { verdicts[$0] == Verdict.ringVisible.rawValue }
-                .map { $0 < peaks.count ? peaks[$0].id : lakes[$0 - peaks.count].id }
+                .map { $0 < peaks.count ? peaks[$0].id
+                    : $0 < lakeEnd ? lakes[$0 - peaks.count].id : savedSpots[$0 - lakeEnd].id }
             let occludedCount = verdicts.lazy.filter { $0 == Verdict.occluded.rawValue }.count
             let floatingCount = verdicts.lazy.filter { $0 == Verdict.floating.rawValue }.count
             let ringCount = ringVisibleIDs.count
@@ -2624,8 +2762,11 @@ struct TerrainMetalView: UIViewRepresentable {
             // DISTANCE-WEIGHTED — elevation alone made the cap a lottery among
             // hundreds of equal-height alpine tarns, dropping the one right below
             // the viewer in favor of look-alikes 80 km out.
-            var peaksOut = all.filter { !$0.isWater }
+            var peaksOut = all.filter { !$0.isWater && !$0.isSavedSpot }
             var lakesOut = all.filter { $0.isWater }
+            // User saved spots bypass the priority backstop entirely — there are
+            // only ever a handful, and they must always survive to the overlay.
+            let savedOut = all.filter { $0.isSavedSpot }
             peaksOut.sort { $0.peak.priority > $1.peak.priority }
             let peaksShown = peaksOut.count
             let lakesShown = lakesOut.count
@@ -2645,7 +2786,7 @@ struct TerrainMetalView: UIViewRepresentable {
             // The visible set is PRE-backstop (a trimmed summit is still
             // line-of-sight visible) and includes the unlabeled ring giants —
             // the info card and search stay honest either way.
-            return (peaksOut + lakesOut, Set(all.map(\.peak.id)).union(ringVisibleIDs))
+            return (peaksOut + lakesOut + savedOut, Set(all.map(\.peak.id)).union(ringVisibleIDs))
         }
 
         /// Debug: `-labelDebug` logs every cull (with the blocking terrain for
@@ -2767,9 +2908,13 @@ struct TerrainMetalView: UIViewRepresentable {
                 if reuseAnchors, let last = lastAnchorState {
                     // Anchors are already correct for this scene: stage them for
                     // the swap directly — the bake is the only thing to wait for.
+                    // The overlay already holds this exact set, so the swap leaves
+                    // its dots in place (see pendingAnchorsUnchanged).
                     pendingAnchors = (last.anchors, last.visibleIDs)
+                    pendingAnchorsUnchanged = true
                 } else {
                     pendingAnchors = nil
+                    pendingAnchorsUnchanged = false
                     // The new labels compute concurrently with the bake (they render
                     // their own depth map from the new uniforms, independent of the
                     // displayed image); `installAnchors` stashes the result and the
@@ -2790,6 +2935,7 @@ struct TerrainMetalView: UIViewRepresentable {
                         // Never strand a held first-scene .ready (see installAnchors).
                         if let cb = self.onAnchorsInstalled { self.onAnchorsInstalled = nil; cb() }
                         self.pendingAnchors = nil
+                        self.pendingAnchorsUnchanged = false
                         self.pendingOnReady = nil
                         self.rebakePending = false
                         self.needsRebakeOnActivate = true
@@ -2828,10 +2974,31 @@ struct TerrainMetalView: UIViewRepresentable {
                 self.view?.setNeedsDisplay()
                 NSLog("Full bake (w=%d) %.0f ms — %@", Self.fullPanoramaWidth, Self.ms(since: t0),
                       self.anchorBuildInFlight ? "waiting for labels" : "labels already in")
+                // `.ready` (the loading-cover lift) waits for BOTH overlays:
+                // first the label anchors, then the celestial pass (sun/moon
+                // arcs + stars) — otherwise whichever loses the race against
+                // the bake pops in a beat after the reveal.
+                let awaitCelestialThenReady = { [weak self] in
+                    guard let self else { onReady(); return }
+                    let celestialCurrent = {
+                        guard let ref = self.celestialRef else { return false }
+                        return abs(ref.lat - self.refLat) < 1e-6
+                            && abs(ref.lon - self.refLon) < 1e-6
+                    }
+                    // Consume any stash that raced in between the install above
+                    // and this barrier (it would otherwise wait forever — the
+                    // first-load path never runs the swap that drains it).
+                    if !celestialCurrent() { self.applyPendingCelestialIfCurrent() }
+                    if celestialCurrent() {
+                        onReady()
+                    } else {
+                        self.onCelestialInstalled = onReady
+                    }
+                }
                 if self.anchorBuildInFlight {
-                    self.onAnchorsInstalled = onReady   // .ready lands with the labels
+                    self.onAnchorsInstalled = awaitCelestialThenReady
                 } else {
-                    onReady()
+                    awaitCelestialThenReady()
                 }
             }
         }
@@ -2941,12 +3108,16 @@ struct TerrainMetalView: UIViewRepresentable {
 
         @objc func handlePan(_ g: UIPanGestureRecognizer) {
             guard let v = view else { return }
-            // ANY device-tracked view (AR or 3D): drag nudges a YAW-ONLY calibration
-            // offset on top of the live tracking — pitch is gravity-anchored and never
-            // meaningfully wrong, and a second drag axis just made horizontal
-            // alignment harder. The view keeps following the phone.
+            // ANY device-tracked view (AR or 3D): drag nudges a calibration
+            // offset on top of the live tracking — AXIS-LOCKED to yaw
+            // (horizontal drag) or the pitch trim (vertical drag), decided by
+            // the drag's first centimeter and held for the whole gesture. One
+            // finger serves both axes precisely BECAUSE of the lock: fixing
+            // the horizontal alignment can't disturb the vertical one, and
+            // vice versa — no diagonal drift. The view keeps following the
+            // phone.
             if let basis = deviceBasis, mode.usesCamera || !manualAlignment {
-                applyYawDrag(g, in: v, basis: basis)
+                applyAlignDrag(g, in: v, basis: basis)
                 if g.state == .ended { onAlignmentNudged() }
                 return
             }
@@ -2966,19 +3137,30 @@ struct TerrainMetalView: UIViewRepresentable {
             v.setNeedsDisplay()
         }
 
-        /// Yaw-only drag alignment on top of device tracking. Scaled by the rendered
-        /// focal length → 1 finger-point ≈ the angle that point subtends on screen,
-        /// so the overlay drags 1:1 with the image (AR uses the real camera FOV).
+        /// Axis lock for the one-finger align drag: `.undecided` while the
+        /// first ~10 pt of movement accumulates, then yaw or pitch for the
+        /// REST of the gesture — either left↔right or up↕down, never diagonal.
+        private enum AlignAxis { case undecided, yaw, pitch }
+        private var alignAxis = AlignAxis.undecided
+        private var alignAccum = CGPoint.zero
+
+        /// One-finger drag alignment on top of device tracking. Scaled by the
+        /// rendered focal length → 1 finger-point ≈ the angle that point
+        /// subtends on screen, so the overlay drags 1:1 with the image (AR
+        /// uses the real camera FOV).
         ///
-        /// The offset lives in WORLD space while the finger moves in SCREEN space —
-        /// take the drag's component along the on-screen gravity-RIGHT axis (same
-        /// right.z/up.z construction the label overlay uses). Without this, rolling
-        /// the phone to landscape broke the mapping: a drag along the horizon didn't
-        /// turn the overlay. Level portrait ⇒ gRight=(1,0) ⇒ dxWorld = t.x, exactly
-        /// the screen-axis behavior. The vertical drag component is deliberately
-        /// discarded.
-        private func applyYawDrag(_ g: UIPanGestureRecognizer, in v: MTKView,
-                                  basis: DeviceAttitude.Basis) {
+        /// The offsets live in WORLD space while the finger moves in SCREEN
+        /// space — the drag is decomposed along the on-screen GRAVITY axes
+        /// (same right.z/up.z construction the label overlay uses), so a
+        /// rolled/landscape phone keeps "along the horizon" turning the view
+        /// and "toward the sky" trimming pitch. Level portrait ⇒ the screen
+        /// axes exactly. Grab-the-world in both: drag right moves the overlay
+        /// right (camera yaws left); drag down pulls the overlay down onto
+        /// terrain it floated above (camera pitches up). Pitch stays a ±8°
+        /// TRIM — it corrects elevation-data error at the eye, not look-around.
+        private func applyAlignDrag(_ g: UIPanGestureRecognizer, in v: MTKView,
+                                    basis: DeviceAttitude.Basis) {
+            if g.state == .began { alignAxis = .undecided; alignAccum = .zero }
             let t = g.translation(in: v)
             g.setTranslation(.zero, in: v)
             let tanHalfV: Double = mode.usesCamera
@@ -2988,43 +3170,40 @@ struct TerrainMetalView: UIViewRepresentable {
                 : Double(tanf(fov * .pi / 360))
             let focalPoints = Double(v.bounds.height) / 2 / max(1e-4, tanHalfV)
             let pointsPerDeg = focalPoints * .pi / 180
-            var dxWorld = Double(t.x)
-            let gLen = hypot(Double(basis.right.z), Double(basis.up.z))
-            if gLen > 0.2 {                     // gravity direction well-defined on screen
-                let gUpX = Double(basis.right.z) / gLen, gUpY = -Double(basis.up.z) / gLen
-                dxWorld = -Double(t.x) * gUpY + Double(t.y) * gUpX   // t · (gUp rotated +90°)
-            }
-            // Grab-the-world: drag right ⇒ overlay moves right (camera yaws left).
-            arYawOffsetDeg += -dxWorld / pointsPerDeg
-            reportARAdjusted()
-            v.setNeedsDisplay()
-        }
-
-        /// Two-finger vertical drag (AR modes only): the PITCH trim. Same
-        /// 1:1-with-the-image scaling and gravity-aware screen mapping as the
-        /// yaw drag, but for the vertical component — grab-the-world: dragging
-        /// down pulls the overlay down onto terrain it was floating above.
-        @objc func handlePitchTrim(_ g: UIPanGestureRecognizer) {
-            guard let v = view, mode.usesCamera, let basis = deviceBasis else { return }
-            let t = g.translation(in: v)
-            g.setTranslation(.zero, in: v)
-            let tanHalfV = Double(arVerticalTanHalfFov(drawableW: Int(v.bounds.width),
-                                                       drawableH: Int(v.bounds.height))
-                                  ?? tanf(fov * .pi / 360))
-            let focalPoints = Double(v.bounds.height) / 2 / max(1e-4, tanHalfV)
-            let pointsPerDeg = focalPoints * .pi / 180
-            // Drag component along on-screen gravity-DOWN (same construction as
-            // the yaw drag's gravity-right — a rolled phone keeps the mapping).
-            var dDown = Double(t.y)
+            // Screen → gravity axes (screen axes as the fallback when gravity
+            // is edge-on to the screen).
+            var gRight = (x: 1.0, y: 0.0), gDown = (x: 0.0, y: 1.0)
             let gLen = hypot(Double(basis.right.z), Double(basis.up.z))
             if gLen > 0.2 {
                 let gUpX = Double(basis.right.z) / gLen, gUpY = -Double(basis.up.z) / gLen
-                dDown = -(Double(t.x) * gUpX + Double(t.y) * gUpY)
+                gRight = (x: -gUpY, y: gUpX)
+                gDown = (x: -gUpX, y: -gUpY)
             }
-            // Overlay down ⇒ camera pitches up (+offset). ±8°: a trim only.
-            arPitchOffsetDeg = max(-8, min(8, arPitchOffsetDeg + dDown / pointsPerDeg))
+            func along(_ a: (x: Double, y: Double), _ p: CGPoint) -> Double {
+                Double(p.x) * a.x + Double(p.y) * a.y
+            }
+            var applied = t
+            if alignAxis == .undecided {
+                // Buffer until the direction is unambiguous, then apply the
+                // WHOLE buffered movement so the lock doesn't eat the first
+                // centimeter of drag.
+                alignAccum.x += t.x
+                alignAccum.y += t.y
+                guard hypot(alignAccum.x, alignAccum.y) >= 10 else { return }
+                let h = along(gRight, alignAccum), d = along(gDown, alignAccum)
+                alignAxis = abs(h) >= abs(d) ? .yaw : .pitch
+                applied = alignAccum
+            }
+            switch alignAxis {
+            case .yaw:
+                arYawOffsetDeg += -along(gRight, applied) / pointsPerDeg
+            case .pitch:
+                arPitchOffsetDeg = max(-8, min(8,
+                    arPitchOffsetDeg + along(gDown, applied) / pointsPerDeg))
+            case .undecided:
+                return
+            }
             reportARAdjusted()
-            if g.state == .ended { onAlignmentNudged() }
             v.setNeedsDisplay()
         }
 
@@ -3095,9 +3274,7 @@ struct TerrainMetalView: UIViewRepresentable {
 
         /// Immersive chrome-hide: the compass + zoom readout are drawn inside
         /// this view (not RootScreen), so they hide here.
-        /// Chrome-hiding inputs: immersive (empty tap) and photo framing.
         private var immersiveChrome = false
-        private var photoFraming = false
 
         /// ft↔m flip: re-set the overlay's anchors so every baked elevation
         /// string re-measures and re-renders in the new units.
@@ -3111,24 +3288,24 @@ struct TerrainMetalView: UIViewRepresentable {
             }
         }
 
+        /// 12h↔24h flip: re-run the celestial pass so the rise/set ↑/↓ tags
+        /// re-format (the strings are baked in rebuildCelestial). Cheap — no DEM
+        /// march, just ephemeris + formatting against the cached skyline.
+        private var clockStamp = ""
+        func setClockStamp(_ stamp: String) {
+            guard stamp != clockStamp else { return }
+            clockStamp = stamp
+            rebuildCelestial()
+        }
+
         func setImmersive(_ hidden: Bool) {
             immersiveChrome = hidden
             refreshOverlayVisibility()
         }
 
-        /// Photo framing: everything not going INTO the photo leaves the
-        /// screen, and the Labels/Compass checkboxes preview live — what you
-        /// see while framing is exactly what the capture composites.
-        func setPhotoFraming(_ on: Bool) {
-            photoFraming = on
-            refreshOverlayVisibility()
-        }
-
         func refreshOverlayVisibility() {
-            container?.compassZoom.isHidden =
-                immersiveChrome || (photoFraming && !captureIncludesCompass)
-            container?.labelOverlay.isHidden =
-                photoFraming && !captureIncludesLabels
+            container?.compassZoom.isHidden = immersiveChrome
+            container?.labelOverlay.isHidden = false
         }
 
         @objc func handleTap(_ g: UITapGestureRecognizer) {
@@ -3231,7 +3408,7 @@ struct TerrainMetalView: UIViewRepresentable {
         /// so only the per-frame resample changes). Every device-tracked view (AR
         /// and 3D) also applies the drag calibration yaw offset; 3D falls back to
         /// gestures only when manual look-around is on (no-IMU environments).
-        /// Shared by draw(in:) and photo capture.
+
         private func currentUniformsWithDeviceBasis(width: Int, height: Int) -> Uniforms {
             var uniforms = makeUniforms(width: width, height: height)
             if let basis = deviceBasis, mode.usesCamera || !manualAlignment {
@@ -3243,8 +3420,7 @@ struct TerrainMetalView: UIViewRepresentable {
             return uniforms
         }
 
-        /// Encode the current mode's view pass into `target`. Shared by draw(in:)
-        /// and photo capture so a new mode can't be wired into one and not the other.
+        /// Encode the current mode's view pass into `target`.
         private func encodeScene(uniforms: Uniforms, into target: MTLTexture,
                                  commandBuffer cb: MTLCommandBuffer, renderer: TerrainRenderer) {
             switch effectiveMode {

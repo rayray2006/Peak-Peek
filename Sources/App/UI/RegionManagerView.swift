@@ -127,7 +127,10 @@ struct RegionManagerView: View {
                         .annotationTitles(.hidden)
                     }
                 }
-                .mapStyle(.standard(elevation: .flat))
+                // Same cartography as the full teleport map — one map style
+                // app-wide. (Flat elevation kept nothing here; the green
+                // coverage overlays read fine over the hybrid imagery.)
+                .mapStyle(.hybrid(elevation: .realistic))
                 .onMapCameraChange(frequency: .continuous) { ctx in visibleRegion = ctx.region }
                 .clipShape(RoundedRectangle(cornerRadius: 14))
                 .overlay(
@@ -325,10 +328,10 @@ struct RegionManagerView: View {
         return DEMFetcher.regionTileCount(south: b.south, north: b.north, west: b.west, east: b.east)
     }
 
-    /// "~60 MB" for a tile-count estimate.
+    /// "~60 MB" for a tile-count estimate. (RegionStore's shared formatter:
+    /// numeric-only, so 0 renders "0 bytes", never the word "Zero".)
     private static func sizeText(tiles: Int) -> String {
-        ByteCountFormatter.string(fromByteCount: Int64(tiles) * approxTileBytes,
-                                  countStyle: .file)
+        RegionStore.byteFormatter.string(fromByteCount: Int64(tiles) * approxTileBytes)
     }
 
     private func downloadSelected() async {

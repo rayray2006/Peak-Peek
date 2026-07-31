@@ -11,8 +11,6 @@ struct PeakInfoPanel: View {
     /// pass for the current viewpoint hasn't finished (no badge shown).
     let isVisible: Bool?
     let isClimbed: Bool
-    /// When the feature was marked "Been" — a quiet calendar note on the card.
-    let beenDate: Date?
     let isBookmarked: Bool
     let onToggleClimbed: () -> Void
     let onToggleBookmark: () -> Void
@@ -21,24 +19,8 @@ struct PeakInfoPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Name left; the quiet been-date rides the row's free space
-            // (stats row stays single-line whatever badges it carries).
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
-                nameText
-                Spacer(minLength: 8)
-                if let beenDate {
-                    // Small and quiet: when you were here.
-                    HStack(spacing: 3) {
-                        Image(systemName: "calendar")
-                            .font(.system(size: 9, weight: .medium))
-                        Text(Self.beenText(beenDate))
-                            .font(PPFont.mono(10))
-                    }
-                    .foregroundStyle(TopoStyle.inkColor.opacity(0.45))
-                    .fixedSize()
-                }
-            }
-            .padding(.trailing, 28)
+            nameText
+                .padding(.trailing, 28)
 
             // Facts with the sightline verdict riding right beside them —
             // pushed to the far edge it read as a stray element.
@@ -142,17 +124,6 @@ struct PeakInfoPanel: View {
     }
 
     /// "Jul 12" this year, "Jul 2025" otherwise — enough to place the memory.
-    private static let dayFormatter: DateFormatter = {
-        let f = DateFormatter(); f.dateFormat = "MMM d"; return f
-    }()
-    private static let yearFormatter: DateFormatter = {
-        let f = DateFormatter(); f.dateFormat = "MMM yyyy"; return f
-    }()
-    private static func beenText(_ date: Date) -> String {
-        Calendar.current.isDate(date, equalTo: Date(), toGranularity: .year)
-            ? dayFormatter.string(from: date) : yearFormatter.string(from: date)
-    }
-
     /// "6,259 ft · 4.2 mi · SE 141°" — elevation, distance, bearing in one
     /// mono line, exactly as the template lays it out.
     private var statsLine: String {

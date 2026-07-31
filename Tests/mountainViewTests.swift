@@ -163,6 +163,29 @@ final class EphemerisTests: XCTestCase {
 // see TerrainMetalView.setMode.)
 
 @MainActor
+final class SaddleNameHeuristicTests: XCTestCase {
+    private func peak(_ name: String) -> Peak {
+        Peak(id: name, name: name, latitude: 0, longitude: 0,
+             elevationMeters: 1000, prominenceMeters: nil)
+    }
+
+    func testSaddleWordsMatchWholeWordsOnly() {
+        XCTAssertTrue(peak("Easy Pass").nameSuggestsSaddle)
+        XCTAssertTrue(peak("Last Chance Pass").nameSuggestsSaddle)
+        XCTAssertTrue(peak("Dip Top Gap").nameSuggestsSaddle)
+        XCTAssertTrue(peak("Col du Galibier").nameSuggestsSaddle)
+        XCTAssertFalse(peak("Compass Rose").nameSuggestsSaddle)
+    }
+
+    func testSummitWordDefeatsAttributiveSaddleWord() {
+        // The peak BESIDE the pass, not a pass: the explicit summit word wins.
+        XCTAssertFalse(peak("Heather Pass Peak").nameSuggestsSaddle)
+        XCTAssertFalse(peak("Pass Mountain").nameSuggestsSaddle)
+        XCTAssertFalse(peak("Gap Point").nameSuggestsSaddle)
+    }
+}
+
+@MainActor
 final class ARYawAnchorMathTests: XCTestCase {
     // The stable-anchor gate and the divergence watchdog both run on circular
     // statistics — the wrap cases are exactly where naive means break.
@@ -243,10 +266,18 @@ final class ProgressSmoothingTests: XCTestCase {
         // A real report BELOW the crept display — the old reset fired here.
         model.renderStatusChanged(.preparingTerrain(progress: 0.11))
         record()
-        // Normal climb through the phase handoff to the bake.
+        // Normal climb through the phase handoff to the bake. The display
+        // sweep is RATE-CAPPED (≈18 pts/s — surges read as jumps), so give
+        // the runloop time to actually sweep up to the reported targets
+        // before asserting how far it climbed.
         for step in stride(from: 0.15, through: 0.9, by: 0.05) {
             model.renderStatusChanged(.rendering(progress: step))
             RunLoop.main.run(until: Date().addingTimeInterval(0.04))
+            record()
+        }
+        let settleUntil = Date().addingTimeInterval(2.5)
+        while Date() < settleUntil {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
             record()
         }
         model.renderStatusChanged(.ready)

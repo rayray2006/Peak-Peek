@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>PeakPeek</string>
+	<string>Peak-Peek</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -17,17 +17,15 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>NSCameraUsageDescription</key>
-	<string>PeakPeek overlays the terrain on the live camera in AR mode.</string>
+	<string>Peak-Peek overlays the terrain on the live camera in AR mode.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>PeakPeek uses your location to render the terrain panorama around you.</string>
+	<string>Peak-Peek uses your location to render the terrain panorama around you.</string>
 	<key>NSMotionUsageDescription</key>
-	<string>PeakPeek uses motion sensors so you can look around by turning the phone.</string>
-	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>PeakPeek saves your captured panorama photos to your library.</string>
+	<string>Peak-Peek uses motion sensors so you can look around by turning the phone.</string>
 	<key>UIAppFonts</key>
 	<array>
 		<string>SpaceGrotesk-Regular.ttf</string>

@@ -89,9 +89,19 @@ final class RegionStore: ObservableObject {
         refreshTotalSize()
     }
 
+    /// File-style byte formatter with the spelled-out forms OFF: the class
+    /// method's default renders 0 bytes as the word "Zero KB" — the Storage
+    /// row read "Zero KB downloaded" instead of "0 MB".
+    static let byteFormatter: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        f.allowsNonnumericFormatting = false
+        return f
+    }()
+
     private func refreshTotalSize() {
-        totalSizeText = ByteCountFormatter.string(
-            fromByteCount: DEMFetcher.downloadedBytes(), countStyle: .file)
+        totalSizeText = Self.byteFormatter.string(
+            fromByteCount: DEMFetcher.downloadedBytes())
     }
 
     /// Tiles sitting in the persistent store that no region references — left
@@ -105,7 +115,7 @@ final class RegionStore: ObservableObject {
     }
 
     func sizeText(_ region: DownloadedRegion) -> String {
-        ByteCountFormatter.string(fromByteCount: Int64(region.byteCount), countStyle: .file)
+        Self.byteFormatter.string(fromByteCount: Int64(region.byteCount))
     }
 
     /// True if (lat, lon) is inside a downloaded region's exact area.

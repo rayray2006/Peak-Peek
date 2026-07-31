@@ -172,10 +172,12 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     /// they don't join the peak directory/search.
     @Published private(set) var nearbyLakes: [Peak] = []
     @Published var selectedPeak: AnnotatedPeak?
-    /// Labels pinned open on the terrain: tapping a dot expands its name label
-    /// and keeps it up; tapping it again collapses it, and a tap on empty
-    /// terrain clears every pin (see select/tapLabel). Only `selectedPeak` —
-    /// the one whose card is up — gets the highlighted dot.
+    /// The ONE label pinned open on the terrain (at most a single element):
+    /// tapping a dot expands its name label — replacing any other open one —
+    /// tapping it again collapses it, and a tap on empty terrain clears it
+    /// (see select/tapLabel). The pin outlives the card's ✕, so the name can
+    /// stay up after the card is dismissed. A Set only for plumbing symmetry
+    /// with the overlay.
     @Published private(set) var pinnedPeakIDs: Set<String> = []
     /// Feature ids with a clear line of sight from the current viewpoint, reported
     /// by the renderer's occlusion pass. nil until the first pass completes, so the
@@ -563,20 +565,35 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     private func progressTick() {
         let gap = targetProgress - shownProgress
         if gap > 0 {
-            // Catch up to real reports quickly (spring-like), never overshooting.
-            shownProgress = min(targetProgress, shownProgress + max(gap * 0.25, 0.004))
+            // Sweep toward real reports at a CAPPED rate. The old spring ate
+            // 25% of the gap per tick: a chunky per-tile target jump surged
+            // the bar 30+ points in half a second, then slammed to a stop
+            // (measured: 47→82% in one second on a cold Rockies load).
+            // ≤0.6 pt/tick ≈ 18 pts/s reads as motion, not a teleport.
+            shownProgress = min(targetProgress,
+                                shownProgress + min(max(gap * 0.06, 0.0035), 0.006))
         } else {
-            // No fresh signal: creep, capped just past the last real value.
-            let cap = min(targetProgress + 0.05, 0.97)
-            shownProgress = min(cap, shownProgress + 0.0025)   // ≈7.5 pts/s
+            // No fresh signal: creep toward a cap just past the last real
+            // report, DECELERATING as it nears — an asymptote, not the old
+            // hard stop (which froze the bar dead for ~6 s between tile
+            // bursts). While RENDERING the cap stretches to 98.5%: the bake
+            // holds its last report at 95% while the label anchors land, and
+            // the bar sat visibly frozen there; now it keeps oozing through
+            // the wait and .ready closes it out.
+            let cap = min(targetProgress + 0.05, inRenderingPhase ? 0.985 : 0.97)
+            let headroom = cap - shownProgress
+            if headroom > 0 {
+                shownProgress = min(cap, shownProgress + max(0.0004, headroom * 0.02))
+            }
         }
         publishProgress()
     }
 
     private func publishProgress() {
-        // @Published churn control: publish only when the DISPLAYED integer
-        // percent (or the phase message) actually changes.
-        let pct = Int((shownProgress * 100).rounded())
+        // @Published churn control: publish only when the displayed HALF-
+        // point (or the phase message) actually changes. Whole-percent quanta
+        // made the slow creep advance in visible once-a-second hops.
+        let pct = Int((shownProgress * 200).rounded())
         let phaseMatches: Bool
         switch status {
         case .preparingTerrain: phaseMatches = !inRenderingPhase
@@ -657,20 +674,20 @@ final class PanoramaViewModel: NSObject, ObservableObject {
                 // record. The old id-only dedup let both through — tapping
                 // the pack's copy summit-snapped "Stand here" uphill of the
                 // gap (Dip Top Gap bug).
-                var merged = Peak.dedupedKeepingFirst(global + bundled + packs + osm)
-                // Normalize the saddle flag by NAME too (whole-word "pass" /
-                // "gap" / "col" / …): OSM occasionally tags a gap as
-                // natural=peak, and legacy pack/cache records predate the
-                // flag — "Easy Pass" drew a plain ink summit dot and summit-
-                // snapped its anchor. One sweep at load time, off-main, so
-                // every consumer (dot tint, anchor snap, stand-here, cards)
-                // sees the same truth.
-                merged = merged.map { p in
+                // Normalize the saddle flag by NAME for the LEGACY sources
+                // only (bundled directory, packs, OSM tile caches — they
+                // predate the flag, so "Easy Pass" drew a plain ink summit
+                // dot). The global DB's kind is AUTHORITATIVE and must not be
+                // second-guessed: "Heather Pass Peak" is natural=peak there,
+                // and the name sweep briefly flipped it to a saddle. Global
+                // first also keeps its verdict over any flipped legacy copy.
+                let legacy = (bundled + packs + osm).map { p in
                     guard !p.isSaddle, p.nameSuggestsSaddle else { return p }
                     var q = p
                     q.isSaddle = true
                     return q
                 }
+                let merged = Peak.dedupedKeepingFirst(global + legacy)
                 // Lakes: label range only (the far-tile radius — matches the
                 // anchor cull), so the published set stays small even in lake
                 // country.
@@ -680,7 +697,15 @@ final class PanoramaViewModel: NSObject, ObservableObject {
                 ) ?? []
                 return (merged, lakes)
             }.value
-            guard let self, self.viewpoint == viewpoint else { return }
+            // Gate on COORDINATES, not the whole Viewpoint. `resolveGPSName`
+            // replaces the viewpoint with a same-coordinate, renamed copy the
+            // moment the reverse-geocode lands — and full-struct equality
+            // (which includes `name`) then treated that rename as a location
+            // change and dropped this result, so a GPS fix could finish with no
+            // peaks and therefore no labels until an unrelated move rebuilt them.
+            guard let self, let current = self.viewpoint,
+                  current.latitude == viewpoint.latitude,
+                  current.longitude == viewpoint.longitude else { return }
             self.allNearbyPeaks = peaks
             self.nearbyLakes = lakes
         }
@@ -709,7 +734,7 @@ final class PanoramaViewModel: NSObject, ObservableObject {
             distanceMeters: distance, exaggeration: terrainExaggeration
         )
         let angle = atan2(apparent, max(1, distance)) * 180 / .pi
-        pinnedPeakIDs.insert(peak.id)
+        pinnedPeakIDs = [peak.id]   // ONE label at a time: replace, never stack
         selectedPeak = AnnotatedPeak(
             peak: peak, azimuthDeg: bearing, elevationAngleDeg: angle, distanceMeters: distance
         )

@@ -100,11 +100,21 @@ final class SkyArcOverlayView: UIView {
         selectedSkyName = nil
     }
 
-    /// Name tag currently shown (set by a tap; nil = none). Hiding on change stops
-    /// the tag flashing the PREVIOUS star's name at the new position for a frame
-    /// (the string/position update happens in the next `project(...)` pass).
+    /// Name tag currently shown (set by a tap; nil = none). On change we hide AND
+    /// clear the tag — with implicit actions off — so the previous star's name
+    /// can't linger: a plain `isHidden = true` fades out over ~0.25s (the default
+    /// layer action) and the layer keeps rendering its OLD string until the next
+    /// `project(...)` pass, which is exactly the "flashes the last name" glitch.
+    /// Wiping it here means the new name pops in clean on the next project.
     var selectedSkyName: String? {
-        didSet { if selectedSkyName != oldValue { skyTagLayer.isHidden = true } }
+        didSet {
+            guard selectedSkyName != oldValue else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            skyTagLayer.isHidden = true
+            skyTagLayer.string = nil
+            CATransaction.commit()
+        }
     }
 
     private let sunArc = CAShapeLayer()

@@ -37,9 +37,9 @@ struct RootScreen: View {
     @State private var mode: TerrainViewMode = .threeD
     @State private var manualAlignment = false
     /// Label density (All / Sparse / Saved / None), persisted across
-    /// launches. Sparse by default: well-separated peaks at 1×, everything
-    /// on zoom-in.
-    @AppStorage("labelDensity") private var labelDensityRaw = LabelDensity.sparse.rawValue
+    /// launches. All by default: every visible feature gets its dot, thinned
+    /// only by the per-frame declutter; the menu can dial it back.
+    @AppStorage("labelDensity") private var labelDensityRaw = LabelDensity.all.rawValue
     private var labelDensity: LabelDensity {
         LabelDensity(rawValue: labelDensityRaw) ?? .all
     }
@@ -59,25 +59,20 @@ struct RootScreen: View {
     /// the search query and the Lists tab live here, not in the panels.
     @State private var searchQuery = ""
     @State private var listsSelection: PeakListKind = .wantToClimb
-    /// Photo capture: token requests a capture; flash confirms the save.
-    /// The menu's Photo button ARMS the shutter popup rather than firing —
-    /// the capture happens on the popup's shutter press, once framed.
-    @State private var captureToken = 0
-    @State private var captureFlash = false
-    @State private var showPhotoShutter = false
-    /// Photo-sheet toggles (template's Labels / Compass chips): what gets
-    /// composited into the captured image. Persisted across launches.
-    @AppStorage("photoIncludesLabels") private var photoIncludesLabels = true
-    @AppStorage("photoIncludesCompass") private var photoIncludesCompass = false
+    /// The Info card (menu ▸ Info): a centered modal explaining the app.
+    /// Shown automatically ONCE, the first time the app ever reaches a
+    /// rendered scene (see the shouldShowInitialLoading observer).
+    @State private var showInfo = false
+    @AppStorage("infoCardSeen") private var infoCardSeen = false
     /// "Save Spot": names the current viewpoint and adds it to the Saved list.
     @State private var showSaveLocation = false
     @State private var saveLocationName = ""
     /// Debug (-openSheet): sheet to present once the first render lands —
     /// presenting during the loading→HUD swap gets torn down with it.
     @State private var debugPendingSheet: ActiveSheet?
-    /// Debug (-openSaveSpot / -openPhoto): same wait-for-render deal.
+    /// Debug (-openSaveSpot / -openInfo): same wait-for-render deal.
     @State private var debugPendingSaveSpot = false
-    @State private var debugPendingPhoto = false
+    @State private var debugPendingInfo = false
     /// Debug (-standOn): feature name to stand on once the render + labels land.
     @State private var debugStandOnName: String?
     /// Debug (-climb/-bookmark): peak names to toggle into the saved lists.
@@ -106,6 +101,7 @@ struct RootScreen: View {
             bookmarkedPeakIDs: peakLists.bookmarkedIDs,
             peaks: model.allNearbyPeaks,
             lakes: model.nearbyLakes,
+            savedSpots: peakLists.savedSpots,
             selectedPeak: model.selectedPeak,
             pinnedPeakIDs: model.pinnedPeakIDs,
             onSelectPeak: { peak in
@@ -135,19 +131,8 @@ struct RootScreen: View {
             onARAdjustedChanged: { arAdjusted = $0 },
             onAlignmentNudged: { alignmentNudges &+= 1 },
             onNightChanged: { isNight = $0 },
-            captureToken: captureToken,
             unitsStamp: unitsRaw,
-            photoFraming: showPhotoShutter,
-            captureIncludesLabels: photoIncludesLabels,
-            captureIncludesCompass: photoIncludesCompass,
-            onPhotoCaptured: { ok in
-                guard ok else { return }
-                UINotificationFeedbackGenerator().notificationOccurred(.success)
-                withAnimation(.easeOut(duration: 0.08)) { captureFlash = true }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                    withAnimation(.easeIn(duration: 0.25)) { captureFlash = false }
-                }
-            },
+            clockStamp: clockRaw,
             immersive: immersive,
             onEmptyTap: { clearedSkyTag in
                 // A tap on nothing: its first job is dismissing whatever is
@@ -167,7 +152,6 @@ struct RootScreen: View {
                     activeSheet = nil
                     consumed = true
                 }
-                guard !showPhotoShutter else { return }   // framing owns the chrome
                 if !consumed {
                     withAnimation(.easeInOut(duration: 0.22)) { immersive.toggle() }
                 }
@@ -203,23 +187,16 @@ struct RootScreen: View {
                 // the rotation snap and dissolves back in at its new positions.
                 Group {
                     hud
-                        // Photo framing hides every non-photo control too —
-                        // the frame is the interface.
-                        .opacity(immersive || showPhotoShutter ? 0 : 1)
-                        .allowsHitTesting(!immersive && !showPhotoShutter)
+                        .opacity(immersive ? 0 : 1)
+                        .allowsHitTesting(!immersive)
                     timePanel
                     regionsPanel
                     listsPanel
                     searchPanel
                     saveSpotPanel
-                    if showPhotoShutter {
-                        photoShutterPopup
-                    }
+                    infoPanel
                 }
                 .opacity(chromeVisible ? 1 : 0)
-                if captureFlash {
-                    Color.white.ignoresSafeArea().allowsHitTesting(false)
-                }
             }
         }
         .animation(.easeInOut(duration: 0.22), value: shouldShowInitialLoading)
@@ -239,13 +216,12 @@ struct RootScreen: View {
         // Theme mode can pin it Day or Night; Auto follows the sky (fed by
         // the renderer's onNightChanged, in the same beat the sky changes).
         .preferredColorScheme(resolvedScheme)
-        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: showPhotoShutter)
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: showSaveLocation)
-        // A panel opening takes over the bottom region — the armed shutter and
-        // the Save Spot sheet yield.
+        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: showInfo)
+        // A panel opening takes over the bottom region — the Save Spot
+        // sheet yields.
         .onChange(of: activeSheet) { _, sheet in
             if sheet != nil {
-                showPhotoShutter = false
                 showSaveLocation = false
                 showLocationCard = false
             }
@@ -317,10 +293,10 @@ struct RootScreen: View {
                     withAnimation { showActionMenu = true }
                 }
             }
-            // Debug: open the Save Spot / Photo bottom sheets (they're not
-            // ActiveSheet cases, so -openSheet can't reach them).
+            // Debug: open the Save Spot bottom sheet (not an ActiveSheet
+            // case, so -openSheet can't reach it).
             if args.contains("-openSaveSpot") { debugPendingSaveSpot = true }
-            if args.contains("-openPhoto") { debugPendingPhoto = true }
+            if args.contains("-openInfo") { debugPendingInfo = true }
             // Debug: force landscape (the simulator's rotate menu can't be driven
             // headlessly; the app asks the scene to rotate itself instead).
             // -landscapeDelay <s> delays the request, e.g. to rotate with a sheet up.
@@ -340,12 +316,6 @@ struct RootScreen: View {
             if let i = args.firstIndex(of: "-simHour"), i + 1 < args.count, let h = Double(args[i + 1]) {
                 let base = Calendar.current.startOfDay(for: Date())
                 model.setDisplayDate(base.addingTimeInterval(h * 3600))
-            }
-            // Debug: auto-capture a photo (the simulator can't tap the shutter);
-            // pair with -captureToDocuments to verify the composited output.
-            if let i = args.firstIndex(of: "-autoCaptureAfter"), i + 1 < args.count,
-               let s = Double(args[i + 1]) {
-                DispatchQueue.main.asyncAfter(deadline: .now() + s) { captureToken &+= 1 }
             }
             // Debug: auto-select a peak (the simulator can't synthesize a tap) to
             // exercise the detail panel.
@@ -428,9 +398,24 @@ struct RootScreen: View {
         }
         .onChange(of: shouldShowInitialLoading) { _, loading in
             guard !loading else { return }
+            // First-ever open: greet with the how-to card once the first
+            // scene is actually up (the card lives in the chrome group, so
+            // it couldn't show over the loading screen anyway). Once only —
+            // after that it's in the menu under Info.
+            if !infoCardSeen {
+                infoCardSeen = true
+                // Let the terrain land first, THEN pop the how-to card over it —
+                // the beat's pause makes the scene register as "opened" before the
+                // card greets you, rather than the card being there from frame one.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { showInfo = true }
+            }
             if let sheet = debugPendingSheet {
                 debugPendingSheet = nil
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { activeSheet = sheet }
+            }
+            if debugPendingInfo {
+                debugPendingInfo = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { showInfo = true }
             }
             if debugPendingSaveSpot {
                 debugPendingSaveSpot = false
@@ -438,10 +423,6 @@ struct RootScreen: View {
                     saveLocationName = model.viewpoint?.name ?? ""
                     showSaveLocation = true
                 }
-            }
-            if debugPendingPhoto {
-                debugPendingPhoto = false
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { showPhotoShutter = true }
             }
             if !debugSaveNames.isEmpty {
                 let saves = debugSaveNames
@@ -634,6 +615,103 @@ struct RootScreen: View {
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 22)
+            }
+        }
+    }
+
+    /// The Info card (menu ▸ Info): a CENTERED modal in the card language —
+    /// paper, radius 16, hairline, soft shadow — over a dimming scrim that
+    /// dismisses on tap. Placeholder body for now; the how-to-use content
+    /// lands here later.
+    @ViewBuilder private var infoPanel: some View {
+        if showInfo {
+            ZStack {
+                Color.black.opacity(0.25)
+                    .onTapGesture { showInfo = false }
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("How to use Peak-Peek")
+                        .font(PPFont.ui(18, .semibold))
+                        .foregroundStyle(TopoStyle.inkColor)
+                        .padding(.trailing, 28)
+                    // Portrait hugs its content (five terse tips clear the fold),
+                    // so the card is only ever as tall as it needs to be. Only
+                    // landscape — where the height truly can't exist — gets the
+                    // scroller (greedy, so it's capped).
+                    if isChromeLandscape {
+                        ScrollView(.vertical, showsIndicators: false) { infoTips }
+                            .frame(maxHeight: 260)
+                    } else {
+                        infoTips
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 18)
+                .padding(.horizontal, 20)
+                .background(TopoStyle.paperColor, in: RoundedRectangle(cornerRadius: 16))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16)
+                        .strokeBorder(TopoStyle.hairline(0.12), lineWidth: 1)
+                )
+                .shadow(color: .black.opacity(0.18), radius: 22, y: 10)
+                .overlay(alignment: .topTrailing) {
+                    Button { showInfo = false } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(TopoStyle.inkColor.opacity(0.5))
+                            .frame(width: 32, height: 32)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(2)
+                }
+                .frame(maxWidth: 420)
+                .padding(.horizontal, 28)
+                // The card scales in; the scrim (below) just fades. Hoisting
+                // ignoresSafeArea to the whole ZStack means the grey is one
+                // full-screen layer from the first frame — it covers top to
+                // bottom in a single beat instead of filling the safe areas a
+                // frame late (the "greying extends after" glitch).
+                .transition(.scale(scale: 0.96).combined(with: .opacity))
+            }
+            .ignoresSafeArea()
+            .transition(.opacity)
+        }
+    }
+
+    /// The five how-to tips, shared by the portrait (hug) and landscape (scroll)
+    /// layouts of the Info card.
+    @ViewBuilder private var infoTips: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            infoTip("arrow.down.circle", "Download your area first",
+                    "Grab your region in Offline before a trip — loads go instant and work offline.")
+            infoTip("hand.draw", "Line it up by hand",
+                    "The compass is rough. Swipe to turn the overlay, up or down to raise it — easiest, drag the drawn sun or moon onto the real one. Realign snaps back.")
+            infoTip("hand.tap", "Tap the dots",
+                    "Each dot is a peak, pass or lake — tap for name, distance, and if it's visible. Save, mark Been, or View from its summit.")
+            infoTip("map", "Go anywhere",
+                    "The mini-map opens a world map — drop a pin to view from anywhere. Use GPS brings you home.")
+            infoTip("clock", "Scrub the day",
+                    "The Time card moves the sun; the ↑ and ↓ tags mark when it clears your ridges.")
+        }
+        .padding(.trailing, 4)
+    }
+
+    /// One Info-card tip: SF symbol beside a semibold title over a quiet body.
+    private func infoTip(_ symbol: String, _ title: String, _ body: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: symbol)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(TopoStyle.inkColor.opacity(0.75))
+                .frame(width: 22, alignment: .center)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(PPFont.ui(14, .semibold))
+                    .foregroundStyle(TopoStyle.inkColor)
+                Text(body)
+                    .font(PPFont.ui(13))
+                    .foregroundStyle(TopoStyle.inkColor.opacity(0.62))
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -895,8 +973,6 @@ struct RootScreen: View {
                         peak: selected,
                         isVisible: model.visibilityVerdict(for: selected.peak),
                         isClimbed: peakLists.contains(selected.peak, in: .climbed),
-                        beenDate: peakLists.peaks(in: .climbed)
-                            .first { $0.peak.id == selected.peak.id }?.climbedAt,
                         isBookmarked: peakLists.contains(selected.peak, in: .wantToClimb),
                         onToggleClimbed: { peakLists.toggle(selected.peak, in: .climbed) },
                         onToggleBookmark: { peakLists.toggle(selected.peak, in: .wantToClimb) },
@@ -994,96 +1070,6 @@ struct RootScreen: View {
         .ignoresSafeArea(.keyboard)
     }
 
-    /// Photo capture, armed by the menu's Photo button: nothing but the
-    /// camera-style shutter floating over the terrain, a quiet ✕ above it —
-    /// no sheet, no chrome, the shot being framed IS the interface.
-    /// Capturing the very moment the menu item was tapped saved a frame with
-    /// the menu still animating away — and gave no chance to frame the shot.
-    private var photoShutterPopup: some View {
-        ZStack {
-            // Tap anywhere off the controls to stand down.
-            Color.clear
-                .contentShape(Rectangle())
-                .ignoresSafeArea()
-                .onTapGesture { showPhotoShutter = false }
-            VStack {
-                Spacer()
-                VStack(spacing: 18) {
-                    Button {
-                        showPhotoShutter = false
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(TopoStyle.inkColor.opacity(0.7))
-                            .frame(width: 34, height: 34)
-                            .contentShape(Circle().inset(by: -8))
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Cancel photo")
-
-                    // Shutter centered; what-goes-in-the-photo checkboxes on
-                    // its sides. They preview LIVE: toggling shows/hides the
-                    // overlay on screen, so the frame is exactly the capture.
-                    HStack {
-                        photoCheck("Labels", isOn: $photoIncludesLabels)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        Button {
-                            captureToken &+= 1
-                            showPhotoShutter = false
-                        } label: {
-                            ZStack {
-                                Circle().stroke(TopoStyle.inkColor, lineWidth: 3)
-                                    .frame(width: 62, height: 62)
-                                Circle().fill(TopoStyle.inkColor)
-                                    .frame(width: 50, height: 50)
-                            }
-                            .contentShape(Circle().inset(by: -8))
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Take photo")
-                        photoCheck("Compass", isOn: $photoIncludesCompass)
-                            .frame(maxWidth: .infinity, alignment: .trailing)
-                    }
-                    .padding(.horizontal, 16)
-                }
-                // Clear the footer/mini-map row: the shutter floats in the
-                // free center ABOVE them (a wide location card can reach the
-                // screen's middle, so the lift is generous).
-                .padding(.bottom, 56)
-            }
-            .padding()
-        }
-        .transition(.move(edge: .bottom).combined(with: .opacity))
-    }
-
-    /// A minimal checkbox: 14 pt hairline square, ink check when on, mono
-    /// label — quiet enough to live beside the shutter.
-    private func photoCheck(_ title: String, isOn: Binding<Bool>) -> some View {
-        Button {
-            isOn.wrappedValue.toggle()
-        } label: {
-            HStack(spacing: 6) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 3)
-                        .strokeBorder(TopoStyle.inkColor.opacity(0.6), lineWidth: 1.25)
-                        .frame(width: 14, height: 14)
-                    if isOn.wrappedValue {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 8, weight: .bold))
-                            .foregroundStyle(TopoStyle.inkColor)
-                    }
-                }
-                Text(title)
-                    .font(PPFont.mono(11))
-                    .tracking(0.5)
-            }
-            .foregroundStyle(TopoStyle.inkColor.opacity(0.85))
-            .contentShape(Rectangle().inset(by: -10))
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(isOn.wrappedValue ? .isSelected : [])
-    }
-
     private var shouldShowInitialLoading: Bool {
         !model.hasRenderedOnce
     }
@@ -1134,6 +1120,8 @@ struct RootScreen: View {
 
     /// Units override ("" = follow locale) — the menu toggles ft ↔ m.
     @AppStorage(UnitText.overrideKey) private var unitsRaw = ""
+    /// Clock override ("" = follow locale) — the menu toggles 12h ↔ 24h.
+    @AppStorage(ClockText.overrideKey) private var clockRaw = ""
 
     private var resolvedScheme: ColorScheme {
         switch themeMode {
@@ -1179,7 +1167,7 @@ struct RootScreen: View {
     }
 
     private var initialLoadingTitle: String {
-        initialLoadingFailed ? "Terrain unavailable" : "PeakPeek"
+        initialLoadingFailed ? "Terrain unavailable" : "Peak-Peek"
     }
 
     /// Unified load fraction for the loading bar (continuous across the
@@ -1276,23 +1264,20 @@ struct RootScreen: View {
                     }
                     menuDivider
 
-                    // Photo: arm the shutter popup (capture on ITS button, not here —
-                    // the user frames the shot first). Arming takes over the
-                    // screen, so any open panel yields — the same one-thing-
-                    // at-a-time rule the panels apply to the shutter.
-                    controlButton("Photo", systemName: "camera", prominence: .secondary) {
-                        activeSheet = nil
-                        showSaveLocation = false
-                        showPhotoShutter = true
-                        collapseActionMenu()
+                    // Toggle 24h ↔ 12h (seeded from the locale on first toggle).
+                    controlButton(
+                        "Time: \(ClockText.uses24Hour ? "24h" : "12h")",
+                        systemName: "clock",
+                        prominence: clockRaw.isEmpty ? .secondary : .primary
+                    ) {
+                        clockRaw = ClockText.uses24Hour ? "12" : "24"
                     }
                     menuDivider
 
                     // Save the current viewpoint as a named Saved location.
-                    // Same takeover rule as Photo: open panels yield first.
+                    // Takeover rule: open panels yield first.
                     controlButton("Save Spot", systemName: "bookmark", prominence: .secondary) {
                         activeSheet = nil
-                        showPhotoShutter = false
                         saveLocationName = model.viewpoint?.name ?? ""
                         showSaveLocation = true
                         collapseActionMenu()
@@ -1322,6 +1307,14 @@ struct RootScreen: View {
                     controlButton("Offline", systemName: "arrow.down.circle",
                                   prominence: regions.isDownloading ? .warning : .secondary) {
                         activeSheet = .regions
+                        collapseActionMenu()
+                    }
+                    menuDivider
+
+                    // How-to-use guide: a centered modal card (content TBD).
+                    controlButton("Info", systemName: "info.circle", prominence: .secondary) {
+                        activeSheet = nil
+                        showInfo = true
                         collapseActionMenu()
                     }
                 }
@@ -1612,7 +1605,7 @@ struct RootScreen: View {
 /// load (first open, teleports, "Stand here") gets the same playful readout.
 private enum LoadingWhimsy {
     static let lines: [String] = [
-        "Stitching tiles",
+            "Stitching tiles",
         "Carving valleys",
         "Raising mountains",
         "Dropping shadows",
@@ -1632,10 +1625,8 @@ private enum LoadingWhimsy {
         "Stacking cairns",
         "Charting ridges",
         "Combing the treeline",
-        "Growing the forests",
         "Raking the scree",
         "Deepening the gorges",
-        "Hanging the stars",
         "Feeding the chipmunks",
         "Petting the goats",
         "Calibrating the altimeter",
@@ -1643,7 +1634,6 @@ private enum LoadingWhimsy {
         "Tightening guylines",
         "Flagging false summits",
         "Trusting the cairns",
-        "Spraying dew",
         "Following the bootpack",
     ]
 }
@@ -1658,7 +1648,7 @@ private enum LoadingWhimsy {
 /// means even two live instances can't double-advance the rotation.
 @MainActor
 private enum WhimsyClock {
-    static let interval: TimeInterval = 2.0
+    static let interval: TimeInterval = 1.1
     /// Random per-launch palette start, so the first line isn't always coral.
     static let colorOffset = Int.random(in: 0..<6)
     private(set) static var order = LoadingWhimsy.lines.shuffled()
@@ -1703,9 +1693,13 @@ private struct WhimsyLine: View {
     }
     var style: Style = .paper
     @Environment(\.colorScheme) private var scheme
-    /// Render trigger only — the line/color come from WhimsyClock; bumping
-    /// this re-evaluates body after each advance.
-    @State private var tick = 0
+    /// The DISPLAYED line/color, mirrored from WhimsyClock. Must be @State that
+    /// body actually READS: the old `tick += 1` render-trigger was never read in
+    /// body, and SwiftUI only invalidates on changes to state a view depends
+    /// on — the clock advanced silently while the text stayed frozen on its
+    /// first line. A recreated instance seeds from the clock's current state.
+    @State private var line = WhimsyClock.currentLine
+    @State private var paletteIndex = WhimsyClock.index + WhimsyClock.colorOffset
 
     /// Coral → amber → sage → sky → lavender → rose, one per message.
     /// Pastels for dark surfaces (the original launch-screen set)…
@@ -1729,7 +1723,6 @@ private struct WhimsyLine: View {
 
     var body: some View {
         let palette = scheme == .dark ? Self.pastel : Self.deep
-        let line = WhimsyClock.currentLine
         // A ZStack of id-keyed Texts, NOT contentTransition(.opacity): the
         // in-place glyph cross-fade laid the incoming line out against the
         // outgoing line's width, so it appeared offset (and mis-scaled via
@@ -1738,7 +1731,7 @@ private struct WhimsyLine: View {
         return ZStack(alignment: style == .paper ? .center : .leading) {
             Text("\(line)…")
                 .font(PPFont.mono(12))
-                .foregroundStyle(palette[(WhimsyClock.index + WhimsyClock.colorOffset) % palette.count])
+                .foregroundStyle(palette[paletteIndex % palette.count])
                 .lineLimit(1)
                 .minimumScaleFactor(0.85)     // safety net; lines are sized to fit
                 .transition(.opacity)
@@ -1755,7 +1748,10 @@ private struct WhimsyLine: View {
                 try? await Task.sleep(for: .seconds(WhimsyClock.remaining))
                 guard !Task.isCancelled else { break }
                 WhimsyClock.advanceIfDue()
-                withAnimation(.easeInOut(duration: 0.35)) { tick += 1 }
+                withAnimation(.easeInOut(duration: 0.35)) {
+                    line = WhimsyClock.currentLine
+                    paletteIndex = WhimsyClock.index + WhimsyClock.colorOffset
+                }
             }
         }
     }
