@@ -644,7 +644,10 @@ final class PanoramaViewModel: NSObject, ObservableObject {
             // query (120 km, one file) finishes well before the peak merge (500 km
             // across four sources), and publishing them separately made lakes pop
             // in first and triggered a throwaway anchor rebuild.
-            let (peaks, lakes) = await Task.detached(priority: .utility) {
+            // .userInitiated: the first reveal waits on labels, and labels wait
+            // on this publish — on efficiency cores the 4-source merge visibly
+            // stretched the loading screen.
+            let (peaks, lakes) = await Task.detached(priority: .userInitiated) {
                 let t0 = DispatchTime.now()
                 defer {
                     NSLog("Peak+lake sources resolved in %.0f ms",

@@ -1774,12 +1774,33 @@ struct TerrainMetalView: UIViewRepresentable {
             let camElevM = Double(camElev), hs = Double(exaggeration)
             let ringProfile = farProfile           // main-thread snapshot for the worker
             let ringGen = farProfileGen            // which ring that profile reflects
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                let horizon = Self.buildHorizon(dem: dem, far: far, refLat: lat, refLon: lon,
-                                                camElevMeters: camElevM, heightScale: hs,
-                                                ringProfile: ringProfile)
+            // The march depends only on (viewpoint, eye height) — the ring and
+            // sea-dip are cheap post-clamps (finishHorizon). Reuse the cached
+            // march when only the ring changed: the ring lands seconds into a
+            // load and used to re-run the ENTIRE march for an identical
+            // terrain profile, doubling the reveal's longest stage.
+            let camElevSnapshot = camElev
+            let cachedMarch: [Float]? = {
+                guard let c = marchedHorizonCache, c.lat == lat, c.lon == lon,
+                      c.camElev == camElevSnapshot else { return nil }
+                return c.marched
+            }()
+            // .userInitiated, not .utility: the first reveal WAITS on the sky
+            // (the celestial `.ready` barrier) — on efficiency cores this march
+            // stretched the loading screen by seconds.
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let t0 = DispatchTime.now()
+                let marched = cachedMarch
+                    ?? Self.buildHorizon(dem: dem, far: far, refLat: lat, refLon: lon,
+                                         camElevMeters: camElevM, heightScale: hs)
+                if cachedMarch == nil {
+                    NSLog("Sky horizon march: %.0f ms", Self.ms(since: t0))
+                }
+                let horizon = Self.finishHorizon(marched: marched, ringProfile: ringProfile,
+                                                 camElevMeters: camElevM)
                 DispatchQueue.main.async {
                     guard let self else { return }
+                    self.marchedHorizonCache = (lat, lon, camElevSnapshot, marched)
                     self.cachedHorizon = horizon
                     self.cachedHorizonRingGen = ringGen
                     self.rebuildCelestial()
@@ -1787,11 +1808,18 @@ struct TerrainMetalView: UIViewRepresentable {
             }
         }
 
+        /// Last marched (pre-clamp) skyline, keyed by the viewpoint it was
+        /// marched for — see rebuildSky.
+        private var marchedHorizonCache:
+            (lat: Double, lon: Double, camElev: Float, marched: [Float])?
+
         /// Serial home for celestial rebuilds: keeps overlapping scrub ticks from
         /// racing each other, and confines the cached formatter + day-path cache
         /// below to one thread (DateFormatter is not thread-safe).
+        /// .userInitiated: the first reveal waits on this pass too (the
+        /// celestial `.ready` barrier).
         private static let celestialQueue = DispatchQueue(
-            label: "com.peakpeek.celestial", qos: .utility)
+            label: "com.peakpeek.celestial", qos: .userInitiated)
         /// Rise/set tag formatter, reused across rebuilds (construction is one of
         /// the classically expensive Foundation inits, and this fired per scrub
         /// tick). celestialQueue-confined; only `timeZone` changes per viewpoint.
@@ -2090,11 +2118,12 @@ struct TerrainMetalView: UIViewRepresentable {
         }
 
         /// Terrain skyline elevation angle per azimuth bin — marched once per
-        /// viewpoint. Drives sky-arc occlusion + rise/set crossing tags.
+        /// viewpoint (and CACHED by rebuildSky: the ring landing re-clamps via
+        /// finishHorizon without re-marching). Drives sky-arc occlusion +
+        /// rise/set crossing tags after finishHorizon's ring/sea-dip clamps.
         private static func buildHorizon(
             dem: DEMTile, far: DEMTile?, refLat: Double, refLon: Double,
-            camElevMeters: Double, heightScale: Double,
-            ringProfile: FarHorizon.Profile?
+            camElevMeters: Double, heightScale: Double
         ) -> [Float] {
             // 0.375°/bin: at 480 bins (0.75°) the interpolated skyline could disagree
             // with the rendered ridge by a few tenths of a degree in rugged terrain,
@@ -2111,32 +2140,86 @@ struct TerrainMetalView: UIViewRepresentable {
             // through the terrain.
             let nearCellM = dem.cellsize * 111_320.0
             let farCellM = (far?.cellsize ?? dem.cellsize) * 111_320.0
-            var horizon = [Float](repeating: -90, count: bins)
+            // Bins are fully independent (read-only captures, one slot each), and
+            // the serial loop was the load's longest CPU pole once the reveal
+            // started waiting on the celestial pass: ~960 bins × thousands of
+            // geodesic samples out to 240 km on ONE thread. Fan out across cores.
+            let out = UnsafeMutablePointer<Float>.allocate(capacity: bins)
+            defer { out.deallocate() }
+            let binWidthRad: Double = 2.0 * Double.pi / Double(bins)
+            // The forward twin of the shader's geodesic-bulge sampling (see
+            // buildAnchors) — the march walks the SAME ENU rays the renderer
+            // draws, so the sky skyline agrees with the rendered ridge by
+            // construction. It also replaces the old per-sample spherical-trig
+            // `GeoMath.destination` (~6 transcendentals) with a linear lat, one
+            // cosine, and a tangent compare — the march was the measured pole
+            // of the whole load (≈12 s of the reveal tail).
+            let tanRefOver2R = tan(refLat * .pi / 180) / (2 * Uniforms.enuEarthRadiusMeters)
+            DispatchQueue.concurrentPerform(iterations: bins) { (b: Int) in
+                let bearing: Double = (Double(b) + 0.5) * binWidthRad
+                out[b] = Self.horizonBinAngle(
+                    sinB: sin(bearing), cosB: cos(bearing), dem: dem, far: far,
+                    refLat: refLat, refLon: refLon, tanRefOver2R: tanRefOver2R,
+                    camElevMeters: camElevMeters, heightScale: heightScale,
+                    curvatureK: curvatureK, maxDist: maxDist,
+                    nearCellM: nearCellM, farCellM: farCellM)
+            }
+            return Array(UnsafeBufferPointer(start: out, count: bins))
+        }
+
+        /// One skyline bin: march the ENU ray out to `maxDist` and keep the
+        /// highest apparent angle (terrain only — the ring/sea-dip clamps are
+        /// finishHorizon's, so this marched profile is cacheable per viewpoint).
+        /// Split out of buildHorizon — inlined in the concurrentPerform closure
+        /// the expression graph blew past the type-checker's budget.
+        private static func horizonBinAngle(
+            sinB: Double, cosB: Double, dem: DEMTile, far: DEMTile?,
+            refLat: Double, refLon: Double, tanRefOver2R: Double,
+            camElevMeters: Double, heightScale: Double, curvatureK: Double,
+            maxDist: Double, nearCellM: Double, farCellM: Double
+        ) -> Float {
+            // Track tan(elevation) = up/s — strictly monotone in the angle, so
+            // the per-sample atan2 falls away (one atan at the end).
+            var maxTan = -1e9
+            var s = 12.0
+            let invMLat = 1.0 / 111_320.0
+            while s < maxDist {
+                let east = s * sinB
+                let north = s * cosB
+                // ENU → geo, inverse of the anchors' forward mapping (meridian
+                // convergence at the sample's latitude + geodesic bulge).
+                let lat = refLat + (north - east * east * tanRefOver2R) * invMLat
+                let lon = refLon + east / (111_320.0 * max(cos(lat * .pi / 180), 0.01))
+                let g = Double(elevAt(near: dem, far: far, lat: lat, lon: lon))
+                let t = (g * heightScale - curvatureK * s * s - camElevMeters) / s
+                if t > maxTan { maxTan = t }
+                let cellHere = (s < Self.nearRadius) ? nearCellM : farCellM
+                s += min(max(12.0, s * 0.012), cellHere * 0.8)
+            }
+            return Float(atan(maxTan) * 180 / .pi)
+        }
+
+        /// Clamp a marched terrain skyline to the far-horizon ring's silhouette
+        /// and, where that is empty (open ocean), the sea-level curvature dip —
+        /// so the sun/moon rise and set on the TRUE horizon, not the terrain
+        /// tile's edge. Cheap (one pass over the bins): the ring landing mid-load
+        /// re-runs ONLY this, reusing the cached march instead of re-marching
+        /// the whole DEM for an identical terrain profile.
+        private static func finishHorizon(
+            marched: [Float], ringProfile: FarHorizon.Profile?, camElevMeters: Double
+        ) -> [Float] {
+            let bins = marched.count
+            let seaDip = Float(-sqrt(max(0, 2 * camElevMeters / 7_324_000)) * 180 / .pi)
+            var horizon = marched
             for b in 0..<bins {
-                let bearing = (Double(b) + 0.5) / Double(bins) * 360 * .pi / 180
-                var maxAngle = -90.0
-                var s = 12.0
-                while s < maxDist {
-                    let p = GeoMath.destination(latitude: refLat, longitude: refLon,
-                                                bearingRad: bearing, distanceMeters: s)
-                    let g = Double(elevAt(near: dem, far: far, lat: p.latitude, lon: p.longitude))
-                    let a = atan2(g * heightScale - curvatureK * s * s - camElevMeters, s) * 180 / .pi
-                    if a > maxAngle { maxAngle = a }
-                    let cellHere = (s < Self.nearRadius) ? nearCellM : farCellM
-                    s += min(max(12.0, s * 0.012), cellHere * 0.8)
-                }
-                // The DEM ends at 120 km, but the WORLD doesn't: clamp to the
-                // far-horizon ring's silhouette and, where that is empty (open
-                // ocean), the sea-level curvature dip — so the sun/moon rise
-                // and set on the TRUE horizon, not the terrain tile's edge.
+                var maxAngle = horizon[b]
                 if let prof = ringProfile {
+                    let bearing = (Double(b) + 0.5) / Double(bins) * 2 * .pi
                     let rb = min(FarHorizon.bins - 1,
                                  max(0, Int(bearing / (2 * .pi) * Double(FarHorizon.bins))))
-                    maxAngle = max(maxAngle, atan(Double(prof.tanEl[rb])) * 180 / .pi)
+                    maxAngle = max(maxAngle, Float(atan(Double(prof.tanEl[rb])) * 180 / .pi))
                 }
-                maxAngle = max(maxAngle,
-                               -sqrt(max(0, 2 * camElevMeters / 7_324_000)) * 180 / .pi)
-                horizon[b] = Float(maxAngle)
+                horizon[b] = max(maxAngle, seaDip)
             }
             return horizon
         }
