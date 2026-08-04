@@ -323,7 +323,17 @@ struct TerrainMetalView: UIViewRepresentable {
         /// The far tile reaches `FarHorizon.farTileMeters` — real raymarched
         /// terrain out to 160 km, so much less of the view is the hazy ring.
         private static let nearRadius = 40_000.0, farRadius = FarHorizon.farTileMeters
-        private static let nearMaxGrid = 9000, farMaxGrid = 4096
+        private static let nearMaxGrid = 9000
+        /// Far-tier grid cap. At 4096 every ridge beyond 40 km sat on ~90 m
+        /// cells — visibly soft silhouettes for the app's main subject. High-RAM
+        /// devices (the 12288-bake gate) take 6144 (~60 m): sharper far
+        /// ridgelines and truer far occlusion for ~+100 MB far-tile memory and a
+        /// slightly longer stitch/march. (DEMFetcher's disk cache keys on the
+        /// grid, so snapshots from the other cap never collide.)
+        private static let farMaxGrid: Int = {
+            let gb = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
+            return gb >= 5.5 ? 6144 : 4096
+        }()
         private weak var view: MTKView?
         var onStatus: (PanoramaViewModel.Status) -> Void
         var onEyeElevation: (Double?) -> Void
@@ -1655,6 +1665,11 @@ struct TerrainMetalView: UIViewRepresentable {
             let renderer = self.renderer
             let ringProfile = farProfile           // main-thread snapshot for the worker
             let ringStamp = farProfileGen          // which ring the anchors will reflect
+            // Pace the depth pass whenever a scene is LIVE under it (moves,
+            // ring top-ups): unpaced bands saturated the GPU and the still-
+            // interactive old scene panned with a stutter. First load (no
+            // scene yet, cover up) stays unpaced for the fastest reveal.
+            let paceDepth = panoInstalled
             labelGeneration &+= 1
             let gen = labelGeneration
             // .userInitiated, not .utility: during a move this build GATES the
@@ -1662,7 +1677,7 @@ struct TerrainMetalView: UIViewRepresentable {
             // efficiency cores and visibly stretched the "Switching location" tail.
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let tD = DispatchTime.now()
-                let depthMap = renderer?.terrainDepthMap(uniforms: maskUniforms)
+                let depthMap = renderer?.terrainDepthMap(uniforms: maskUniforms, paced: paceDepth)
                 let tB = DispatchTime.now()
                 if Self.labelDebug {
                     NSLog("Anchor depth map: %.0f ms", Self.ms(since: tD))
@@ -3005,7 +3020,13 @@ struct TerrainMetalView: UIViewRepresentable {
                     rebuildLabelAnchors()
                 }
                 renderer.panoramaWidth = Self.fullPanoramaWidth
-                bakeOnce(paced: paced, onProgress: onBand) { [weak self] tex in
+                // ALWAYS paced here: every re-bake runs under a LIVE scene the
+                // user is panning (moves show the old terrain until the swap;
+                // top-ups the new). Unpaced bands ran back-to-back and owned
+                // the GPU for the bake's whole duration — the "jitter while a
+                // new location loads". The ~16 ms/band breather costs the move
+                // under a second of wall time, hidden behind the progress bar.
+                bakeOnce(paced: true, onProgress: onBand) { [weak self] tex in
                     guard let self else { return }
                     guard gen == self.bakeGeneration else { return }  // superseded: the newer bake swaps
                     guard let tex else {

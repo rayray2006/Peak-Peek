@@ -1634,6 +1634,7 @@ private enum LoadingWhimsy {
         "Tightening guylines",
         "Flagging false summits",
         "Trusting the cairns",
+            
         "Following the bootpack",
     ]
 }
@@ -1648,7 +1649,7 @@ private enum LoadingWhimsy {
 /// means even two live instances can't double-advance the rotation.
 @MainActor
 private enum WhimsyClock {
-    static let interval: TimeInterval = 2.2
+    static let interval: TimeInterval = 2.8
     /// Random per-launch palette start, so the first line isn't always coral.
     static let colorOffset = Int.random(in: 0..<6)
     private(set) static var order = LoadingWhimsy.lines.shuffled()

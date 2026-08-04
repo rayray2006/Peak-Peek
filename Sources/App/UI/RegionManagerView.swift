@@ -118,19 +118,22 @@ struct RegionManagerView: View {
                     // every other map in the app.
                     UserAnnotation()
                     if isManualViewpoint, let vp = currentViewpoint {
+                        // Same pin as the teleport map — one marker language
+                        // for "where the eye stands" on every map.
                         Annotation(vp.name, coordinate:
                             CLLocationCoordinate2D(latitude: vp.latitude, longitude: vp.longitude)) {
-                            Circle().fill(TopoStyle.inkColor)
-                                .frame(width: 10, height: 10)
-                                .overlay(Circle().stroke(TopoStyle.paperColor, lineWidth: 2))
+                            ViewpointPin()
                         }
                         .annotationTitles(.hidden)
                     }
                 }
                 // Same cartography as the full teleport map — one map style
-                // app-wide. (Flat elevation kept nothing here; the green
-                // coverage overlays read fine over the hybrid imagery.)
-                .mapStyle(.hybrid(elevation: .realistic))
+                // app-wide — but FLAT elevation here: with .realistic the
+                // coverage polygons drape onto 3D terrain whose mesh LOD
+                // re-tessellates at the viewport edges while panning, so the
+                // green area's edge visibly crawled. Flat keeps the overlays
+                // pinned to their coordinates.
+                .mapStyle(.hybrid(elevation: .flat))
                 .onMapCameraChange(frequency: .continuous) { ctx in visibleRegion = ctx.region }
                 .clipShape(RoundedRectangle(cornerRadius: 14))
                 .overlay(

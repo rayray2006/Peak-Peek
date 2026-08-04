@@ -198,18 +198,15 @@ struct TimeControlsView: View {
             RoundedRectangle(cornerRadius: 14)
                 .strokeBorder(TopoStyle.hairline(0.10), lineWidth: 1)
         )
-        // Swipe pages months, matching the chevrons: left/up → next month,
-        // right/down → previous (finger-up reads as scrolling toward later
-        // dates). Dominant-axis pick, 25 pt threshold — day taps unaffected,
-        // and the compact-landscape ScrollView still wins slow vertical drags.
+        // Horizontal swipe pages months, matching the chevrons: left → next,
+        // right → previous. HORIZONTAL only (25 pt, dominant axis) — vertical
+        // drags stay with the hosting ScrollView, and day taps are unaffected.
         .gesture(
             DragGesture(minimumDistance: 25)
                 .onEnded { v in
                     let dx = v.translation.width, dy = v.translation.height
-                    let months = abs(dx) > abs(dy)
-                        ? (dx < 0 ? 1 : -1)
-                        : (dy < 0 ? 1 : -1)
-                    if let d = calendar.date(byAdding: .month, value: months,
+                    guard abs(dx) > abs(dy) else { return }
+                    if let d = calendar.date(byAdding: .month, value: dx < 0 ? 1 : -1,
                                              to: model.displayDate) {
                         model.setDisplayDate(d)
                     }

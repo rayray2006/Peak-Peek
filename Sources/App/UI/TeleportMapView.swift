@@ -434,7 +434,9 @@ struct MiniMapView: View {
 /// the current viewpoint AND a freshly dropped pin. Same circular language as
 /// `SavedPeakDot`: ink pin glyph on a paper disc. `compact` is the mini-map
 /// size — the full 22 pt badge covered a quarter of the 104 pt peek.
-private struct ViewpointPin: View {
+/// The manual-viewpoint marker, shared by every map (teleport, mini, offline)
+/// so "where the eye stands" reads identically across them.
+struct ViewpointPin: View {
     var compact = false
 
     var body: some View {

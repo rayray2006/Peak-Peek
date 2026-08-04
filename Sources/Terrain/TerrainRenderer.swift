@@ -256,10 +256,18 @@ final class TerrainRenderer {
     /// march/eye/DEM as the visible panorama, so a label visibility decision made
     /// against it always agrees with the picture on screen.
     ///
-    /// 4096 (0.088°/texel) instead of 2048: the visible bake is 8–16 K wide, and
-    /// the coarser the depth map, the wider the quantization band at silhouettes
-    /// where near-grazing peaks flip between shown/hidden. ~22 MB transient.
-    func terrainDepthMap(uniforms: Uniforms, width: Int = 4096)
+    /// 8192 (0.044°/texel): the visible bake is 8–16 K wide, and the coarser
+    /// the depth map, the wider the quantization band at silhouettes where
+    /// near-grazing peaks flip between shown/hidden — at 4096 a summit
+    /// skimming a ridge 80 km out was decided by a pixel that could lie.
+    /// ~40–80 MB transient, one banded pass per viewpoint (still far cheaper
+    /// than the bake it runs beside).
+    /// `paced: true` = a display frame's breather between bands, exactly like
+    /// the paced bake: this pass runs DURING moves while the old scene is
+    /// still live and interactive, and back-to-back bands saturated the GPU —
+    /// visible as pan jitter for the pass's whole duration. The caller blocks
+    /// a background thread either way, so pacing costs only wall time.
+    func terrainDepthMap(uniforms: Uniforms, width: Int = 8192, paced: Bool = false)
         -> (width: Int, height: Int, depth: [Float])? {
         let w = max(8, width)
         let h = Self.panoHeight(forWidth: w, elevMax: uniforms.panoElevMax)
@@ -296,6 +304,7 @@ final class TerrainRenderer {
             // the eye", so every label would judge occluded and the scene
             // shows NO labels at all. Fail loud instead; the caller retries.
             guard cb.status == .completed else { return nil }
+            if paced, i + 1 < bands { Thread.sleep(forTimeInterval: 0.014) }
         }
         var depth = [Float](repeating: 0, count: w * h)
         depth.withUnsafeMutableBytes { ptr in

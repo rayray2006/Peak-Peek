@@ -230,6 +230,16 @@ final class PeakLabelOverlayView: UIView {
         return args[i + 1].lowercased()
     }()
 
+    /// Measured text widths per feature id (+ the elevation string they were
+    /// measured for, so a units flip re-measures). The two NSString.size calls
+    /// are what made node configuration expensive enough to need chunking —
+    /// and the far-ring top-up reassigns a ~99%-identical anchor set about a
+    /// second after EVERY load, so without this cache the re-stream blanked
+    /// and re-grew all the dots (the post-load flash). With it, a same-scene
+    /// rebuild reconfigures in one synchronous pass — no flash; a genuinely
+    /// new location still streams in chunks.
+    private var measuredCache: [String: (nameW: CGFloat, elevString: String, elevW: CGFloat)] = [:]
+
     private func rebuildPool() {
         if let needle = Self.watchNeedle {
             for a in anchors where a.peak.name.lowercased().contains(needle) {
@@ -240,7 +250,8 @@ final class PeakLabelOverlayView: UIView {
         // Configuring a node measures two strings and touches five layers; doing
         // all ~600 anchors in one synchronous pass stalled the main thread — a
         // visible hitch right as the freshly loaded view became interactive.
-        // Build in chunks a runloop tick apart; labels stream in over a few frames.
+        // Build TIME-BUDGETED chunks: cache-hit rebuilds finish synchronously,
+        // cold ones yield to the runloop and stream in over a few frames.
         poolGeneration &+= 1
         configuredCount = 0
         // Precompute the angular-declutter inputs (parallel to `anchors`).
@@ -249,23 +260,38 @@ final class PeakLabelOverlayView: UIView {
         if pool.count > anchors.count {
             for i in anchors.count..<pool.count { pool[i].setHidden(true) }
         }
+        // Unbounded growth guard (teleporting around the world all session).
+        if measuredCache.count > 60_000 { measuredCache.removeAll(keepingCapacity: true) }
         configureNodes(from: 0, generation: poolGeneration)
     }
 
     private func configureNodes(from start: Int, generation: Int) {
         guard generation == poolGeneration else { return }   // superseded mid-build
-        let end = min(anchors.count, start + 120)
-        while pool.count < end { pool.append(makeNode()) }
         let scale = UIScreen.main.scale
-        for i in start..<end {
+        // ~6 ms budget: cache-hit passes configure thousands well inside it
+        // (layer property sets only); measurement-heavy passes yield and
+        // continue next tick. Check every 32 nodes; always make SOME progress.
+        let deadline = CACurrentMediaTime() + 0.006
+        var i = start
+        while i < anchors.count {
+            if i > start, i % 32 == 0, CACurrentMediaTime() > deadline { break }
+            if pool.count <= i { pool.append(makeNode()) }
             let a = anchors[i]
             let node = pool[i]
             let displayName = a.peak.displayName
-            let name = displayName as NSString
-            let nameW = ceil(name.size(withAttributes: [.font: Self.nameFont]).width)
-
             let elev = a.peak.elevationMeters > 0 ? UnitText.elevation(meters: a.peak.elevationMeters) : ""
-            let elevW = elev.isEmpty ? 0 : ceil((elev as NSString).size(withAttributes: [.font: Self.elevFont]).width)
+            let nameW: CGFloat
+            let elevW: CGFloat
+            if let m = measuredCache[a.peak.id], m.elevString == elev {
+                nameW = m.nameW
+                elevW = m.elevW
+            } else {
+                nameW = ceil((displayName as NSString)
+                    .size(withAttributes: [.font: Self.nameFont]).width)
+                elevW = elev.isEmpty ? 0 : ceil((elev as NSString)
+                    .size(withAttributes: [.font: Self.elevFont]).width)
+                measuredCache[a.peak.id] = (nameW, elev, elevW)
+            }
 
             // Both lines centered over the leader: the container is as wide as
             // the longer of the two.
@@ -284,11 +310,12 @@ final class PeakLabelOverlayView: UIView {
                                          y: Self.vPad + Self.nameHeight + 1,
                                          width: elevW + 1, height: Self.elevHeight)
             node.styleKey = -1       // bake the text styles on first projection
+            i += 1
         }
-        configuredCount = end
-        if end < anchors.count {
+        configuredCount = i
+        if i < anchors.count {
             DispatchQueue.main.async { [weak self] in
-                self?.configureNodes(from: end, generation: generation)
+                self?.configureNodes(from: i, generation: generation)
             }
         } else {
             setNeedsLayout()
@@ -326,10 +353,6 @@ final class PeakLabelOverlayView: UIView {
     }
 
     // MARK: - Per-frame projection
-
-    /// Zoom factor (×) at/above which capsule labels appear. Below it, only the
-    /// summit dots show; zoom in (or tap a dot) to reveal a name.
-    private static let labelZoom: Float = 1.8
 
     /// User-facing label density (Labels menu item). The declutter spacing is
     /// zoom-scaled ANGULAR separation (see `recomputeSelection`), so `.sparse`
@@ -518,9 +541,8 @@ final class PeakLabelOverlayView: UIView {
     }
 
     /// Project anchors with the current camera basis (the exact vectors the renderer
-    /// used this frame) and lay out them. Dots show by default; capsule labels show
-    /// only when zoomed in past `labelZoom`, or for the selected peak. Cheap — call
-    /// every frame.
+    /// used this frame) and lay out them. Dots show by default; capsule labels open
+    /// by TAP only (selected or pinned). Cheap — call every frame.
     func project(forward: SIMD3<Float>, right: SIMD3<Float>, up: SIMD3<Float>,
                  tanHalfFovY: Float, aspect: Float, zoom: Float) {
         let W = bounds.width, H = bounds.height
@@ -545,10 +567,11 @@ final class PeakLabelOverlayView: UIView {
         // screen-point density knobs into the angular spacings the stable
         // selection uses. Panning doesn't change it, so the set holds still.
         let pxPerRad = 0.5 * H / CGFloat(tanHalfFovY)
-        // Saved mode used to force every pill open at any zoom; saved points
-        // now behave like the rest — dots until zoomed past labelZoom (or
-        // tapped), just tinted by their list.
-        let capsulesOn = zoom >= Self.labelZoom
+        // Names open by TAP alone (selected/pinned) — the ambient zoom-in
+        // reveal is gone: pinching magnifies the terrain without pills
+        // sprouting over it. (The capsule contest below stays for the day the
+        // ambient reveal returns; with capsulesOn pinned false it never runs.)
+        let capsulesOn = false
         if !selectionIsCurrent(pixelsPerRadian: pxPerRad, capsulesOn: capsulesOn) {
             recomputeSelection(pixelsPerRadian: pxPerRad, capsulesOn: capsulesOn)
         }
