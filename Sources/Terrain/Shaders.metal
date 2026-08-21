@@ -516,13 +516,16 @@ fragment float4 panoramaViewFragment(VSOut in [[stage_in]],
 // AR view: same panorama resample as `panoramaViewFragment`, but keeps the baked
 // sky/terrain alpha and premultiplies it — sky (alpha 0) becomes transparent so
 // the live camera shows through while terrain stays opaque. Used only in AR mode;
-// the 3D path above is unchanged.
+// the 3D path above is unchanged. Terrain carries the SAME sun-altitude dimming
+// (u.terrainBright) as the 3D view: it was lost when the factor was hoisted out
+// of the shader, so entering AR at dusk/night jumped the terrain to full
+// daylight over a dark camera image.
 fragment float4 panoramaViewARFragment(VSOut in [[stage_in]],
                                        constant Uniforms& u [[buffer(0)]],
                                        texture2d<float> pano [[texture(0)]]) {
     float4 c = pano.sample(panoSampler, panoUV(viewRay(in.uv, u), u));
     float a = silhouetteAlpha(c.a);
-    return float4(c.rgb * a, a);                 // premultiplied; sky transparent
+    return float4(c.rgb * u.terrainBright * a, a);   // premultiplied; sky transparent
 }
 
 // Per-texel signal for edge detection: terrain luminance, or a low sentinel for
