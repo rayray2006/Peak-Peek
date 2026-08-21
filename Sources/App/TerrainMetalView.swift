@@ -673,6 +673,7 @@ struct TerrainMetalView: UIViewRepresentable {
                 // the old scene's dots throughout (swap never ran), so nothing
                 // visibly changes while this lands.
                 lastAnchorState = nil
+                lastJudgeRaw = nil
                 labelGeneration &+= 1
                 anchorAbort?.cancelled = true
                 rebuildSky()
@@ -711,7 +712,8 @@ struct TerrainMetalView: UIViewRepresentable {
                 let anchorsCurrent = lastAnchorState?.ringStamp == ringGeneration
                 NSLog("Ring top-up bake (%@)", anchorsCurrent ? "anchors reused" : "anchors rebuilt")
                 bakeProgressive(progressFrom: 0, reportProgress: false,
-                                reuseAnchors: anchorsCurrent, paced: true) { self.report(.ready) }
+                                reuseAnchors: anchorsCurrent, paced: true,
+                                ringTopUp: true) { self.report(.ready) }
             }
         }
         /// DEM-tile download progress for the "Loading tiles X of Y" readout. Touched
@@ -1593,8 +1595,10 @@ struct TerrainMetalView: UIViewRepresentable {
                     if self.isReloading {
                         self.ringLandedMidBake = true
                     } else {
+                        // Only the ring changed: the anchor rebuild may copy
+                        // the settled judge's ring-independent results.
                         self.bakeProgressive(progressFrom: 0, reportProgress: false,
-                                             paced: true) {
+                                             paced: true, ringTopUp: true) {
                             self.report(.ready)
                         }
                     }
@@ -1750,11 +1754,12 @@ struct TerrainMetalView: UIViewRepresentable {
         /// `reporter` (loads only — bakeProgressive's bar tail): called with the
         /// build's 0…1 fraction as features are judged. Standalone rebuilds
         /// (exaggeration, units, saved-spot edits) pass nothing.
-        private func rebuildLabelAnchors(reporter: ((Double) -> Void)? = nil) {
+        private func rebuildLabelAnchors(reporter: ((Double) -> Void)? = nil,
+                                         allowPriorJudge: Bool = false) {
             anchorRebuildWork?.cancel()
             anchorBuildInFlight = true
             let work = DispatchWorkItem { [weak self] in
-                self?.rebuildLabelAnchorsNow(reporter: reporter)
+                self?.rebuildLabelAnchorsNow(reporter: reporter, allowPriorJudge: allowPriorJudge)
             }
             anchorRebuildWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: work)
@@ -1765,7 +1770,8 @@ struct TerrainMetalView: UIViewRepresentable {
         /// token drops stale results. The result routes through `installAnchors`:
         /// installed directly when the scene is stable, or stashed for the atomic
         /// swap while a re-bake is in flight — safe to call mid-bake.
-        private func rebuildLabelAnchorsNow(reporter: ((Double) -> Void)? = nil) {
+        private func rebuildLabelAnchorsNow(reporter: ((Double) -> Void)? = nil,
+                                            allowPriorJudge: Bool = false) {
             // Early-outs still deliver a (empty) result: during a re-bake the swap
             // barrier is waiting on it — silently returning would hang the swap.
             guard let dem else {
@@ -1794,6 +1800,20 @@ struct TerrainMetalView: UIViewRepresentable {
             let ringProfile = farProfile           // main-thread snapshot for the worker
             let ringStamp = farProfileGen          // which ring the anchors will reflect
             let standingOn = standingOnPeakID      // its own dot is under your feet
+            // Ring top-up only: when NOTHING but the ring changed since the
+            // last completed judge, reuse its per-feature results for the
+            // ring-independent majority (see JudgeRaw). Any other difference
+            // — tiles, features, eye, exaggeration, stand-on — falls back to
+            // the full judge. Cleared now, restamped only if THIS build
+            // completes: a superseded build can never leave a stale raw.
+            let identity = currentJudgeIdentity()
+            let prior: JudgeRaw? = allowPriorJudge && lastJudgeRaw?.identity == identity
+                ? lastJudgeRaw?.raw : nil
+            lastJudgeRaw = nil
+            if allowPriorJudge {
+                NSLog("Anchor rebuild: %@", prior != nil
+                      ? "ring-band only (prior judge reused)" : "full (no matching prior)")
+            }
             // Pace the depth pass whenever a scene is LIVE under it (moves,
             // ring top-ups): unpaced bands saturated the GPU and the still-
             // interactive old scene panned with a stutter. First load (no
@@ -1818,14 +1838,14 @@ struct TerrainMetalView: UIViewRepresentable {
                     if Self.labelDebug { NSLog("Anchor build: %.0f ms", Self.ms(since: tB)) }
                 }
                 reporter?(0.03)   // depth pass done; the judge loop reports the rest
-                let (anchors, visibleIDs) = Self.buildAnchors(
+                let (anchors, visibleIDs, raw) = Self.buildAnchors(
                     peaks: peaks, lakes: lakes, savedSpots: savedSpots,
                     dem: dem, far: far, refLat: refLat, refLon: refLon,
                     camElevMeters: camElevM, heightScale: hs,
                     depth: depthMap?.depth ?? [], depthW: depthMap?.width ?? 0,
                     depthH: depthMap?.height ?? 0, skyDepth: skyDepth, panoElevMax: panoElevMax,
                     ringProfile: ringProfile, standingOnPeakID: standingOn,
-                    onProgress: reporter, abort: abort)
+                    onProgress: reporter, abort: abort, prior: prior)
                 DispatchQueue.main.async {
                     guard let self else { return }
                     // Depth-pass health is orthogonal to staleness: a failed
@@ -1833,6 +1853,7 @@ struct TerrainMetalView: UIViewRepresentable {
                     if depthMap == nil { self.scheduleAnchorDepthRetry() }
                     else { self.anchorDepthRetries = 0 }
                     guard gen == self.labelGeneration else { return }
+                    self.lastJudgeRaw = (raw, identity)
                     self.installAnchors(anchors, visibleIDs: visibleIDs, ringStamp: ringStamp)
                 }
             }
@@ -1845,6 +1866,50 @@ struct TerrainMetalView: UIViewRepresentable {
         /// result.
         private var lastAnchorState:
             (anchors: [PeakLabelOverlayView.Anchor], visibleIDs: Set<String>, ringStamp: Int)?
+
+        /// Raw per-feature output of the last COMPLETED judge, for the ring
+        /// top-up's PARTIAL reuse. `ringProfile` is read in exactly one branch
+        /// of the judge — the beyond-the-raymarch band — so when the anchors
+        /// were built BEFORE the ring landed (the verbatim-reuse stamp check
+        /// fails), a rebuild whose only delta is the ring still copies every
+        /// `onTile && inMarch` feature's result unchanged and skips the
+        /// summit-matching scan wholesale (matching never reads the ring).
+        /// Only the ring band re-judges. On a cold move the judge is the
+        /// longest phase and the ring always lands mid-bake, so without this
+        /// every move paid the full judge twice for a ~99%-identical set.
+        struct JudgeRaw {
+            let results: [PeakLabelOverlayView.Anchor?]
+            let verdicts: [UInt8]
+            let waterMeta: [(ring: Int32, elev: Float)]
+            let snappedCell: [(lat: Double, lon: Double, elev: Float)?]
+        }
+        /// What the judge's outcome depends on, BESIDES the ring: reuse is
+        /// valid only when every one of these matches the prior build.
+        private struct JudgeIdentity: Equatable {
+            var demGen: Int
+            var peakStamp: Int, lakeStamp: Int, spotStamp: Int
+            var refLat: Double, refLon: Double
+            var camElev: Double, exaggeration: Double
+            var standingOn: String?
+        }
+        private var lastJudgeRaw: (raw: JudgeRaw, identity: JudgeIdentity)?
+
+        private static func featureStamp(_ features: [Peak]) -> Int {
+            var h = Hasher()
+            h.combine(features.count)
+            h.combine(features.first?.id)
+            h.combine(features.last?.id)
+            return h.finalize()
+        }
+        private func currentJudgeIdentity() -> JudgeIdentity {
+            JudgeIdentity(demGen: demGeneration,
+                          peakStamp: Self.featureStamp(peaks),
+                          lakeStamp: Self.featureStamp(lakes),
+                          spotStamp: Self.featureStamp(savedSpots),
+                          refLat: refLat, refLon: refLon,
+                          camElev: Double(camElev), exaggeration: Double(exaggeration),
+                          standingOn: standingOnPeakID)
+        }
 
         /// Route a computed anchor set: stash it for the atomic image+label swap
         /// while a re-bake is pending, install it directly otherwise.
@@ -2386,8 +2451,18 @@ struct TerrainMetalView: UIViewRepresentable {
             ringProfile: FarHorizon.Profile?,
             standingOnPeakID: String? = nil,
             onProgress: ((Double) -> Void)? = nil,
-            abort: AnchorAbort? = nil
-        ) -> (anchors: [PeakLabelOverlayView.Anchor], visibleIDs: Set<String>) {
+            abort: AnchorAbort? = nil,
+            prior: JudgeRaw? = nil
+        ) -> (anchors: [PeakLabelOverlayView.Anchor], visibleIDs: Set<String>, raw: JudgeRaw) {
+            // Ring top-up partial reuse: the caller vouches (JudgeIdentity)
+            // that nothing but the ring changed; this shadow only refuses a
+            // prior whose shape can't index these feature arrays.
+            let priorTotal = peaks.count + lakes.count + savedSpots.count
+            let prior = prior.flatMap { p -> JudgeRaw? in
+                p.results.count == priorTotal && p.verdicts.count == priorTotal
+                    && p.waterMeta.count == priorTotal
+                    && p.snappedCell.count == peaks.count ? p : nil
+            }
             let mLat = 111_320.0
             let mLon = 111_320.0 * max(cos(refLat * .pi / 180), 0.01)
             let curvatureK = (1 - GeoMath.refractionCoefficient)
@@ -2446,7 +2521,9 @@ struct TerrainMetalView: UIViewRepresentable {
             // Reach and prominence floor come from DEMTile — the same window
             // the EYE searches when you stand on a peak.
             var candidates = [[DEMTile.LocalSummit]](repeating: [], count: peaks.count)
-            if !peaks.isEmpty {
+            // With a prior, matching is skipped wholesale below — the scan
+            // (the judge's single most expensive phase) never runs.
+            if prior == nil, !peaks.isEmpty {
                 candidates.withUnsafeMutableBufferPointer { cand in
                     DispatchQueue.concurrentPerform(iterations: peaks.count) { i in
                         if abort?.cancelled == true { return }
@@ -2467,7 +2544,11 @@ struct TerrainMetalView: UIViewRepresentable {
             onProgress?(0.05)   // candidate scan done; the judge loop is the rest
             var snappedCell = [(lat: Double, lon: Double, elev: Float)?](
                 repeating: nil, count: peaks.count)
-            do {
+            if let prior {
+                // Summit matching never reads the ring: the prior build's
+                // assignment IS this build's assignment.
+                snappedCell = prior.snappedCell
+            } else {
                 var claimed = Set<Int64>()
                 func claimKey(_ la: Double, _ lo: Double) -> Int64 {
                     // Half-arc-second bins: finer than any tier's cell grid.
@@ -2681,6 +2762,15 @@ struct TerrainMetalView: UIViewRepresentable {
                                 direction: SIMD3<Float>(Float(dE), Float(dN), Float(pinnedTan * d)),
                                 distanceMeters: d,
                                 isWater: false)
+                            return
+                        }
+                        // This feature passed the onTile/inMarch guard, so nothing below
+                        // reads `ringProfile` — a ring top-up copies the prior
+                        // build's result verbatim instead of re-judging.
+                        if let prior {
+                            res[i] = prior.results[i]
+                            verd[i] = prior.verdicts[i]
+                            wm[i] = prior.waterMeta[i]
                             return
                         }
                         // Cheap range gate on the CATALOG coord before the (costly) summit
@@ -3112,6 +3202,10 @@ struct TerrainMetalView: UIViewRepresentable {
                 }
                 }
             }
+            // Snapshot for the ring top-up's partial reuse — post-dedup, so a
+            // pass-2 copy re-running the (idempotent) dedup is a no-op.
+            let raw = JudgeRaw(results: results, verdicts: verdicts,
+                               waterMeta: waterMeta, snappedCell: snappedCell)
             let all = results.compactMap { $0 }
             // Visible but deliberately unlabeled: ring-drawn peaks, far-tier
             // water, and the peak under your feet. All stay visible for the
@@ -3168,7 +3262,7 @@ struct TerrainMetalView: UIViewRepresentable {
             // line-of-sight visible) and includes the unlabeled ring giants —
             // the info card and search stay honest either way.
             return (peaksOut + lakesOut + savedOut,
-                    Set(all.map(\.peak.id)).union(unlabeledVisibleIDs))
+                    Set(all.map(\.peak.id)).union(unlabeledVisibleIDs), raw)
         }
 
         /// Debug: `-labelDebug` logs every cull (with the blocking terrain for
@@ -3336,6 +3430,7 @@ struct TerrainMetalView: UIViewRepresentable {
         /// in behind it — see `TerrainRenderer.bakePanoramaAsync`.
         private func bakeProgressive(progressFrom: Double, reportProgress: Bool = true,
                                      reuseAnchors: Bool = false, paced: Bool = false,
+                                     ringTopUp: Bool = false,
                                      onReady: @escaping () -> Void) {
             guard let renderer = renderer, dem != nil else { onReady(); return }
             bakeGeneration &+= 1
@@ -3383,7 +3478,9 @@ struct TerrainMetalView: UIViewRepresentable {
                     // their own depth map from the new uniforms, independent of the
                     // displayed image); `installAnchors` stashes the result and the
                     // swap fires once BOTH image and labels are ready.
-                    rebuildLabelAnchors(reporter: anchorReporter)
+                    // `ringTopUp`: only the ring changed — the rebuild may
+                    // copy the prior judge's ring-independent results.
+                    rebuildLabelAnchors(reporter: anchorReporter, allowPriorJudge: ringTopUp)
                 }
                 renderer.panoramaWidth = Self.fullPanoramaWidth
                 // ALWAYS paced here: every re-bake runs under a LIVE scene the
