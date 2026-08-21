@@ -292,7 +292,10 @@ struct TimeControlsView: View {
                     .onChanged { g in
                         let f = min(1, max(0, (g.location.x - 8) / max(1, w - 16)))
                         // Snap to whole minutes, like the old slider's step.
-                        let seconds = (f * 86_399 / 60).rounded() * 60
+                        // Cap at 23:59 — at the right edge f = 1 rounded UP to
+                        // 86,400 s = next-day midnight, and every drag tick
+                        // held there then advanced another day.
+                        let seconds = min(86_340, (f * 86_399 / 60).rounded() * 60)
                         secondsBinding.wrappedValue = Double(seconds)
                     }
             )
@@ -381,6 +384,12 @@ struct TimeControlsView: View {
     }
 
     private func date(onSameDayAs date: Date, secondsIntoDay seconds: Double) -> Date {
-        calendar.startOfDay(for: date).addingTimeInterval(seconds)
+        // Clamp inside the civil day: on a 23-hour spring-forward day even a
+        // capped 23:59 offset lands past midnight, and the scrubber's
+        // same-day round trip then walked a day per drag tick.
+        let start = calendar.startOfDay(for: date)
+        let dayLength = calendar.date(byAdding: .day, value: 1, to: start)
+            .map { $0.timeIntervalSince(start) } ?? 86_400
+        return start.addingTimeInterval(min(seconds, dayLength - 60))
     }
 }

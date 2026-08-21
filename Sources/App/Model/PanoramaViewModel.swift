@@ -1,6 +1,7 @@
 import Combine
 import CoreLocation
 import Foundation
+import UIKit
 
 /// Drives the viewpoint: GPS or a manual teleport sets where the eye stands; the
 /// `TerrainMetalView` renderer takes the viewpoint + exaggeration and reports its
@@ -28,15 +29,24 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         case failed(String)
     }
 
+    /// The peak a "Stand here" visit is standing ON. Carries what the renderer
+    /// needs to put the eye on the peak's RENDERED apex — the same cell the
+    /// label pass picks for its dot — and to suppress that dot once you're
+    /// standing there. Catalog coords are often tens of meters off the true
+    /// top, which leaves a shoulder blocking part of the panorama.
+    /// GPS fixes and map-pin teleports carry no target and never snap.
+    struct SummitTarget: Equatable {
+        let peakID: String
+        /// Catalog height, 0 when the catalog has none (the snap then falls
+        /// back to the nearest-peak-capped highest-cell search).
+        let elevationMeters: Double
+    }
+
     struct Viewpoint: Equatable {
         let name: String
         let latitude: Double
         let longitude: Double
-        /// "Stand here" on a peak: once the DEM loads, the eye snaps to the TRUE
-        /// summit (highest DEM cell nearby) instead of the catalog coordinate —
-        /// which is often tens of meters off, leaving a blocked view in one
-        /// direction. GPS fixes and map-pin teleports never snap.
-        var snapToSummit: Bool = false
+        var summitTarget: SummitTarget? = nil
     }
 
     @Published private(set) var status: Status = .idle
@@ -150,11 +160,50 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     /// the sun (and the dynamic sky colour) keep up with real time. The sun moves only
     /// ~0.25°/min, so a coarse tick is plenty and cheap.
     private var liveClock: Timer?
+    private var foregroundObserver: NSObjectProtocol?
+    private var backgroundObserver: NSObjectProtocol?
+    /// When the app last left the foreground — decides below whether a
+    /// scrubbed (simulated) sky is still the user's active intent on return.
+    private var backgroundedAt: Date?
     private func startLiveClock() {
         liveClock?.invalidate()
         liveClock = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             guard let self, !self.usesSimulatedTime else { return }
             self.displayDate = Date()
+        }
+        if backgroundObserver == nil {
+            backgroundObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.didEnterBackgroundNotification,
+                object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.backgroundedAt = Date() }
+            }
+        }
+        // Timers don't fire while the app is suspended, and the first tick
+        // after a long suspension can lag — reopening the app the next morning
+        // kept yesterday's sky (arc, disc, day/night) until it fired or the
+        // user scrubbed. Snap to the wall clock the moment we return. A
+        // SCRUBBED sky is kept across a quick app switch, but after an hour
+        // away it has outlived its intent — coming back the next day to
+        // yesterday's simulated instant read as "the sky never updates".
+        if foregroundObserver == nil {
+            foregroundObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.willEnterForegroundNotification,
+                object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self else { return }
+                    let away = self.backgroundedAt.map { Date().timeIntervalSince($0) } ?? 0
+                    NSLog("Live clock: foreground (simulated=%d, away %.0f s, displayDate=%@)",
+                          self.usesSimulatedTime ? 1 : 0, away, "\(self.displayDate)")
+                    if !self.usesSimulatedTime {
+                        self.displayDate = Date()
+                    } else if away >= 3_600 {
+                        NSLog("Live clock: dropping stale simulated time (%.0f s away)", away)
+                        self.resetDisplayDateToNow()
+                    }
+                }
+            }
         }
     }
 
@@ -163,6 +212,12 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         // without this a released VM would leave them firing no-op closures.
         liveClock?.invalidate()
         progressTimer?.invalidate()
+        if let foregroundObserver {
+            NotificationCenter.default.removeObserver(foregroundObserver)
+        }
+        if let backgroundObserver {
+            NotificationCenter.default.removeObserver(backgroundObserver)
+        }
     }
 
     /// Peak overlays (Phase 2). Present so the directory/info UI compiles and the
@@ -413,6 +468,10 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         if !unchanged {
             self.eyeElevationMeters = nil
             self.visibleFeatureIDs = nil      // stale for the new eye; renderer re-reports
+            // A previous load's display sweep (or finish sweep) must not keep
+            // publishing over the new load's bar — it made a cancelled move's
+            // card jump back to the old percentage before restarting.
+            stopProgressSmoothing()
             if case .rendering = status {} else { status = .preparingTerrain(progress: nil) }
         }
         loadPeaks(around: viewpoint)
@@ -435,10 +494,16 @@ final class PanoramaViewModel: NSObject, ObservableObject {
 
     /// Remember where the eye stood so the next launch reopens here immediately.
     private static func saveViewpoint(_ vp: Viewpoint, manual: Bool) {
-        UserDefaults.standard.set([
+        var d: [String: Any] = [
             "lat": vp.latitude, "lon": vp.longitude,
-            "name": vp.name, "manual": manual, "snap": vp.snapToSummit,
-        ] as [String: Any], forKey: vpDefaultsKey)
+            "name": vp.name, "manual": manual,
+            "snap": vp.summitTarget != nil,
+        ]
+        if let t = vp.summitTarget {
+            d["snapPeakID"] = t.peakID
+            d["snapElev"] = t.elevationMeters
+        }
+        UserDefaults.standard.set(d, forKey: vpDefaultsKey)
     }
 
     /// The viewpoint from the previous session, or nil on a first-ever launch.
@@ -447,8 +512,13 @@ final class PanoramaViewModel: NSObject, ObservableObject {
               let lat = d["lat"] as? Double, let lon = d["lon"] as? Double else { return nil }
         let name = d["name"] as? String ?? "Last location"
         let manual = d["manual"] as? Bool ?? false
-        let snap = d["snap"] as? Bool ?? false
-        return (Viewpoint(name: name, latitude: lat, longitude: lon, snapToSummit: snap), manual)
+        // A record written before the target existed carries only the flag —
+        // it still snaps, just by the fallback (no id, no catalog height).
+        let target = (d["snap"] as? Bool ?? false)
+            ? SummitTarget(peakID: d["snapPeakID"] as? String ?? "",
+                           elevationMeters: d["snapElev"] as? Double ?? 0)
+            : nil
+        return (Viewpoint(name: name, latitude: lat, longitude: lon, summitTarget: target), manual)
     }
 
     /// Come home: drop manual mode and (re)stand at the device's position. With a
@@ -505,6 +575,14 @@ final class PanoramaViewModel: NSObject, ObservableObject {
             setProgressTarget(progress, rendering: false)
         case let .rendering(progress):
             setProgressTarget(progress, rendering: true)
+        case .ready where progressTimer != nil:
+            // The load finished while the (rate-capped) display was still
+            // mid-flight. Sweep visibly TO the end, then lift the card — a
+            // bar that vanishes at 70% reads as broken. ~75 pts/s: from
+            // half-bar this holds the cover ~0.35 s, never more than ~0.7 s.
+            finishing = true
+            targetProgress = 1.0
+            inRenderingPhase = true
         case .failed where lastGoodViewpoint != nil:
             // A MOVE failed to load (offline teleport) but the previous scene
             // is still on screen: say so briefly in the status pill, then
@@ -536,6 +614,9 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     private var shownProgress = 0.0
     private var inRenderingPhase = false
     private var lastPublishedPct = -1
+    /// `.ready` arrived while the display was mid-sweep: run the bar to 100%
+    /// at finish speed, THEN publish `.ready` (see progressTick).
+    private var finishing = false
 
     private func setProgressTarget(_ target: Double, rendering: Bool) {
         // A fresh sweep (timer nil) starts at the first report; within one
@@ -563,15 +644,33 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     }
 
     private func progressTick() {
+        if finishing {
+            // Finish sweep: the scene is ready behind the card — run the bar
+            // to the very end fast enough to feel conclusive, slow enough to
+            // be seen arriving. The full bar gets (at least) one tick on
+            // screen before the card lifts.
+            if shownProgress >= 0.9995 {
+                stopProgressSmoothing()
+                status = .ready
+                return
+            }
+            shownProgress = min(1.0, shownProgress + 0.025)
+            publishProgress()
+            return
+        }
         let gap = targetProgress - shownProgress
         if gap > 0 {
             // Sweep toward real reports at a CAPPED rate. The old spring ate
             // 25% of the gap per tick: a chunky per-tile target jump surged
             // the bar 30+ points in half a second, then slammed to a stop
             // (measured: 47→82% in one second on a cold Rockies load).
-            // ≤0.6 pt/tick ≈ 18 pts/s reads as motion, not a teleport.
+            // ≤0.6 pt/tick ≈ 18 pts/s reads as motion, not a teleport —
+            // with a faster lane (still smooth) when the display has fallen
+            // far behind a burst of real progress, so it can't still be
+            // trailing by 30 points when the load completes.
+            let cap = gap > 0.12 ? 0.012 : 0.006
             shownProgress = min(targetProgress,
-                                shownProgress + min(max(gap * 0.06, 0.0035), 0.006))
+                                shownProgress + min(max(gap * 0.06, 0.0035), cap))
         } else {
             // No fresh signal: creep toward a cap just past the last real
             // report, DECELERATING as it nears — an asymptote, not the old
@@ -613,6 +712,7 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         targetProgress = 0
         shownProgress = 0
         lastPublishedPct = -1
+        finishing = false
     }
 
     func eyeElevationResolved(_ meters: Double?) {
@@ -794,8 +894,10 @@ final class PanoramaViewModel: NSObject, ObservableObject {
             && $0.isSaddle
         }
         let isSaddle = peak.isSaddle || liveSaddle || peak.nameSuggestsSaddle
+        let target = isSaddle || isWater ? nil
+            : SummitTarget(peakID: peak.id, elevationMeters: peak.elevationMeters)
         teleport(to: Viewpoint(name: peak.name, latitude: peak.latitude, longitude: peak.longitude,
-                               snapToSummit: !isSaddle && !isWater),
+                               summitTarget: target),
                  manual: true)
     }
 

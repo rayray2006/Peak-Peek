@@ -192,17 +192,15 @@ final class SkyArcOverlayView: UIView {
             layer.addSublayer(p)
         }
 
-        for (arc, color) in [
-            (sunArc, UIColor(red: 0.86, green: 0.66, blue: 0.12, alpha: 0.75)),
-            (moonArc, UIColor(white: 0.75, alpha: 0.55)),
-        ] {
-            arc.strokeColor = color.cgColor
+        for arc in [sunArc, moonArc] {
             arc.fillColor = nil
             arc.lineWidth = 1.2
             arc.lineCap = .round
             arc.lineJoin = .round
             layer.addSublayer(arc)
         }
+        sunArc.strokeColor = UIColor(red: 0.86, green: 0.66, blue: 0.12, alpha: 0.75).cgColor
+        // moonArc's stroke is day/night-adaptive — set in updateMoonStyle() below.
 
         let sunR: CGFloat = 5
         sunDiscLayer.path = CGPath(ellipseIn: CGRect(x: -sunR, y: -sunR, width: 2 * sunR, height: 2 * sunR), transform: nil)
@@ -250,6 +248,11 @@ final class SkyArcOverlayView: UIView {
         moonDiscLayer.fillColor = UIColor(white: 0.17 + 0.16 * t, alpha: 1).cgColor
         moonDiscLayer.strokeColor = UIColor(white: 0.10 + 0.72 * t,
                                             alpha: 0.55 + 0.35 * t).cgColor
+        // The ARC follows the sky like the disc: its old fixed light gray
+        // (0.75 @ 0.55) washed out against the bright daytime gradient — the
+        // "moon arc isn't there" reports. By day it darkens to a readable
+        // slate; by night it returns to moonlight gray.
+        moonArc.strokeColor = UIColor(white: 0.30 + 0.45 * t, alpha: 0.60).cgColor
     }
 
     /// The lit-region path for a moon of radius R, illuminated fraction k (0…1),

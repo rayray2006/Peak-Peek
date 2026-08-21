@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 @testable import PeakPeek
 
 final class GeoMathTests: XCTestCase {
@@ -156,6 +157,29 @@ final class EphemerisTests: XCTestCase {
             }
         }
     }
+
+    // Regression hunt for "moon arc sometimes missing": at mid-latitudes the
+    // moon crests well above the sea horizon on EVERY lap (max altitude ≥
+    // 90° − 48.8° − 28.7° ≈ 12.5° even at extreme southern declination), so a
+    // lap whose samples never clear the horizon means the anchor scan picked
+    // the wrong culmination and sampled a misplaced window. Two lunar months,
+    // four times a day, at the app's home latitude.
+    func testMoonLapAlwaysCrestsAboveHorizonOverTwoMonths() {
+        let base = Date(timeIntervalSince1970: 1_786_000_000)          // Aug 2026
+        for day in 0..<60 {
+            for hour in [2.0, 9.0, 15.0, 21.0] {
+                let d = base.addingTimeInterval(Double(day) * 86_400 + hour * 3_600)
+                let path = Ephemeris.windowPath(
+                    of: .moon, centeredOn: d, latitude: 48.83, longitude: -121.27)
+                XCTAssertTrue(path.covers(d), "lap must contain \(d)")
+                let els = path.samples.map(\.position.elevationDeg)
+                XCTAssertGreaterThan(els.max() ?? -90, 5,
+                                     "moon lap never clears the horizon at \(d)")
+                XCTAssertLessThan(els.min() ?? 90, -5,
+                                  "lap not anchored at a lower culmination at \(d)")
+            }
+        }
+    }
 }
 
 // (The AR magnification-matching crop and its tests are gone: AR is locked to
@@ -284,6 +308,43 @@ final class ProgressSmoothingTests: XCTestCase {
 
         XCTAssertFalse(wentBackward, "displayed progress moved backward (max seen \(maxSeen))")
         XCTAssertGreaterThan(maxSeen, 0.5, "progress should have climbed with the reports")
+    }
+
+    func testReadyRunsTheBarToTheEndBeforeLifting() {
+        let model = PanoramaViewModel()
+        // Pin a MANUAL viewpoint: the test host runs with live CLLocation, and
+        // a stray fix/authorization callback mid-test teleports the model —
+        // which (correctly) resets the very smoothing run this test drives.
+        // Manual mode gates all of those.
+        model.teleport(to: .init(name: "Test", latitude: 47, longitude: -121),
+                       manual: true)
+        var published: [Double] = []
+        var readyAfterFullBar = false
+        let sink = model.$status.sink { st in
+            if case let .rendering(p) = st { published.append(p) }
+            if case .ready = st, published.max() ?? 0 >= 0.999 { readyAfterFullBar = true }
+        }
+        defer { sink.cancel() }
+
+        // No runloop spin between these: the test-host app's live location
+        // callbacks can teleport the model mid-spin, which (correctly) resets
+        // the load's smoothing and would break the sequence under test.
+        model.renderStatusChanged(.preparingTerrain(progress: nil))   // load starts
+        model.renderStatusChanged(.rendering(progress: 0.4))
+        // The load completes while the rate-capped display is far behind: the
+        // bar must sweep visibly to 100% and only then settle at .ready —
+        // never vanish mid-flight.
+        model.renderStatusChanged(.ready)
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            if case .ready = model.status { break }
+        }
+        XCTAssertTrue(readyAfterFullBar,
+                      "expected the bar to reach 100% before .ready (max published \(published.max() ?? 0))")
+        for (a, b) in zip(published, published.dropFirst()) {
+            XCTAssertLessThanOrEqual(a, b + 1e-9, "finish sweep moved backward")
+        }
     }
 }
 
@@ -541,6 +602,49 @@ final class CancelMoveTests: XCTestCase {
     }
 }
 
+@MainActor
+final class StandOnPeakTests: XCTestCase {
+    private func annotated(_ p: Peak) -> AnnotatedPeak {
+        AnnotatedPeak(peak: p, azimuthDeg: 0, elevationAngleDeg: 0, distanceMeters: 1000)
+    }
+
+    /// A peak visit must carry the peak's IDENTITY and catalog height to the
+    /// renderer: the height is what the eye's apex match agrees against (so the
+    /// eye and the peak's own dot pick the same DEM cell), and the id is what
+    /// suppresses that dot once you're standing there.
+    func testStandingOnAPeakCarriesItsIDAndHeight() {
+        let model = PanoramaViewModel()
+        let k2 = Peak(id: "n:12345", name: "K2", latitude: 35.8825, longitude: 76.5133,
+                      elevationMeters: 8611, prominenceMeters: 4020)
+        model.standOnPeak(annotated(k2))
+        XCTAssertEqual(model.viewpoint?.summitTarget,
+                       PanoramaViewModel.SummitTarget(peakID: "n:12345",
+                                                      elevationMeters: 8611))
+    }
+
+    /// A saddle is a LOW point: no target, so nothing snaps uphill onto the
+    /// neighboring summit and nothing is suppressed.
+    func testStandingOnASaddleCarriesNoTarget() {
+        let model = PanoramaViewModel()
+        let gap = Peak(id: "n:999", name: "Easy Pass", latitude: 48.6, longitude: -120.6,
+                       elevationMeters: 1900, prominenceMeters: nil, isSaddle: true)
+        model.standOnPeak(annotated(gap))
+        XCTAssertNil(model.viewpoint?.summitTarget)
+    }
+
+    /// The target survives the last-viewpoint round trip, so reopening the app
+    /// stands you back on the apex — not on the catalog point.
+    func testSummitTargetSurvivesTheLastViewpointRoundTrip() throws {
+        let model = PanoramaViewModel()
+        let peak = Peak(id: "n:777", name: "Sahale Peak", latitude: 48.48, longitude: -121.06,
+                        elevationMeters: 2621, prominenceMeters: 300)
+        model.standOnPeak(annotated(peak))
+        let reopened = try XCTUnwrap(PanoramaViewModel.loadSavedViewpoint())
+        XCTAssertEqual(reopened.viewpoint.summitTarget?.peakID, "n:777")
+        XCTAssertEqual(reopened.viewpoint.summitTarget?.elevationMeters, 2621)
+    }
+}
+
 final class LakeClassificationTests: XCTestCase {
     /// The Wing Lake bug: a lake teleported to from beyond the nearby cache's
     /// 160 km reach must still classify as water, via the bundled global lakes
@@ -707,5 +811,206 @@ final class SightlineOcclusionTests: XCTestCase {
         // blanket-occlude everything downhill.
         XCTAssertFalse(marchOccluded(from: Self.horseflyPass, to: Self.lewisLake,
                                      eyeLift: 70))
+    }
+}
+
+final class LocalSummitTests: XCTestCase {
+    /// A synthetic tile from a row-major grid (row 0 = north), ~33 m cells.
+    private func makeTile(_ grid: [[Float]]) -> DEMTile {
+        let flat = grid.flatMap { $0 }
+        return DEMTile(ncols: grid[0].count, nrows: grid.count,
+                       xllcorner: -120, yllcorner: 45, cellsize: 0.0003,
+                       nodata: -9999, elevations: flat,
+                       maxElevation: flat.max() ?? 0)
+    }
+
+    private func centerQuery(_ tile: DEMTile) -> (lat: Double, lon: Double) {
+        (tile.yllcorner + Double(tile.nrows) * tile.cellsize / 2,
+         tile.xllcorner + Double(tile.ncols) * tile.cellsize / 2)
+    }
+
+    /// Two bumps joined by a 600 m ridge over a 100 m plain: the union-find
+    /// flood must credit the lower bump with prominence above the SADDLE
+    /// (800 − 600), the higher with prominence above the window floor.
+    func testTwoBumpsSplitProminenceAtTheSaddle() {
+        var g = [[Float]](repeating: [Float](repeating: 100, count: 20), count: 20)
+        for r in 4...6 { for c in 4...6 { g[r][c] = 900 } }
+        g[5][5] = 1000
+        for r in 4...6 { for c in 13...15 { g[r][c] = 700 } }
+        g[5][14] = 800
+        for c in 7...12 { g[5][c] = 600 }          // the connecting ridge
+        let tile = makeTile(g)
+        let q = centerQuery(tile)
+        let summits = tile.localSummits(lat: q.lat, lon: q.lon,
+                                        radiusMeters: 400, minProminence: 8)
+        XCTAssertEqual(summits.count, 2)
+        XCTAssertEqual(summits[0].elev, 1000)      // highest first
+        XCTAssertEqual(summits[0].prominence, 900) // above the window floor
+        XCTAssertEqual(summits[1].elev, 800)
+        XCTAssertEqual(summits[1].prominence, 200) // above the 600 m saddle
+        // Each summit sits on its bump's apex cell.
+        XCTAssertEqual(summits[0].lon, -120 + (5 + 0.5) * 0.0003, accuracy: 1e-9)
+        XCTAssertEqual(summits[1].lon, -120 + (14 + 0.5) * 0.0003, accuracy: 1e-9)
+    }
+
+    /// A flat 3-cell plateau must yield ONE candidate, not three.
+    func testPlateauYieldsOneSummit() {
+        var g = [[Float]](repeating: [Float](repeating: 100, count: 20), count: 20)
+        g[10][9] = 500; g[10][10] = 500; g[10][11] = 500
+        let tile = makeTile(g)
+        let q = centerQuery(tile)
+        let summits = tile.localSummits(lat: q.lat, lon: q.lon,
+                                        radiusMeters: 400, minProminence: 8)
+        XCTAssertEqual(summits.count, 1)
+        XCTAssertEqual(summits[0].elev, 500)
+        XCTAssertEqual(summits[0].prominence, 400)
+    }
+
+    /// Grid ripple below the prominence floor must not become a candidate.
+    func testMinProminenceFiltersRipple() {
+        var g = [[Float]](repeating: [Float](repeating: 100, count: 20), count: 20)
+        for r in 9...11 { for c in 9...11 { g[r][c] = 300 } }
+        g[10][10] = 320
+        g[15][15] = 106                            // 6 m ripple on the plain
+        let tile = makeTile(g)
+        let q = centerQuery(tile)
+        let summits = tile.localSummits(lat: q.lat, lon: q.lon,
+                                        radiusMeters: 400, minProminence: 8)
+        XCTAssertEqual(summits.map(\.elev), [320])
+        XCTAssertEqual(summits[0].prominence, 220)
+    }
+
+    // MARK: matchedSummit — the eye and the dot pick the SAME cell
+
+    /// The K2 bug: the catalog point sits on a low shoulder and the mountain's
+    /// real apex is ~400 m away (SRTM void-fill displaces big summits like
+    /// this). The LABEL always searched 600 m and scored on agreement with the
+    /// catalog height, while the EYE took the highest cell within ~250 m — so
+    /// "View" left you on the shoulder with the peak's own dot a few hundred
+    /// meters off. `matchedSummit` is now the one rule both use.
+    func testMatchedSummitReachesTheApexThatAgreesWithTheCatalogHeight() {
+        var g = [[Float]](repeating: [Float](repeating: 100, count: 26), count: 26)
+        for r in 11...13 { for c in 5...7 { g[r][c] = 380 } }
+        g[12][6] = 400                              // the shoulder, at the catalog point
+        for r in 11...13 { for c in 21...23 { g[r][c] = 880 } }
+        g[12][22] = 900                             // the real apex, 16 cells (~380 m) east
+        let tile = makeTile(g)
+        let catalog = (lat: tile.yllcorner + (Double(26 - 1 - 12) + 0.5) * tile.cellsize,
+                       lon: tile.xllcorner + (6 + 0.5) * tile.cellsize)
+        let apex = tile.matchedSummit(lat: catalog.lat, lon: catalog.lon,
+                                      catalogElevationMeters: 900)
+        XCTAssertEqual(apex?.elev, 900)
+        XCTAssertEqual(apex?.lon ?? 0, tile.xllcorner + (22 + 0.5) * tile.cellsize, accuracy: 1e-9)
+        // What the eye used to do, and why the dot ended up beside you.
+        XCTAssertEqual(tile.highestNear(lat: catalog.lat, lon: catalog.lon,
+                                        radiusMeters: 250).elev, 400)
+    }
+
+    /// Standing on a labelled FALSE summit must keep you on its own top: the
+    /// higher main summit next door overshoots the catalog height and is
+    /// penalized 2×. (This is what replaced the old "45% of the distance to the
+    /// nearest other peak" radius cap.)
+    func testMatchedSummitStaysOnAFalseSummitInsteadOfClimbingTheMainOne() {
+        var g = [[Float]](repeating: [Float](repeating: 100, count: 26), count: 26)
+        for r in 11...13 { for c in 11...13 { g[r][c] = 380 } }
+        g[12][12] = 400                             // the false summit (catalog 400 m)
+        for r in 11...13 { for c in 19...21 { g[r][c] = 880 } }
+        g[12][20] = 900                             // the main summit, ~190 m away
+        let tile = makeTile(g)
+        let catalog = (lat: tile.yllcorner + (Double(26 - 1 - 12) + 0.5) * tile.cellsize,
+                       lon: tile.xllcorner + (12 + 0.5) * tile.cellsize)
+        let apex = tile.matchedSummit(lat: catalog.lat, lon: catalog.lon,
+                                      catalogElevationMeters: 400)
+        XCTAssertEqual(apex?.elev, 400)
+        XCTAssertEqual(apex?.lon ?? 0, tile.xllcorner + (12 + 0.5) * tile.cellsize, accuracy: 1e-9)
+    }
+
+    /// No catalog height (an OSM peak with no `ele` tag): nothing to agree
+    /// with, so the higher candidate wins.
+    func testMatchedSummitWithoutACatalogHeightPrefersTheHigherBump() {
+        var g = [[Float]](repeating: [Float](repeating: 100, count: 26), count: 26)
+        for r in 11...13 { for c in 11...13 { g[r][c] = 380 } }
+        g[12][12] = 400
+        for r in 11...13 { for c in 19...21 { g[r][c] = 880 } }
+        g[12][20] = 900
+        let tile = makeTile(g)
+        let catalog = (lat: tile.yllcorner + (Double(26 - 1 - 12) + 0.5) * tile.cellsize,
+                       lon: tile.xllcorner + (12 + 0.5) * tile.cellsize)
+        XCTAssertEqual(tile.matchedSummit(lat: catalog.lat, lon: catalog.lon,
+                                          catalogElevationMeters: nil)?.elev, 900)
+    }
+
+    /// Flat ground has no local maximum to stand on — the caller falls back to
+    /// the catalog point rather than being handed an arbitrary cell.
+    func testMatchedSummitIsNilWithNoBumpInReach() {
+        let g = [[Float]](repeating: [Float](repeating: 100, count: 26), count: 26)
+        let tile = makeTile(g)
+        let q = centerQuery(tile)
+        XCTAssertNil(tile.matchedSummit(lat: q.lat, lon: q.lon,
+                                        catalogElevationMeters: 100))
+    }
+}
+
+final class SightlineProfileTests: XCTestCase {
+    /// A synthetic tile whose elevation varies only by COLUMN (west→east),
+    /// on the equator so a cell is a fixed 0.0003° ≈ 33.4 m of easting.
+    private func makeTile(profile: [Float]) -> DEMTile {
+        let row = profile
+        let grid = [[Float]](repeating: row, count: 21)
+        return DEMTile(ncols: row.count, nrows: 21, xllcorner: 0, yllcorner: -0.00315,
+                       cellsize: 0.0003, nodata: -9999, elevations: grid.flatMap { $0 },
+                       maxElevation: profile.max() ?? 0)
+    }
+
+    private let cellMeters = 0.0003 * 111_320.0
+    private func lon(col: Double) -> Double { (col + 0.5) * 0.0003 }
+
+    private func profile(_ tile: DEMTile, eyeCol: Double, featCol: Double,
+                         featElev: Double, camElev: Double)
+        -> (blocked: Bool, crestHoriz: Double, crestTan: Double, colDepth: Double) {
+        let horiz = (featCol - eyeCol) * cellMeters
+        return TerrainMetalView.Coordinator.sightlineProfile(
+            eyeLat: 0, eyeLon: lon(col: eyeCol),
+            featLat: 0, featLon: lon(col: featCol),
+            horiz: horiz, apparentUp: featElev - camElev,
+            camElevMeters: camElev, heightScale: 1, curvatureK: 0,
+            dem: tile, far: nil)
+    }
+
+    /// Summit hidden behind its OWN shoulder (ground rises continuously from
+    /// the shoulder to the top): blocked, but with essentially no col — the
+    /// case that pins the label to the visible crest.
+    func testOwnShoulderBlocksWithShallowCol() {
+        var p = [Float](repeating: 100, count: 45)
+        for c in 10...30 { p[c] = 100 + Float(c - 10) * 35 }      // rise to 800
+        for c in 31...40 { p[c] = 800 + Float(c - 30) * 20 }      // shoulder → 1000 summit
+        let tile = makeTile(profile: p)
+        let r = profile(tile, eyeCol: 5.5, featCol: 40.5, featElev: 1000, camElev: 101.6)
+        XCTAssertTrue(r.blocked)
+        XCTAssertLessThan(r.colDepth, 40, "one continuous mass — no hidden valley")
+    }
+
+    /// A SEPARATE foreground ridge with a deep valley behind it: blocked with
+    /// a col of hundreds of meters — must NOT crest-pin.
+    func testSeparateRidgeBlocksWithDeepCol() {
+        var p = [Float](repeating: 100, count: 45)
+        for c in 10...19 { p[c] = 100 + Float(c - 10) * 78 }      // ridge to ~800
+        p[20] = 800
+        for c in 21...29 { p[c] = 200 }                            // hidden valley
+        for c in 30...40 { p[c] = 200 + Float(c - 30) * 80 }      // far summit 1000
+        let tile = makeTile(profile: p)
+        let r = profile(tile, eyeCol: 5.5, featCol: 40.5, featElev: 1000, camElev: 101.6)
+        XCTAssertTrue(r.blocked)
+        XCTAssertGreaterThan(r.colDepth, 200)
+    }
+
+    /// Concave approach (flat valley floor, then a steep final rise): the
+    /// summit is genuinely visible — not blocked.
+    func testClearSightlineOverConcaveGround() {
+        var p = [Float](repeating: 100, count: 45)
+        for c in 35...40 { p[c] = 100 + Float(c - 35) * 180 }     // steep rise to 1000
+        let tile = makeTile(profile: p)
+        let r = profile(tile, eyeCol: 5.5, featCol: 40.5, featElev: 1000, camElev: 101.6)
+        XCTAssertFalse(r.blocked)
     }
 }

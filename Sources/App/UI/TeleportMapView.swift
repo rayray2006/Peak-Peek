@@ -39,7 +39,12 @@ struct TeleportMapView: View {
         // styling, not the themed ink.
         MapReader { proxy in
             Map(initialPosition: startPosition) { mapAnnotations }
-            .mapStyle(.hybrid(elevation: .realistic))
+            // FLAT elevation, like the region manager's map (which hit the
+            // same bug first): with .realistic, annotations drape onto a 3D
+            // terrain mesh and don't render until a camera change forces a
+            // re-tessellation — the viewpoint pin was invisible until the map
+            // was moved or zoomed.
+            .mapStyle(.hybrid(elevation: .flat))
             // No compass/scale chrome: they pop in during rotation right where
             // the floating title and ✕ live, and a pin-drop picker needs neither.
             .mapControlVisibility(.hidden)
@@ -400,8 +405,10 @@ struct MiniMapView: View {
         }
         // Same cartography as the full teleport map — one map style app-wide.
         // (No saturation wash: it was tuned for the pale standard tiles and
-        // just greyed the hybrid imagery.)
-        .mapStyle(.hybrid(elevation: .realistic))
+        // just greyed the hybrid imagery.) FLAT elevation: annotations drape
+        // onto the .realistic 3D mesh only after a camera change, and this
+        // map is non-interactive — the viewpoint pin never appeared at all.
+        .mapStyle(.hybrid(elevation: .flat))
         .frame(width: 104, height: 104)
         .clipShape(RoundedRectangle(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(TopoStyle.hairline(0.12), lineWidth: 1))

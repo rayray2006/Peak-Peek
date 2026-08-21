@@ -222,7 +222,7 @@ struct TerrainMetalView: UIViewRepresentable {
         context.coordinator.setCancelMoveToken(cancelMoveToken)
         if let vp = viewpoint {
             context.coordinator.requestViewpoint(lat: vp.latitude, lon: vp.longitude,
-                                                 snapToSummit: vp.snapToSummit)
+                                                 summitTarget: vp.summitTarget)
         }
     }
 
@@ -561,15 +561,26 @@ struct TerrainMetalView: UIViewRepresentable {
 
         // Viewpoint bookkeeping.
         private var lastRequested: (lat: Double, lon: Double)?
-        /// Set by "Stand here": once the DEM is in, move the eye to the true summit.
+        /// Set by "Stand here": once the DEM is in, move the eye onto the peak's
+        /// rendered apex (see summitSnappedEye).
         private var pendingSummitSnap = false
+        /// Catalog height of that peak (nil/0 = the catalog has none) — what the
+        /// apex match agrees against, so the eye and the peak's dot pick the
+        /// same DEM cell.
+        private var pendingSummitElevation: Double?
+        /// Catalog id of the peak being stood ON. Its own label is suppressed
+        /// while you stand there: you cannot see the summit under your feet,
+        /// and any residual cell-scale disagreement used to show up as the
+        /// mountain's own dot hovering a few hundred meters away.
+        private(set) var standingOnPeakID: String?
         private var isReloading = false
         /// The last coordinate whose load FAILED, with when — gates the
         /// passive re-request loop (see requestViewpoint).
         private var lastFailedRequest: (lat: Double, lon: Double, at: Date)?
         /// The latest viewpoint requested while a reload was in flight; run when
         /// the current bake settles instead of being silently dropped.
-        private var queuedRequest: (lat: Double, lon: Double, snap: Bool)?
+        private var queuedRequest: (lat: Double, lon: Double,
+                                    target: PanoramaViewModel.SummitTarget?)?
         /// Generation stamp for viewpoint moves: every requestViewpoint bumps
         /// it, and every completion (fetch install, failure report, bake
         /// onReady, progress tick) is guarded on it — so a cancelled or
@@ -581,10 +592,28 @@ struct TerrainMetalView: UIViewRepresentable {
         /// on a mid-fetch cancel so the revert-teleport's resubmission of the
         /// still-displayed spot dedupes to a no-op instead of re-baking it.
         private var requestBeforeMove: (lat: Double, lon: Double)?
+        /// `standingOnPeakID` as it stood before the in-flight move — restored
+        /// with the dedupe memory above (the resubmission no-ops, so nothing
+        /// else would put it back).
+        private var standingOnBeforeMove: String?
         /// True once the in-flight move has retargeted scene state (refLat,
         /// ground, sky). Fetch moves stay false until install; reuse-fast-path
-        /// moves flip immediately — that's the case a cancel must re-bake.
+        /// moves flip immediately.
         private var moveMutatedScene = false
+        /// Eye state as it stood before the in-flight move, plus the DEM
+        /// identity it belongs to: a mutated-scene cancel restores these
+        /// directly (the displayed panorama still shows the old scene — only
+        /// the scalars moved), making ✕ instant instead of a full re-bake.
+        /// The restore is only safe while the move hasn't swapped tiles.
+        private var sceneBeforeMove: (refLat: Double, refLon: Double,
+                                      ground: Float, demGen: Int)?
+        /// Bumped whenever dem/demFar are (re)assigned — the tile identity
+        /// guard for the instant-cancel restore above.
+        private var demGeneration = 0
+        /// The in-flight move's DEM fetch. Cancelled on ✕ so an abandoned
+        /// multi-tile download stops pulling data instead of running to
+        /// completion in the background (memory + bandwidth it will discard).
+        private var fetchTask: Task<Void, Never>?
 
         /// The switching card's ✕: abandon the in-flight move. The scene on
         /// screen still shows the PREVIOUS viewpoint (a new panorama only
@@ -594,25 +623,70 @@ struct TerrainMetalView: UIViewRepresentable {
         func setCancelMoveToken(_ token: Int) {
             guard token != cancelMoveToken else { return }
             cancelMoveToken = token
-            guard isReloading else { return }
+            guard isReloading else {
+                // The load settled in the beat between the ✕ appearing and the
+                // tap (the display's finish sweep keeps the card up ~a second
+                // past real completion). The model's revert-teleport has
+                // already flipped its status to "preparing" — answer it, or
+                // the card sticks on a load that will never report.
+                report(.ready)
+                return
+            }
             moveGeneration &+= 1
             bakeGeneration &+= 1
             queuedRequest = nil
             isReloading = false
-            if moveMutatedScene {
-                // The move already retargeted the scene state (a reuse-move
-                // mid-bake): the model's revert-teleport (same update pass)
-                // must re-request and re-bake the old spot.
-                lastRequested = nil
-            } else {
+            fetchTask?.cancel()
+            fetchTask = nil
+            if !moveMutatedScene {
                 // Cancelled mid-fetch: nothing was touched — the displayed
                 // scene IS the previous viewpoint. Restore the dedupe memory
                 // so the revert resubmission no-ops, and stand ready NOW: no
                 // re-bake, and no waiting out the orphaned fetch's stitch
                 // (which starves the cores for seconds after a heavy cancel).
+                // The revert no-ops, so the abandoned peak's identity must come
+                // back with it — otherwise its label stays suppressed here.
+                standingOnPeakID = standingOnBeforeMove
                 lastRequested = requestBeforeMove
                 report(.ready)
                 onEyeElevation(Double(groundElev) + 1.6)
+            } else if let pre = sceneBeforeMove, pre.demGen == demGeneration, dem != nil {
+                // The move retargeted the eye/sky scalars but the TILES (and
+                // the displayed panorama, which only swaps when its bake
+                // completes) are still the old scene's — put the scalars back
+                // and stand ready NOW. The old ✕ re-baked the old spot from
+                // scratch here: a fresh full loading bar right after "cancel",
+                // which read as the cancel not working, and its pile-up of
+                // concurrent bakes + anchor builds could spike memory into a
+                // jetsam kill.
+                refLat = pre.refLat; refLon = pre.refLon
+                groundElev = pre.ground
+                standingOnPeakID = standingOnBeforeMove   // before the re-judge below
+                recomputeCamElev()
+                pendingPanoTex = nil
+                pendingAnchors = nil
+                pendingAnchorsUnchanged = false
+                pendingOnReady = nil
+                rebakePending = false
+                // Orphan the move's in-flight anchor build and re-judge for
+                // the restored eye in the background — the overlay still shows
+                // the old scene's dots throughout (swap never ran), so nothing
+                // visibly changes while this lands.
+                lastAnchorState = nil
+                labelGeneration &+= 1
+                anchorAbort?.cancelled = true
+                rebuildSky()
+                updateFarHorizon()
+                rebuildLabelAnchors()
+                lastRequested = requestBeforeMove
+                report(.ready)
+                onEyeElevation(Double(groundElev) + 1.6)
+            } else {
+                // The move already swapped tiles (fetch install, bake pending):
+                // the old scalars belong to evicted tiles, so the model's
+                // revert-teleport (same update pass) must re-request and
+                // re-bake the old spot for real.
+                lastRequested = nil
             }
         }
 
@@ -622,7 +696,7 @@ struct TerrainMetalView: UIViewRepresentable {
             isReloading = false
             if let q = queuedRequest {
                 queuedRequest = nil
-                requestViewpoint(lat: q.lat, lon: q.lon, snapToSummit: q.snap)
+                requestViewpoint(lat: q.lat, lon: q.lon, summitTarget: q.target)
             } else if ringLandedMidBake {
                 // The far-horizon ring arrived after this bake's bands encoded:
                 // top the panorama up quietly so distant silhouettes appear.
@@ -661,10 +735,13 @@ struct TerrainMetalView: UIViewRepresentable {
             report(.preparingTerrain(progress: Self.loadShare * fraction))
         }
         /// Download + stitch span 0…loadShare of the readout; the bake then
-        /// sweeps loadShare…0.95 on its per-band completions (see
-        /// `bakeProgressive`), holds at 0.95 while the labels land, and `.ready`
-        /// closes it out.
-        private static let loadShare = 0.85
+        /// sweeps a short band above it and the LABEL-ANCHOR build (reported
+        /// per-feature from buildAnchors) fills the rest up to 0.98 — see
+        /// `bakeProgressive`. 0.5, not the old 0.85: on a cold load the anchor
+        /// judge takes about as long as the network fetch, and giving the
+        /// fetch 85 points squeezed the longest silent phase into the bar's
+        /// last sliver — the "pauses near the end" readout.
+        private static let loadShare = 0.5
         /// Bumped per bake request; a completing bake whose token is stale (a newer
         /// viewpoint/exaggeration was requested) is discarded instead of installed.
         private var bakeGeneration = 0
@@ -723,9 +800,17 @@ struct TerrainMetalView: UIViewRepresentable {
                 if let ref = celestialRef,
                    abs(ref.lat - refLat) > 1e-6 || abs(ref.lon - refLon) > 1e-6
                     || celestialRingGen != ringNow {
+                    NSLog("Celestial cleared at swap (ring %d vs %d) — rescheduling",
+                          celestialRingGen, ringNow)
                     container?.skyArc.clearCelestial()
                     celestialRef = nil
                     celestialRingGen = -1
+                    // The fresh pass was only IMPLIED here: under the live
+                    // clock the next 30 s tick supplied it, but in simulated
+                    // time (scrubbed sky) no tick ever comes and the overlay
+                    // stayed EMPTY — arcs and discs gone until the next scrub.
+                    // Schedule it explicitly.
+                    rebuildCelestial()
                 }
             }
             // Reused anchors are already on the overlay and unchanged — leave its
@@ -1215,7 +1300,8 @@ struct TerrainMetalView: UIViewRepresentable {
         /// the CURRENT tile already covers this point (with a margin of terrain around
         /// the eye), reuse it and skip the network — exploring or GPS-walking within a
         /// region then costs zero downloads.
-        func requestViewpoint(lat: Double, lon: Double, snapToSummit: Bool = false) {
+        func requestViewpoint(lat: Double, lon: Double,
+                              summitTarget: PanoramaViewModel.SummitTarget? = nil) {
             if let last = lastRequested,
                abs(last.lat - lat) < 1e-6, abs(last.lon - lon) < 1e-6 { return }
             // A spot that just FAILED (offline fetch): updateUIView resubmits
@@ -1232,16 +1318,20 @@ struct TerrainMetalView: UIViewRepresentable {
                 // standing at the new feature while the render stayed put (the
                 // Illumination Saddle → Rock bug). Keep only the LATEST request
                 // and run it when the in-flight bake settles (finishReload).
-                queuedRequest = (lat: lat, lon: lon, snap: snapToSummit)
+                queuedRequest = (lat: lat, lon: lon, target: summitTarget)
                 return
             }
             requestBeforeMove = lastRequested
+            standingOnBeforeMove = standingOnPeakID
             lastRequested = (lat, lon)
-            pendingSummitSnap = snapToSummit
+            pendingSummitSnap = summitTarget != nil
+            pendingSummitElevation = summitTarget?.elevationMeters
+            standingOnPeakID = summitTarget.flatMap { $0.peakID.isEmpty ? nil : $0.peakID }
             isReloading = true
             moveGeneration &+= 1
             let gen = moveGeneration
             moveMutatedScene = false
+            sceneBeforeMove = (refLat, refLon, groundElev, demGeneration)
             report(.preparingTerrain(progress: nil))
 
             // Reuse fast-path: both tiers already cover this viewpoint.
@@ -1268,7 +1358,7 @@ struct TerrainMetalView: UIViewRepresentable {
             }
 
             guard let device = view?.device else { isReloading = false; return }
-            Task { [weak self] in
+            fetchTask = Task { [weak self] in
                 let t0 = DispatchTime.now()
                 var nearTile: DEMTile?
                 var farTile: DEMTile?
@@ -1348,6 +1438,10 @@ struct TerrainMetalView: UIViewRepresentable {
                         fromNetwork = nearResult.complete && farResult.complete
                         if !fromNetwork { NSLog("DEM fetch incomplete (transient tile failures) — not snapshotting") }
                     } catch {
+                        // A cancelled move throws out of the URLSession awaits:
+                        // stop dead — no bundled fallback, no failure report
+                        // (the ✕ path already stood the old scene back up).
+                        if Task.isCancelled { return }
                         if let bundled = self?.bundledTile(), bundled.contains(lat: lat, lon: lon) {
                             nearTile = bundled; farTile = bundled
                             NSLog("DEM fetch failed; using bundled cascades fallback")
@@ -1384,8 +1478,9 @@ struct TerrainMetalView: UIViewRepresentable {
                 await MainActor.run {
                     guard let self, gen == self.moveGeneration else { return }  // cancelled
                     self.moveMutatedScene = true
-                    self.dem = tile
-                    self.demFar = farTile
+                    self.demGeneration &+= 1     // tiles swapped: the pre-move
+                    self.dem = tile              // scalars can no longer be
+                    self.demFar = farTile        // restored by a cancel
                     self.onDEMTiles(tile, farTile)
                     self.renderer?.heightTexture = tex
                     self.renderer?.farHeightTexture = farTex
@@ -1408,16 +1503,34 @@ struct TerrainMetalView: UIViewRepresentable {
         }
 
         /// Where the eye actually stands. Plain viewpoints (GPS, map pin) use the
-        /// exact coordinate; a "Stand here" peak visit snaps to the highest DEM
-        /// cell nearby — catalog summit coords are often tens of meters off the
-        /// true top, which leaves a shoulder blocking part of the panorama. The
-        /// snap radius is capped at ~45% of the distance to the NEAREST OTHER
-        /// named peak, so standing on a labelled false summit keeps you on ITS
-        /// top instead of teleporting you to the higher main summit.
+        /// exact coordinate; a "Stand here" peak visit stands on the peak's
+        /// RENDERED apex — catalog summit coords are often tens of meters off
+        /// the true top, which leaves a shoulder blocking part of the panorama.
+        ///
+        /// The apex is chosen by `DEMTile.matchedSummit`, i.e. the SAME scoring
+        /// the label pass uses to place this peak's dot. That is the whole
+        /// point: the eye used to take the highest cell within ~250 m while the
+        /// dot searched 600 m for the maximum agreeing with the catalog height,
+        /// so on a big void-filled summit (K2) the two picked different cells —
+        /// you arrived on a shoulder with the mountain's own dot sitting a few
+        /// hundred meters away. Elevation agreement (overshoot penalized 2×)
+        /// also subsumes the old "45% of the distance to the nearest other
+        /// peak" cap: a labelled false summit matches its OWN bump, never the
+        /// higher main summit next door.
+        ///
+        /// Fallbacks, in order: no catalog height (nothing to agree with) or no
+        /// local maximum in reach (a gendarme inside a bigger mass) → the old
+        /// nearest-peak-capped highest-cell search, which never stands below
+        /// the catalog point.
         private func summitSnappedEye(
             lat: Double, lon: Double, tile: DEMTile
         ) -> (lat: Double, lon: Double, elev: Float) {
             if pendingSummitSnap {
+                if let target = pendingSummitElevation, target > 0,
+                   let apex = tile.matchedSummit(lat: lat, lon: lon,
+                                                 catalogElevationMeters: target) {
+                    return (apex.lat, apex.lon, apex.elev)
+                }
                 let mLat = 111_320.0, mLon = 111_320.0 * max(cos(lat * .pi / 180), 0.01)
                 var nearestOther = Double.infinity
                 for p in peaks {
@@ -1624,10 +1737,25 @@ struct TerrainMetalView: UIViewRepresentable {
         /// all three serialized the GPU behind the bake and tripled the wait
         /// before labels (and, during a re-bake, the whole scene swap) could
         /// land. Only the last request in a burst actually runs.
-        private func rebuildLabelAnchors() {
+        /// Cooperative abort for an in-flight buildAnchors: superseded builds
+        /// used to run their full 10–20 s judge to completion just to have the
+        /// result discarded by the generation check — a cancel or quick chain
+        /// of moves stacked several concurrent builds (each holding a ~65 MB
+        /// depth map), spiking memory toward a jetsam kill. Workers poll the
+        /// flag and bail. Plain Bool on purpose: the race is benign (a few
+        /// extra iterations at worst — stale results are gen-discarded anyway).
+        private final class AnchorAbort { var cancelled = false }
+        private var anchorAbort: AnchorAbort?
+
+        /// `reporter` (loads only — bakeProgressive's bar tail): called with the
+        /// build's 0…1 fraction as features are judged. Standalone rebuilds
+        /// (exaggeration, units, saved-spot edits) pass nothing.
+        private func rebuildLabelAnchors(reporter: ((Double) -> Void)? = nil) {
             anchorRebuildWork?.cancel()
             anchorBuildInFlight = true
-            let work = DispatchWorkItem { [weak self] in self?.rebuildLabelAnchorsNow() }
+            let work = DispatchWorkItem { [weak self] in
+                self?.rebuildLabelAnchorsNow(reporter: reporter)
+            }
             anchorRebuildWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: work)
         }
@@ -1637,7 +1765,7 @@ struct TerrainMetalView: UIViewRepresentable {
         /// token drops stale results. The result routes through `installAnchors`:
         /// installed directly when the scene is stable, or stashed for the atomic
         /// swap while a re-bake is in flight — safe to call mid-bake.
-        private func rebuildLabelAnchorsNow() {
+        private func rebuildLabelAnchorsNow(reporter: ((Double) -> Void)? = nil) {
             // Early-outs still deliver a (empty) result: during a re-bake the swap
             // barrier is waiting on it — silently returning would hang the swap.
             guard let dem else {
@@ -1665,6 +1793,7 @@ struct TerrainMetalView: UIViewRepresentable {
             let renderer = self.renderer
             let ringProfile = farProfile           // main-thread snapshot for the worker
             let ringStamp = farProfileGen          // which ring the anchors will reflect
+            let standingOn = standingOnPeakID      // its own dot is under your feet
             // Pace the depth pass whenever a scene is LIVE under it (moves,
             // ring top-ups): unpaced bands saturated the GPU and the still-
             // interactive old scene panned with a stutter. First load (no
@@ -1672,6 +1801,9 @@ struct TerrainMetalView: UIViewRepresentable {
             let paceDepth = panoInstalled
             labelGeneration &+= 1
             let gen = labelGeneration
+            anchorAbort?.cancelled = true     // supersede: stop the old judge NOW
+            let abort = AnchorAbort()
+            anchorAbort = abort
             // .userInitiated, not .utility: during a move this build GATES the
             // scene swap (maybeCompleteSwap waits on it) — utility landed it on
             // efficiency cores and visibly stretched the "Switching location" tail.
@@ -1685,13 +1817,15 @@ struct TerrainMetalView: UIViewRepresentable {
                 defer {
                     if Self.labelDebug { NSLog("Anchor build: %.0f ms", Self.ms(since: tB)) }
                 }
+                reporter?(0.03)   // depth pass done; the judge loop reports the rest
                 let (anchors, visibleIDs) = Self.buildAnchors(
                     peaks: peaks, lakes: lakes, savedSpots: savedSpots,
                     dem: dem, far: far, refLat: refLat, refLon: refLon,
                     camElevMeters: camElevM, heightScale: hs,
                     depth: depthMap?.depth ?? [], depthW: depthMap?.width ?? 0,
                     depthH: depthMap?.height ?? 0, skyDepth: skyDepth, panoElevMax: panoElevMax,
-                    ringProfile: ringProfile)
+                    ringProfile: ringProfile, standingOnPeakID: standingOn,
+                    onProgress: reporter, abort: abort)
                 DispatchQueue.main.async {
                     guard let self else { return }
                     // Depth-pass health is orthogonal to staleness: a failed
@@ -2065,6 +2199,10 @@ struct TerrainMetalView: UIViewRepresentable {
                     guard let self else { return }
                     let apply = { [weak self] in
                         guard let self, let so = self.container?.skyArc else { return }
+                        NSLog("Celestial apply: sun %d/%d moon %d/%d visible samples, date %@",
+                              sun.samples.filter(\.visible).count, sun.samples.count,
+                              moon.samples.filter(\.visible).count, moon.samples.count,
+                              "\(date)")
                         so.sunSamples = sun.samples
                         so.moonSamples = moon.samples
                         so.sunDisc = sunDisc
@@ -2106,6 +2244,7 @@ struct TerrainMetalView: UIViewRepresentable {
                         && abs(lon - self.refLon) < 1e-6
                     if (self.isReloading || self.rebakePending)
                         && !(self.onCelestialInstalled != nil && matchesCurrent) {
+                        NSLog("Celestial stashed for swap (ring %d)", ringGen)
                         self.pendingCelestialApply = (lat, lon, ringGen, apply)
                     } else {
                         apply()
@@ -2244,7 +2383,10 @@ struct TerrainMetalView: UIViewRepresentable {
             dem: DEMTile, far: DEMTile?, refLat: Double, refLon: Double,
             camElevMeters: Double, heightScale: Double,
             depth: [Float], depthW: Int, depthH: Int, skyDepth: Double, panoElevMax: Double,
-            ringProfile: FarHorizon.Profile?
+            ringProfile: FarHorizon.Profile?,
+            standingOnPeakID: String? = nil,
+            onProgress: ((Double) -> Void)? = nil,
+            abort: AnchorAbort? = nil
         ) -> (anchors: [PeakLabelOverlayView.Anchor], visibleIDs: Set<String>) {
             let mLat = 111_320.0
             let mLon = 111_320.0 * max(cos(refLat * .pi / 180), 0.01)
@@ -2268,64 +2410,61 @@ struct TerrainMetalView: UIViewRepresentable {
             // `ringVisible` = drawn only by the far-horizon ring: honestly VISIBLE
             // (info card / search say so) but deliberately unlabeled — it never
             // becomes an anchor.
-            enum Verdict: UInt8 { case skipped = 0, shown, occluded, floating, ringVisible }
-            // ---- Deterministic summit CLAIMING --------------------------------
-            // The old scheme let every peak independently grab the highest cell
-            // within its radius, with a SYMMETRIC neighbor cap — two failure
-            // modes, both live on the Matterhorn: Épaule de Furggen 157 m away
-            // crushed the Matterhorn's own snap radius to 71 m, and the
-            // void-filled SRTM summit (3567 m where the mountain is 4478!) put
-            // the massif's highest DRAWN cell (4230 m) over Pic Tyndall — whose
-            // independent snap then claimed the drawn apex while the Matterhorn
-            // label sat visibly below it. Now:
-            //  1. Radius caps are ASYMMETRIC: only a HIGHER catalog peak shrinks
-            //     a neighbor's reach (a false summit must never starve the main
-            //     peak's), ties broken by id for determinism.
-            //  2. Peaks snap SERIALLY in descending catalog elevation, each
-            //     claiming its cell (plus a one-cell halo) — the dominant peak
-            //     of a cluster always gets the best cell, subordinates take the
-            //     next-best, never a race.
-            //  3. A dominant whose best cell UNDERSHOOTS its catalog height by
-            //     >150 m (the void-fill signature) extends its scan once to
-            //     600 m so it can claim the massif's true drawn apex; and
-            //     cells above a peak's own height carry an overshoot penalty
-            //     (see summitCellNear), so shoulders prefer their own tops.
+            // `standingOn` = the peak under the eye's feet: certainly visible
+            // (the search and its card say so), deliberately unlabeled.
+            enum Verdict: UInt8 {
+                case skipped = 0, shown, occluded, floating, ringVisible, standingOn
+            }
+            // ---- Summit MATCHING ----------------------------------------------
+            // The drawn terrain has a finite set of summits: the DEM grid's
+            // LOCAL MAXIMA. Which bump is which peak is an ASSIGNMENT problem,
+            // not a per-peak "highest cell in reach" search — the old radius/
+            // claim heuristics let a crowd loser take an arbitrary next-best
+            // cell, i.e. a flank, which is exactly where mis-placed dots came
+            // from. Now: every peak collects the candidate maxima near its
+            // catalog coordinate (parallel window scans), then peaks match
+            // serially in descending catalog elevation, each taking the best-
+            // scoring UNCLAIMED maximum (elevation agreement + distance +
+            // prominence). Each maximum hosts at most one label, so a dot can
+            // only sit on a real apex of the rendered surface. A peak with no
+            // unclaimed maximum in reach gets NO snap: it anchors at its
+            // catalog point and the silhouette pin below settles it onto the
+            // drawn crest — honest, and it means the DEM has no bump of its
+            // own for it (a gendarme inside a bigger peak's mass).
+            //
+            // The old scheme's special cases fall out of the scoring:
+            //  · void-filled summits (Matterhorn's SRTM top reads 3567 m where
+            //    the mountain is 4478): the drawn apex wins on elevation
+            //    agreement + prominence despite its distance, no 600 m rescue
+            //    scan needed — the search radius is just 600 for everyone;
+            //  · shoulder peaks (Pic Tyndall) can't steal the apex: the main
+            //    summit claims first, and overshoot is penalized 2×;
+            //  · a subordinate 157 m out (Épaule de Furggen) can't shrink the
+            //    dominant's reach — there are no per-peak radii to shrink.
             let effElev: [Double] = peaks.map { $0.elevationMeters }
-            var snapRadius = [Double](repeating: 300, count: peaks.count)
-            if peaks.count > 1 {
-                let cellLat = 0.006
-                let cellLon = 0.006 / max(cos(refLat * .pi / 180), 0.01)
-                func cellKey(_ la: Int64, _ lo: Int64) -> Int64 { la &* 1_000_000 &+ lo }
-                var grid: [Int64: [Int]] = [:]
-                for (i, p) in peaks.enumerated() {
-                    grid[cellKey(Int64((p.latitude + 90) / cellLat),
-                                 Int64((p.longitude + 180) / cellLon)), default: []].append(i)
-                }
-                for (i, p) in peaks.enumerated() {
-                    let la = Int64((p.latitude + 90) / cellLat)
-                    let lo = Int64((p.longitude + 180) / cellLon)
-                    var nn = Double.infinity
-                    for dla in -1...1 {
-                        for dlo in -1...1 {
-                            // Saddles never snap; LOWER peaks never shrink a
-                            // higher one's reach (asymmetric cap, rule 1).
-                            for j in grid[cellKey(la + Int64(dla), lo + Int64(dlo)), default: []]
-                            where j != i && !peaks[j].isSaddle
-                                && (effElev[j] > effElev[i]
-                                    || (effElev[j] == effElev[i] && peaks[j].id < peaks[i].id)) {
-                                let q = peaks[j]
-                                let d = hypot((q.latitude - p.latitude) * mLat,
-                                              (q.longitude - p.longitude) * mLon)
-                                if d < nn { nn = d }
-                            }
-                        }
+            // Candidate maxima per peak (parallel; each slot written once).
+            // Reach and prominence floor come from DEMTile — the same window
+            // the EYE searches when you stand on a peak.
+            var candidates = [[DEMTile.LocalSummit]](repeating: [], count: peaks.count)
+            if !peaks.isEmpty {
+                candidates.withUnsafeMutableBufferPointer { cand in
+                    DispatchQueue.concurrentPerform(iterations: peaks.count) { i in
+                        if abort?.cancelled == true { return }
+                        let p = peaks[i]
+                        guard !p.isSaddle else { return }
+                        guard hypot((p.longitude - refLon) * mLon,
+                                    (p.latitude - refLat) * mLat) <= maxDist + 500 else { return }
+                        let inNear = dem.contains(lat: p.latitude, lon: p.longitude)
+                        let tile = inNear ? dem : (far ?? dem)
+                        guard tile.contains(lat: p.latitude, lon: p.longitude) else { return }
+                        cand[i] = tile.localSummits(
+                            lat: p.latitude, lon: p.longitude,
+                            radiusMeters: DEMTile.summitSearchRadiusMeters,
+                            minProminence: DEMTile.summitMinProminence)
                     }
-                    if nn * 0.45 < 300 { snapRadius[i] = max(40, nn * 0.45) }
                 }
             }
-            // Serial claim pass (rules 2–3). Cheap: one small window scan per
-            // peak (~tens of ms across the catalog), and it makes the whole
-            // assignment order-deterministic.
+            onProgress?(0.05)   // candidate scan done; the judge loop is the rest
             var snappedCell = [(lat: Double, lon: Double, elev: Float)?](
                 repeating: nil, count: peaks.count)
             do {
@@ -2339,28 +2478,39 @@ struct TerrainMetalView: UIViewRepresentable {
                     effElev[$0] == effElev[$1] ? peaks[$0].id < peaks[$1].id
                                                : effElev[$0] > effElev[$1]
                 }
-                for i in order where !peaks[i].isSaddle {
+                for i in order where !candidates[i].isEmpty {
                     let p = peaks[i]
-                    let inNear = dem.contains(lat: p.latitude, lon: p.longitude)
-                    let tile = inNear ? dem : (far ?? dem)
-                    guard tile.contains(lat: p.latitude, lon: p.longitude) else { continue }
-                    let target = p.elevationMeters > 0 ? Float(p.elevationMeters) : nil
-                    let excluded: (Double, Double) -> Bool = { claimed.contains(claimKey($0, $1)) }
-                    var s = tile.summitCellNear(lat: p.latitude, lon: p.longitude,
-                                                radiusMeters: snapRadius[i],
-                                                targetElev: target, isExcluded: excluded)
-                    if let target, target - s.elev > 150, snapRadius[i] < 600 {
-                        // Void-shaved summit: reach out for the drawn apex.
-                        s = tile.summitCellNear(lat: p.latitude, lon: p.longitude,
-                                                radiusMeters: 600,
-                                                targetElev: target, isExcluded: excluded)
+                    let target = p.elevationMeters > 0 ? p.elevationMeters : nil
+                    var best: (score: Double, s: DEMTile.LocalSummit)?
+                    for s in candidates[i] where !claimed.contains(claimKey(s.lat, s.lon)) {
+                        // Shared scoring rule (DEMTile.summitMatchScore) — the
+                        // eye's "Stand here" snap runs the identical formula.
+                        let score = DEMTile.summitMatchScore(
+                            s, catalogLat: p.latitude, catalogLon: p.longitude,
+                            catalogElevationMeters: target,
+                            metersPerDegLat: mLat, metersPerDegLon: mLon)
+                        if best == nil || score > best!.score { best = (score, s) }
                     }
-                    snappedCell[i] = s
-                    let halo = tile.cellsize
+                    if let needle = Self.labelWatch, p.name.lowercased().contains(needle) {
+                        if let best {
+                            NSLog("labelWatch %@: MATCHED summit %.5f,%.5f elev %.0f prom %.0f (of %d candidates, score %.0f)",
+                                  p.name, best.s.lat, best.s.lon, Double(best.s.elev),
+                                  Double(best.s.prominence), candidates[i].count, best.score)
+                        } else {
+                            NSLog("labelWatch %@: UNMATCHED — all %d candidate summits claimed; anchoring at catalog point",
+                                  p.name, candidates[i].count)
+                        }
+                    }
+                    guard let best else { continue }
+                    snappedCell[i] = (best.s.lat, best.s.lon, best.s.elev)
+                    // Claim the apex plus a one-cell halo, so two labels can
+                    // never land a single cell apart on one bump.
+                    let inNear = dem.contains(lat: p.latitude, lon: p.longitude)
+                    let halo = (inNear ? dem : (far ?? dem)).cellsize
                     for dla in -1...1 {
                         for dlo in -1...1 {
-                            claimed.insert(claimKey(s.lat + Double(dla) * halo,
-                                                    s.lon + Double(dlo) * halo))
+                            claimed.insert(claimKey(best.s.lat + Double(dla) * halo,
+                                                    best.s.lon + Double(dlo) * halo))
                         }
                     }
                 }
@@ -2381,10 +2531,29 @@ struct TerrainMetalView: UIViewRepresentable {
             // which candidate RING the anchor came from (0 = the label sat on
             // or beside real water — most trustworthy) and its surface height.
             var waterMeta = [(ring: Int32, elev: Float)](repeating: (.max, 0), count: total)
+            // Judge-loop progress for the loading bar: one atomic tick per
+            // feature, surfaced every ~2% — this loop (occlusion lookups +
+            // water marches over ~30k features) is the longest phase of a
+            // load, and it used to be the bar's silent dead zone.
+            let progressLock = NSLock()
+            var progressDone = 0
+            let progressEvery = max(1, total / 48)
             results.withUnsafeMutableBufferPointer { res in
                 verdicts.withUnsafeMutableBufferPointer { verd in
                     waterMeta.withUnsafeMutableBufferPointer { wm in
                     DispatchQueue.concurrentPerform(iterations: total) { i in
+                        if abort?.cancelled == true { return }
+                        defer {
+                            if let onProgress {
+                                progressLock.lock()
+                                progressDone += 1
+                                let n = progressDone
+                                progressLock.unlock()
+                                if n % progressEvery == 0 {
+                                    onProgress(0.05 + 0.95 * Double(n) / Double(total))
+                                }
+                            }
+                        }
                         let isSavedSpot = i >= lakeEnd
                         let isWater = i >= peaks.count && i < lakeEnd
                         let peak = isSavedSpot ? savedSpots[i - lakeEnd]
@@ -2392,6 +2561,18 @@ struct TerrainMetalView: UIViewRepresentable {
                         let watched = Self.labelWatch.map { peak.name.lowercased().contains($0) } ?? false
                         func watch(_ msg: String) {
                             if watched { NSLog("labelWatch %@: %@", peak.name, msg) }
+                        }
+                        // THE PEAK YOU ARE STANDING ON gets no dot. You can't see
+                        // the summit under your feet, and the eye's apex match and
+                        // this pass's ASSIGNMENT can still part company by a cell
+                        // or two (a higher neighbor claims the apex first) — which
+                        // read as the mountain's own label hovering just off to the
+                        // side. It stays in the visible set: the card and the
+                        // search must not call it hidden.
+                        if !isWater, !isSavedSpot, peak.id == standingOnPeakID {
+                            verd[i] = Verdict.standingOn.rawValue
+                            watch("unlabeled: you are standing on it")
+                            return
                         }
                         // Coverage is the union of both tiers (far spans the whole scene).
                         let inNear = dem.contains(lat: peak.latitude, lon: peak.longitude)
@@ -2510,10 +2691,12 @@ struct TerrainMetalView: UIViewRepresentable {
                             watch(String(format: "skipped: %.0f m beyond reach %.0f m", approxHoriz, maxDist))
                             return
                         }
-                        // Peaks use the CLAIMED summit cell from the serial
+                        // Peaks use the MATCHED local maximum from the
                         // assignment pass above (deterministic, contention-
-                        // free); the label then sits on the rendered summit,
-                        // not the (often offset) catalog point/height. Lakes
+                        // free); the label then sits on a real apex of the
+                        // rendered terrain, not the (often offset) catalog
+                        // point/height. Unmatched peaks anchor at the catalog
+                        // point — the silhouette pin below settles them. Lakes
                         // AND saddles/gaps anchor at the DEM elevation of the
                         // point itself, no snap: a saddle is a LOW point
                         // between summits, and a summit snap dragged its label
@@ -2630,15 +2813,44 @@ struct TerrainMetalView: UIViewRepresentable {
                         // is drawn in.
                         var bearing = atan2(east, north)
                         if bearing < 0 { bearing += 2 * .pi }
-                        // OCCLUSION = one lookup in the RENDER's own depth panorama:
-                        // the feature is visible exactly when rendered TERRAIN in its
-                        // direction reaches (about) its distance. Sky texels are
-                        // NEUTRAL — they must never vouch for a peak. (They used to:
-                        // any sky in the 3×3 made `farthest` the FAR sentinel, so a
-                        // 110 km giant whose sightline passed a hair BELOW a 35 km
-                        // ridge picked up the sky above that ridge and labeled itself
-                        // onto the occluder's slope — the classic "Mount Stuart
-                        // through Buck Mountain" bug.)
+                        // NEAR features (≤30 km), peaks AND saddles: occlusion by
+                        // EXACT sightline march — the same apparent-height math the
+                        // renderer draws with, at sub-cell steps, so the verdict has
+                        // neither of the depth map's error bars (its 3×3 texel
+                        // forgiveness, which let neighboring pixels vouch a hidden
+                        // peak onto a front ridge, and its max(120, 8%·distance)
+                        // margin, which flipped genuinely visible grazing summits
+                        // to hidden — a texel is 0.044° of azimuth). Saddles march
+                        // with a low-point stop-short: the sightline INTO a pass
+                        // legally grazes its col walls over the final approach,
+                        // exactly like the water march's shore-cell skip.
+                        if !isWater, horiz <= 30_000 {
+                            let prof = Self.sightlineProfile(
+                                eyeLat: refLat, eyeLon: refLon,
+                                featLat: hi.lat, featLon: hi.lon,
+                                horiz: horiz, apparentUp: apparentUp,
+                                camElevMeters: camElevMeters, heightScale: heightScale,
+                                curvatureK: curvatureK, dem: dem, far: far,
+                                lowPoint: peak.isSaddle)
+                            if prof.blocked {
+                                watch(String(format:
+                                    "OCCLUDED (march): terrain at %.0f m of %.0f rises above the sightline",
+                                    prof.crestHoriz, horiz))
+                                verd[i] = Verdict.occluded.rawValue
+                                return
+                            }
+                            // March says clear: shown. The silhouette pin below
+                            // still snaps the dot onto the drawn image.
+                        } else
+                        // FAR peaks + saddles: one lookup in the RENDER's own depth
+                        // panorama — the feature is visible exactly when rendered
+                        // TERRAIN in its direction reaches (about) its distance. Sky
+                        // texels are NEUTRAL — they must never vouch for a peak.
+                        // (They used to: any sky in the 3×3 made `farthest` the FAR
+                        // sentinel, so a 110 km giant whose sightline passed a hair
+                        // BELOW a 35 km ridge picked up the sky above that ridge and
+                        // labeled itself onto the occluder's slope — the classic
+                        // "Mount Stuart through Buck Mountain" bug.)
                         // The 3×3 neighborhood forgives the map's finite resolution
                         // at silhouettes; the relative margin absorbs the summit-snap
                         // vs texel-centre offset; saddles get a looser one since
@@ -2730,14 +2942,27 @@ struct TerrainMetalView: UIViewRepresentable {
                         // Pin the dot to the RENDERED silhouette. The anchor's
                         // height is the DEM's summit cell, but the raymarch can
                         // undersample a sharp spire and draw it a little lower —
-                        // the dot then floats in the sky above the drawn mountain
-                        // (classic on needle summits like Alpamayo). If the depth
-                        // map shows SKY at the anchor's own pixel, walk down its
-                        // column to the first rendered terrain and place the dot
-                        // there. (The visible bake is finer than the depth map, so
-                        // its silhouette is never LOWER — the clamp can only land
-                        // on or just inside the drawn mountain.)
+                        // the dot then floats above the drawn mountain (classic
+                        // on needle summits like Alpamayo). The anchor's own
+                        // pixel tells us when: anything that is NOT the peak's
+                        // own drawn body — SKY, or BACKDROP terrain clearly
+                        // farther than the peak (Crooked Thumb from Luna Peak:
+                        // the dot's pixel read the 40 km Shuksan-area ridge
+                        // behind a 5 km spire, so the old sky-only test skipped
+                        // the pin and the dot hung over the backdrop). Find the
+                        // drawn crest just below: search this column AND its two
+                        // pixel neighbors for the HIGHEST silhouette whose depth
+                        // matches this peak's distance — the apex of the peak's
+                        // own drawn body, which fixes the last texel of lateral
+                        // error too (the old single-column walk could only move
+                        // a dot DOWN, pinning it onto a shoulder when the drawn
+                        // apex sat one column over). No depth-matching column ⇒
+                        // the old behavior: first non-backdrop terrain straight
+                        // below. (The visible bake is finer than the depth map,
+                        // so its silhouette is never LOWER — the clamp can only
+                        // land on or just inside the drawn mountain.)
                         var placedUp = apparentUp
+                        var placedEast = east, placedNorth = north
                         if depthW > 0 {
                             var cu = bearing / (2 * .pi)
                             cu -= floor(cu)
@@ -2745,19 +2970,75 @@ struct TerrainMetalView: UIViewRepresentable {
                             let elRad = sightAngle * .pi / 180
                             let row0 = min(depthH - 1, max(0,
                                 Int((0.5 - 0.5 * elRad / panoElevMax) * Double(depthH))))
-                            if Double(depth[row0 * depthW + cx]) >= skyDepth {
+                            // Same relative margin as the occlusion pass: depth
+                            // within it = the peak's own body at this pixel.
+                            let pinMargin = max(120.0, horiz * 0.08)
+                            func isBackdrop(_ d: Double) -> Bool {
+                                d >= skyDepth || d > horiz + pinMargin
+                            }
+                            if !isBackdrop(Double(depth[row0 * depthW + cx])) {
+                                watch(String(format: "PIN: none — anchor row %d (%.3f°) already reads own-body terrain (depth %.0f m of %.0f)",
+                                             row0, sightAngle, Double(depth[row0 * depthW + cx]), horiz))
+                            }
+                            if isBackdrop(Double(depth[row0 * depthW + cx])) {
                                 // Cap the drop at ~3.5°: the occlusion pass vouched
                                 // for terrain near this feature's distance, so the
                                 // silhouette is always close below.
                                 let rowsPerDeg = Double(depthH) / (2 * panoElevMax) * .pi / 180
                                 let maxRow = min(depthH - 1, row0 + max(2, Int(rowsPerDeg * 3.5)))
-                                var r = row0 + 1
-                                while r <= maxRow, Double(depth[r * depthW + cx]) >= skyDepth { r += 1 }
-                                if r <= maxRow {
-                                    let vv = (Double(r) + 0.5) / Double(depthH)
-                                    let clampedRad = (0.5 - vv) * 2 * panoElevMax
-                                    placedUp = tan(clampedRad) * horiz
+                                var bestMatch: (row: Int, col: Int)?
+                                var centerFirst: Int?
+                                for dx in -1...1 {
+                                    let col = ((cx + dx) % depthW + depthW) % depthW
+                                    var r = row0 + 1
+                                    while r <= maxRow, isBackdrop(Double(depth[r * depthW + col])) { r += 1 }
+                                    guard r <= maxRow else { continue }
+                                    if dx == 0 { centerFirst = r }
+                                    if abs(Double(depth[r * depthW + col]) - horiz) <= pinMargin,
+                                       bestMatch == nil || r < bestMatch!.row {
+                                        bestMatch = (r, col)
+                                    }
                                 }
+                                if let m = bestMatch ?? centerFirst.map({ (row: $0, col: cx) }) {
+                                    let vv = (Double(m.row) + 0.5) / Double(depthH)
+                                    let clampedRad = (0.5 - vv) * 2 * panoElevMax
+                                    watch(String(format: "PIN: anchor row %d (%.3f°) → crest row %d (%.3f°), col %+d",
+                                                 row0, sightAngle, m.row,
+                                                 clampedRad * 180 / .pi, m.col - cx))
+                                    placedUp = tan(clampedRad) * horiz
+                                    if m.col != cx {
+                                        // Re-aim the drawn anchor at the chosen
+                                        // column's center. (directionTrue keeps the
+                                        // geographic bearing: against the LIVE
+                                        // camera the real rock is where it is.)
+                                        let b = (Double(m.col) + 0.5) / Double(depthW) * 2 * .pi
+                                        placedEast = horiz * sin(b)
+                                        placedNorth = horiz * cos(b)
+                                    }
+                                }
+                            }
+                        }
+                        // FLOAT CHECK (`-labelDebug`): the invariant this whole
+                        // placement exists to keep — a dot must never sit over
+                        // sky. Logs the offenders with how far above the drawn
+                        // crest they landed, in depth-map texels; silence means
+                        // every label in the scene is seated on the image.
+                        if Self.labelDebug, depthW > 0, !isWater, !isSavedSpot {
+                            var pb = atan2(placedEast, placedNorth)
+                            if pb < 0 { pb += 2 * .pi }
+                            var pu = pb / (2 * .pi); pu -= floor(pu)
+                            let pcol = min(depthW - 1, max(0, Int(pu * Double(depthW))))
+                            let pel = atan2(placedUp, horiz)
+                            let prow = min(depthH - 1, max(0,
+                                Int((0.5 - 0.5 * pel / panoElevMax) * Double(depthH))))
+                            if Double(depth[prow * depthW + pcol]) >= skyDepth {
+                                var r = prow
+                                while r < depthH - 1,
+                                      Double(depth[r * depthW + pcol]) >= skyDepth { r += 1 }
+                                let texels = r - prow
+                                NSLog("FLOAT %@: %.0f m out, dot %d texels (%.3f°) above the drawn crest",
+                                      peak.name, horiz, texels,
+                                      Double(texels) * 2 * panoElevMax / Double(depthH) * 180 / .pi)
                             }
                         }
                         // Catalog elevation 0 = "unknown" (some OSM peaks have no ele
@@ -2786,7 +3067,7 @@ struct TerrainMetalView: UIViewRepresentable {
                         let trueUp = trueElev * heightScale - curvatureK * horiz * horiz - camElevMeters
                         res[i] = .init(
                             peak: labeled,
-                            direction: SIMD3<Float>(Float(east), Float(north), Float(placedUp)),
+                            direction: SIMD3<Float>(Float(placedEast), Float(placedNorth), Float(placedUp)),
                             distanceMeters: horiz,
                             isWater: isWater,
                             isSavedSpot: isSavedSpot,
@@ -2832,19 +3113,21 @@ struct TerrainMetalView: UIViewRepresentable {
                 }
             }
             let all = results.compactMap { $0 }
-            // Ring-drawn peaks (and far-tier water, judged but unlabeled): all
-            // stay visible for the card/search; the ultra-prominent peaks
-            // among them also carry anchors (in `all`).
-            let ringVisibleIDs = (0..<total).lazy
-                .filter { verdicts[$0] == Verdict.ringVisible.rawValue }
+            // Visible but deliberately unlabeled: ring-drawn peaks, far-tier
+            // water, and the peak under your feet. All stay visible for the
+            // card/search; the ultra-prominent ring peaks among them also carry
+            // anchors (in `all`).
+            let unlabeledVisibleIDs = (0..<total).lazy
+                .filter { verdicts[$0] == Verdict.ringVisible.rawValue
+                    || verdicts[$0] == Verdict.standingOn.rawValue }
                 .map { $0 < peaks.count ? peaks[$0].id
                     : $0 < lakeEnd ? lakes[$0 - peaks.count].id : savedSpots[$0 - lakeEnd].id }
             let occludedCount = verdicts.lazy.filter { $0 == Verdict.occluded.rawValue }.count
             let floatingCount = verdicts.lazy.filter { $0 == Verdict.floating.rawValue }.count
-            let ringCount = ringVisibleIDs.count
-            let inRangeCount = occludedCount + floatingCount + all.count + ringCount
-            NSLog("Occlusion: %d in-range, %d occluded, %d floating, %d shown, %d ring-visible",
-                  inRangeCount, occludedCount, floatingCount, all.count, ringCount)
+            let unlabeledCount = unlabeledVisibleIDs.count
+            let inRangeCount = occludedCount + floatingCount + all.count + unlabeledCount
+            NSLog("Occlusion: %d in-range, %d occluded, %d floating, %d shown, %d visible-unlabeled",
+                  inRangeCount, occludedCount, floatingCount, all.count, unlabeledCount)
             // EVERY visible peak gets an anchor: a peak cut here can never appear
             // at ANY zoom (the overlay's declutter is zoom-scaled, this isn't), so
             // a tight cap made "Visible" info cards for summits that could never
@@ -2884,7 +3167,8 @@ struct TerrainMetalView: UIViewRepresentable {
             // The visible set is PRE-backstop (a trimmed summit is still
             // line-of-sight visible) and includes the unlabeled ring giants —
             // the info card and search stay honest either way.
-            return (peaksOut + lakesOut + savedOut, Set(all.map(\.peak.id)).union(ringVisibleIDs))
+            return (peaksOut + lakesOut + savedOut,
+                    Set(all.map(\.peak.id)).union(unlabeledVisibleIDs))
         }
 
         /// Debug: `-labelDebug` logs every cull (with the blocking terrain for
@@ -2900,11 +3184,75 @@ struct TerrainMetalView: UIViewRepresentable {
             return a[i + 1].lowercased()
         }()
 
-        // (The old CPU line-of-sight ray march for PEAKS is gone: their occlusion
-        // reads the renderer's own hit-distance panorama in buildAnchors — one
-        // lookup per feature, always in agreement with the drawn image. WATER gets
-        // a dedicated march below: the depth lookup fundamentally can't judge a
-        // LOW point — see the isWater branch in buildAnchors.)
+        // (Occlusion judges: NEAR peaks (≤30 km) use the exact sightline march
+        // below — sub-cell steps, no texel error bars, and it powers the
+        // own-mass crest pin. FAR peaks and saddles read the renderer's own
+        // hit-distance panorama in buildAnchors — one lookup per feature,
+        // always in agreement with the drawn image. WATER gets a dedicated
+        // march: the depth lookup fundamentally can't judge a LOW point —
+        // see the isWater branch in buildAnchors.)
+
+        /// Exact eye→feature sightline profile for the near-field occlusion
+        /// verdict. Walks the geodesic at ≤ a cell per step with the anchors'
+        /// apparent-height math (heightScale + curvature drop), tracking the
+        /// highest apparent angle — the drawn skyline in the feature's
+        /// direction. `blocked` when that crest rises above the feature's own
+        /// sightline (with ~0.05° grazing slack). The last ~2 cells before
+        /// the feature are excluded: samples inside a summit's own cell sit
+        /// at its height with a shorter run, which reads as a false block on
+        /// flat-topped summits. `lowPoint` (saddles/passes) stretches that
+        /// exclusion to ≥150 m — the sightline into a col legally grazes its
+        /// walls over the final approach, like the water march's shore skip.
+        /// (`crestTan`/`colDepth` describe the blocker and what's behind it —
+        /// kept for diagnostics/tests; the verdict uses only `blocked`.)
+        static func sightlineProfile(
+            eyeLat: Double, eyeLon: Double, featLat: Double, featLon: Double,
+            horiz: Double, apparentUp: Double, camElevMeters: Double,
+            heightScale: Double, curvatureK: Double, dem: DEMTile, far: DEMTile?,
+            lowPoint: Bool = false
+        ) -> (blocked: Bool, crestHoriz: Double, crestTan: Double, colDepth: Double) {
+            let summitTan = apparentUp / horiz
+            let slack = 8e-4                    // ≈0.05° of grazing tolerance
+            var backoff = dem.contains(lat: featLat, lon: featLon) ? 80.0 : 240.0
+            if lowPoint { backoff = max(backoff, 150) }
+            let stop = horiz - backoff
+            var crestTan = -Double.greatestFiniteMagnitude
+            var crestS = 0.0
+            var crestGround = 0.0
+            var d = 60.0                        // the eye's own crest is guaranteed clear
+            guard stop > d else { return (false, 0, 0, 0) }
+            while d < stop {
+                let f = d / horiz
+                let sLat = eyeLat + (featLat - eyeLat) * f
+                let sLon = eyeLon + (featLon - eyeLon) * f
+                let inNear = dem.contains(lat: sLat, lon: sLon)
+                let tile: DEMTile? = inNear ? dem : far
+                if let tile, tile.contains(lat: sLat, lon: sLon) {
+                    let ground = Double(tile.elevation(lat: sLat, lon: sLon))
+                    let up = ground * heightScale - curvatureK * d * d - camElevMeters
+                    let t = up / d
+                    if t > crestTan { crestTan = t; crestS = d; crestGround = ground }
+                }
+                d += inNear ? 30 : 90           // ≤ a cell per tier
+            }
+            guard crestTan > summitTan + slack else { return (false, crestS, crestTan, 0) }
+            // Deepest ground dip between the crest and the summit: the "is
+            // this the same mountain?" measure.
+            var minGround = crestGround
+            d = crestS + 30
+            while d < stop {
+                let f = d / horiz
+                let sLat = eyeLat + (featLat - eyeLat) * f
+                let sLon = eyeLon + (featLon - eyeLon) * f
+                let inNear = dem.contains(lat: sLat, lon: sLon)
+                let tile: DEMTile? = inNear ? dem : far
+                if let tile, tile.contains(lat: sLat, lon: sLon) {
+                    minGround = min(minGround, Double(tile.elevation(lat: sLat, lon: sLon)))
+                }
+                d += inNear ? 30 : 90
+            }
+            return (true, crestS, crestTan, crestGround - minGround)
+        }
 
         /// True when intermediate terrain rises above the sightline from the eye
         /// to a water-surface point. Same apparent-height math as the anchors
@@ -2993,11 +3341,29 @@ struct TerrainMetalView: UIViewRepresentable {
             bakeGeneration &+= 1
             let gen = bakeGeneration
             let t0 = DispatchTime.now()
-            let span = 0.95 - progressFrom
+            // The remaining bar splits by measured wall time, not hope: the
+            // bake is a short band (~a second of GPU) and the label-anchor
+            // build — the actual long pole of every load — sweeps the rest to
+            // 0.98 on real per-feature reports from buildAnchors. It used to
+            // hold silently at 0.95, which is where the bar visibly died.
+            let bakeTo = progressFrom + (0.98 - progressFrom) * 0.2
+            let span = bakeTo - progressFrom
             if reportProgress { report(.rendering(progress: progressFrom)) }
             let onBand: (Double) -> Void = { [weak self] f in
                 guard let self, gen == self.bakeGeneration, reportProgress else { return }
                 self.report(.rendering(progress: progressFrom + span * f))
+            }
+            // Anchor-build progress feeds the bar's tail. Guarded by the bake
+            // generation, so a superseded load's late reports are muted; the
+            // standalone anchor rebuilds (exaggeration, units) never pass a
+            // reporter and can't resurrect the loading card.
+            let anchorReporter: ((Double) -> Void)? = !reportProgress ? nil : { [weak self] f in
+                DispatchQueue.main.async {
+                    guard let self, gen == self.bakeGeneration else { return }
+                    let bar = bakeTo + (0.98 - bakeTo) * min(1, max(0, f))
+                    if Self.labelDebug { NSLog("Anchor progress %.2f → bar %.3f", f, bar) }
+                    self.report(.rendering(progress: bar))
+                }
             }
             if panoInstalled {
                 rebakePending = true
@@ -3017,7 +3383,7 @@ struct TerrainMetalView: UIViewRepresentable {
                     // their own depth map from the new uniforms, independent of the
                     // displayed image); `installAnchors` stashes the result and the
                     // swap fires once BOTH image and labels are ready.
-                    rebuildLabelAnchors()
+                    rebuildLabelAnchors(reporter: anchorReporter)
                 }
                 renderer.panoramaWidth = Self.fullPanoramaWidth
                 // ALWAYS paced here: every re-bake runs under a LIVE scene the
@@ -3060,7 +3426,7 @@ struct TerrainMetalView: UIViewRepresentable {
             // exactly like re-bake swaps), and `.ready` holds until they've
             // installed — the loading screen lifts on terrain WITH its labels
             // instead of the labels streaming in a beat later.
-            rebuildLabelAnchors()
+            rebuildLabelAnchors(reporter: anchorReporter)
             renderer.panoramaWidth = Self.fullPanoramaWidth
             bakeOnce(paced: paced, onProgress: onBand) { [weak self] tex in
                 guard let self, gen == self.bakeGeneration else { onReady(); return }

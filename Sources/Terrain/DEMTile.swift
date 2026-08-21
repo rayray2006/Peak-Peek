@@ -318,43 +318,189 @@ struct DEMTile {
         return (mn, mx, lat, lon)
     }
 
-    /// The label-anchor summit snap: like `highestNear`, but steerable — used
-    /// by the deterministic summit CLAIMING in buildAnchors.
-    /// - `targetElev`: the peak's surveyed height. Cells above it score a 2×
-    ///   overshoot penalty, so a shoulder peak (Pic Tyndall, 4241 m) prefers a
-    ///   cell of its own height over the main summit's higher cell next door.
-    ///   nil = pure highest (unknown elevation).
-    /// - `isExcluded`: cells already claimed by a higher peak are skipped.
-    /// Falls back to the center cell if everything in range is excluded.
-    func summitCellNear(lat: Double, lon: Double, radiusMeters: Double,
-                        targetElev: Float?,
-                        isExcluded: ((Double, Double) -> Bool)? = nil)
-        -> (lat: Double, lon: Double, elev: Float) {
+    /// A local maximum of the DEM grid — an actual apex of the drawn terrain —
+    /// with its WINDOWED prominence: how far it rises above the highest saddle
+    /// connecting it to higher ground inside the search window (window floor
+    /// when nothing in the window is higher). Label anchors match catalog
+    /// peaks to these 1:1, so a dot can only ever sit on a real bump top,
+    /// never on a flank cell.
+    struct LocalSummit {
+        let lat: Double
+        let lon: Double
+        let elev: Float
+        let prominence: Float
+    }
+
+    /// All grid local maxima within `radiusMeters` of (lat, lon), with
+    /// prominence ≥ `minProminence`, highest first.
+    ///
+    /// One union-find flood over the window computes every candidate's
+    /// prominence at once: cells are visited highest→lowest, each joining its
+    /// already-visited (higher) neighbors' components; a cell where two
+    /// components meet is the SADDLE between their summits, fixing the lower
+    /// summit's prominence there. Plateau ties break by cell index, so a flat
+    /// summit yields ONE candidate (the rest read as prominence 0). The
+    /// maxima test itself uses the full grid, so a window-edge cell whose
+    /// higher neighbor sits just outside the window can't fake a summit.
+    func localSummits(lat: Double, lon: Double, radiusMeters: Double,
+                      minProminence: Float) -> [LocalSummit] {
         let (mLon, mLat) = metersPerDegree(atLat: lat)
         let dCol = Int((radiusMeters / mLon) / cellsize) + 1
         let dRow = Int((radiusMeters / mLat) / cellsize) + 1
         let cCenter = min(ncols - 1, max(0, Int((lon - xllcorner) / cellsize)))
         let rCenter = min(nrows - 1, max(0, (nrows - 1) - Int((lat - yllcorner) / cellsize)))
-        var bestScore: Float = -.greatestFiniteMagnitude
-        var bc = cCenter, br = rCenter
-        var bestElev = elevations[rCenter * ncols + cCenter]
-        for r in max(0, rCenter - dRow)...min(nrows - 1, rCenter + dRow) {
-            for c in max(0, cCenter - dCol)...min(ncols - 1, cCenter + dCol) {
-                let v = elevations[r * ncols + c]
-                var score = v
-                if let targetElev { score -= 2 * max(0, v - targetElev) }
-                guard score > bestScore else { continue }
-                if let isExcluded {
-                    let cellLon = xllcorner + (Double(c) + 0.5) * cellsize
-                    let cellLat = yllcorner + (Double(nrows - 1 - r) + 0.5) * cellsize
-                    if isExcluded(cellLat, cellLon) { continue }
-                }
-                bestScore = score; bestElev = v; bc = c; br = r
-            }
+        let r0 = max(0, rCenter - dRow), r1 = min(nrows - 1, rCenter + dRow)
+        let c0 = max(0, cCenter - dCol), c1 = min(ncols - 1, cCenter + dCol)
+        let w = c1 - c0 + 1, h = r1 - r0 + 1
+        let count = w * h
+        guard count > 1 else { return [] }
+
+        // Window-local copy (wi = wr * w + wc), for cache-friendly flooding.
+        var elev = [Float](repeating: 0, count: count)
+        for wr in 0..<h {
+            let base = (r0 + wr) * ncols + c0
+            for wc in 0..<w { elev[wr * w + wc] = elevations[base + wc] }
         }
-        let outLon = xllcorner + (Double(bc) + 0.5) * cellsize
-        let outLat = yllcorner + (Double(nrows - 1 - br) + 0.5) * cellsize
-        return (outLat, outLon, bestElev)
+        // Highest first; ties by index — the deterministic plateau representative.
+        var order = Array(Int32(0)..<Int32(count))
+        order.sort { elev[Int($0)] == elev[Int($1)] ? $0 < $1 : elev[Int($0)] > elev[Int($1)] }
+
+        var parent = [Int32](repeating: -1, count: count)   // -1 = unvisited
+        var summitOf = [Int32](repeating: -1, count: count) // root wi → summit wi
+        var prom = [Float](repeating: -1, count: count)     // summit wi → prominence
+        func find(_ x: Int32) -> Int32 {
+            var r = x
+            while parent[Int(r)] != r { r = parent[Int(r)] }
+            var c = x
+            while parent[Int(c)] != r { let n = parent[Int(c)]; parent[Int(c)] = r; c = n }
+            return r
+        }
+
+        var windowMin = Float.greatestFiniteMagnitude
+        for wi in order {
+            let v = elev[Int(wi)]
+            guard v > nodata else { continue }
+            windowMin = min(windowMin, v)
+            let wr = Int(wi) / w, wc = Int(wi) % w
+            // Distinct components among already-visited neighbors.
+            var roots: [Int32] = []
+            for dr in -1...1 {
+                for dc in -1...1 where dr != 0 || dc != 0 {
+                    let nr = wr + dr, nc = wc + dc
+                    guard nr >= 0, nr < h, nc >= 0, nc < w else { continue }
+                    let ni = Int32(nr * w + nc)
+                    guard parent[Int(ni)] >= 0 else { continue }
+                    let rt = find(ni)
+                    if !roots.contains(rt) { roots.append(rt) }
+                }
+            }
+            guard let first = roots.first else {
+                parent[Int(wi)] = wi          // new component: wi is its summit
+                summitOf[Int(wi)] = wi
+                continue
+            }
+            // Join the component with the HIGHEST summit; every other
+            // component ends here — this cell is its saddle.
+            var keep = first
+            for rt in roots.dropFirst() {
+                let a = summitOf[Int(keep)], b = summitOf[Int(rt)]
+                let higher = elev[Int(a)] == elev[Int(b)] ? min(a, b)
+                    : (elev[Int(a)] > elev[Int(b)] ? a : b)
+                let lower = higher == a ? b : a
+                prom[Int(lower)] = elev[Int(lower)] - v
+                let winner = higher == a ? keep : rt
+                let loser = winner == keep ? rt : keep
+                parent[Int(loser)] = winner
+                keep = winner
+            }
+            parent[Int(wi)] = keep
+        }
+
+        var out: [LocalSummit] = []
+        for wi in 0..<count where summitOf[wi] == Int32(wi) {
+            let p = prom[wi] >= 0 ? prom[wi] : elev[wi] - windowMin   // never merged
+            guard p >= minProminence else { continue }
+            let row = r0 + wi / w, col = c0 + wi % w
+            // Full-grid maxima check (ties by index): filters window-edge fakes.
+            let gi = row * ncols + col
+            let v = elevations[gi]
+            var isMax = true
+            for dr in -1...1 {
+                for dc in -1...1 where dr != 0 || dc != 0 {
+                    let nr = row + dr, nc = col + dc
+                    guard nr >= 0, nr < nrows, nc >= 0, nc < ncols else { continue }
+                    let ni = nr * ncols + nc
+                    let nv = elevations[ni]
+                    if nv > v || (nv == v && ni < gi) { isMax = false }
+                }
+            }
+            guard isMax else { continue }
+            out.append(LocalSummit(
+                lat: yllcorner + (Double(nrows - 1 - row) + 0.5) * cellsize,
+                lon: xllcorner + (Double(col) + 0.5) * cellsize,
+                elev: v, prominence: p))
+        }
+        out.sort { $0.elev == $1.elev ? $0.lat < $1.lat : $0.elev > $1.elev }
+        return out
+    }
+
+    // MARK: Summit matching (ONE rule, used by the dot AND by the eye)
+
+    /// Reach of every summit match: enough to cover catalog-coordinate offset
+    /// and the apex displacement of a void-filled summit.
+    static let summitSearchRadiusMeters: Double = 600
+    /// Rise that separates a real bump from grid ripple.
+    static let summitMinProminence: Float = 8
+
+    /// How well a local maximum describes the RENDERED apex of a catalog peak.
+    /// Elevation agreement dominates; overshoot (a cell higher than the
+    /// surveyed summit) is someone else's mountain, penalized 2×. The distance
+    /// term keeps a peak from wandering to a look-alike bump across the cirque;
+    /// the small prominence bonus breaks near-ties toward the massif apex over
+    /// a shoulder ripple. `catalogElevationMeters` nil = the catalog has no
+    /// height, so prefer the higher candidate.
+    ///
+    /// This is the ONLY place the rule lives: the label pass scores with it to
+    /// assign one apex per peak, and the eye scores with it to stand on the
+    /// peak you asked for — so the dot and your feet agree by construction.
+    static func summitMatchScore(
+        _ s: LocalSummit, catalogLat: Double, catalogLon: Double,
+        catalogElevationMeters: Double?,
+        metersPerDegLat mLat: Double, metersPerDegLon mLon: Double
+    ) -> Double {
+        let dist = hypot((s.lat - catalogLat) * mLat, (s.lon - catalogLon) * mLon)
+        var score = -0.15 * dist + 0.25 * Double(min(s.prominence, 100))
+        if let target = catalogElevationMeters, target > 0 {
+            let dh = Double(s.elev) - target
+            score -= dh > 0 ? 2 * dh : -dh
+        } else {
+            score += Double(s.elev) * 0.2       // unknown height: prefer higher
+        }
+        return score
+    }
+
+    /// The rendered apex of ONE catalog peak — the best-scoring local maximum
+    /// in reach, with no claims to respect. The label pass solves the same
+    /// scoring as an ASSIGNMENT (many peaks competing for one apex each);
+    /// placing the eye is a single-peak case of it, so both land on the same
+    /// cell. nil when the DEM has no bump of its own here (a gendarme inside a
+    /// bigger peak's mass) — the caller decides what to do with the catalog
+    /// point.
+    func matchedSummit(lat: Double, lon: Double,
+                       catalogElevationMeters: Double?) -> LocalSummit? {
+        let mLat = 111_320.0
+        let mLon = 111_320.0 * max(cos(lat * .pi / 180), 0.01)
+        var best: (score: Double, s: LocalSummit)?
+        for s in localSummits(lat: lat, lon: lon,
+                              radiusMeters: Self.summitSearchRadiusMeters,
+                              minProminence: Self.summitMinProminence) {
+            let score = Self.summitMatchScore(
+                s, catalogLat: lat, catalogLon: lon,
+                catalogElevationMeters: catalogElevationMeters,
+                metersPerDegLat: mLat, metersPerDegLon: mLon)
+            if best == nil || score > best!.score { best = (score, s) }
+        }
+        return best?.s
     }
 
     /// Candidate WATER-surface anchor cells for a lake label, nearest first.

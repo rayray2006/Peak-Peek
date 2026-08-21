@@ -1219,6 +1219,16 @@ struct RootScreen: View {
                 // the menu (or the ✕ above it) off screen — it scrolls instead.
                 ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .trailing, spacing: 0) {
+                    // Ordered by reach: Search + the live-cycled modes first,
+                    // then the feature sheets, then set-and-forget preferences,
+                    // with Offline and Info anchoring the bottom.
+                    controlButton("Search", systemName: "magnifyingglass", prominence: .secondary) {
+                        // Toggle: a second tap closes the inline panel.
+                        activeSheet = activeSheet == .directory ? nil : .directory
+                        collapseActionMenu()
+                    }
+                    menuDivider
+
                     // Cycle 3D → AR → Edges. Stays open so it can be cycled live.
                     controlButton(
                         "View: \(mode.title)",
@@ -1244,6 +1254,29 @@ struct RootScreen: View {
                     }
                     menuDivider
 
+                    controlButton("Time", systemName: "clock",
+                                  prominence: model.usesSimulatedTime ? .warning : .secondary) {
+                        activeSheet = .time
+                        collapseActionMenu()
+                    }
+                    menuDivider
+
+                    controlButton("Lists", systemName: "checklist", prominence: .secondary) {
+                        activeSheet = .lists
+                        collapseActionMenu()
+                    }
+                    menuDivider
+
+                    // Save the current viewpoint as a named Saved location.
+                    // Takeover rule: open panels yield first.
+                    controlButton("Save Spot", systemName: "bookmark", prominence: .secondary) {
+                        activeSheet = nil
+                        saveLocationName = model.viewpoint?.name ?? ""
+                        showSaveLocation = true
+                        collapseActionMenu()
+                    }
+                    menuDivider
+
                     // Cycle Auto → Day → Night. Stays open for live cycling.
                     controlButton(
                         "Theme: \(themeMode.title)",
@@ -1266,41 +1299,11 @@ struct RootScreen: View {
 
                     // Toggle 24h ↔ 12h (seeded from the locale on first toggle).
                     controlButton(
-                        "Time: \(ClockText.uses24Hour ? "24h" : "12h")",
+                        "Clock: \(ClockText.uses24Hour ? "24h" : "12h")",
                         systemName: "clock",
                         prominence: clockRaw.isEmpty ? .secondary : .primary
                     ) {
                         clockRaw = ClockText.uses24Hour ? "12" : "24"
-                    }
-                    menuDivider
-
-                    // Save the current viewpoint as a named Saved location.
-                    // Takeover rule: open panels yield first.
-                    controlButton("Save Spot", systemName: "bookmark", prominence: .secondary) {
-                        activeSheet = nil
-                        saveLocationName = model.viewpoint?.name ?? ""
-                        showSaveLocation = true
-                        collapseActionMenu()
-                    }
-                    menuDivider
-
-                    controlButton("Search", systemName: "magnifyingglass", prominence: .secondary) {
-                        // Toggle: a second tap closes the inline panel.
-                        activeSheet = activeSheet == .directory ? nil : .directory
-                        collapseActionMenu()
-                    }
-                    menuDivider
-
-                    controlButton("Lists", systemName: "checklist", prominence: .secondary) {
-                        activeSheet = .lists
-                        collapseActionMenu()
-                    }
-                    menuDivider
-
-                    controlButton("Time", systemName: "clock",
-                                  prominence: model.usesSimulatedTime ? .warning : .secondary) {
-                        activeSheet = .time
-                        collapseActionMenu()
                     }
                     menuDivider
 
@@ -1605,7 +1608,8 @@ struct RootScreen: View {
 /// load (first open, teleports, "Stand here") gets the same playful readout.
 private enum LoadingWhimsy {
     static let lines: [String] = [
-            "Stitching tiles",
+        
+        "Stitching tiles",
         "Carving valleys",
         "Raising mountains",
         "Dropping shadows",
