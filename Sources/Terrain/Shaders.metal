@@ -309,10 +309,10 @@ static float4 marchAndShade(float3 ro, float3 rd, constant Uniforms& u,
     // highlights so subtle slope detail shows in the brighter, otherwise-flat
     // areas. Tunables: kAmbient (shadow floor — lower = darker), kSun (range),
     // kGamma (contrast — higher = darker darks + more highlight texture).
-    const float kAmbient = 0.14;
+    const float kAmbient = 0.15;
     const float kSky     = 0.10;
     const float kSun     = 0.62;
-    const float kGamma   = 1.40;
+    const float kGamma   = 1.26;
     float light = clamp(kAmbient + kSky * sky + kSun * diffuse, 0.0, 1.0);
     float shade = pow(light, kGamma);
     // Sun-INDEPENDENT slope tone: steep faces ink darker than flats, so a
@@ -322,7 +322,7 @@ static float4 marchAndShade(float3 ro, float3 rd, constant Uniforms& u,
     // floated in the sky). Broad normal on purpose: a slope band should
     // shade as ONE surface, not per-cell noise. Flats (<~10°) stay paper.
     float slope = clamp(1.0 - nB.z, 0.0, 1.0);   // 1 - cos(slope angle)
-    shade *= 1.0 - 0.35 * smoothstep(0.02, 0.5, slope);
+    shade *= 1.0 - 0.26 * smoothstep(0.02, 0.5, slope);
     float3 color = float3(shade);
 
     // Aerial perspective: real distance reads as a pale, low-contrast haze, so far
