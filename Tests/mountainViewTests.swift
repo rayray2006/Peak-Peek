@@ -1023,6 +1023,32 @@ final class SightlineProfileTests: XCTestCase {
         XCTAssertGreaterThan(r.colDepth, 200)
     }
 
+    /// Standing on a summit plateau, the ground at your feet — the dome edge
+    /// ~15–30 m out, inside the old march's 60 m blind gap — hides everything
+    /// behind and below it. The valley feature must read BLOCKED, exactly as
+    /// the renderer draws foreground ground at its angle ("points coming
+    /// through the ground at my feet").
+    func testSummitForegroundBlocksFeatureBelowTheDomeEdge() {
+        var p = [Float](repeating: 200, count: 45)
+        for c in 0...6 { p[c] = 1000 }                            // summit plateau
+        for c in 7...10 { p[c] = 1000 - Float(c - 6) * 200 }      // dome falls away
+        let tile = makeTile(profile: p)
+        let r = profile(tile, eyeCol: 5.5, featCol: 40.5, featElev: 250, camElev: 1001.6)
+        XCTAssertTrue(r.blocked, "the plateau edge is the occluder")
+        XCTAssertLessThan(r.crestHoriz, 60, "the crest sits inside the old blind gap")
+    }
+
+    /// Same summit eye, feature ABOVE the horizon: the fine near-field
+    /// sampling must not self-occlude on the eye's own plateau.
+    func testSummitEyeStillSeesFeaturesAboveTheHorizon() {
+        var p = [Float](repeating: 200, count: 45)
+        for c in 0...6 { p[c] = 1000 }
+        for c in 7...10 { p[c] = 1000 - Float(c - 6) * 200 }
+        let tile = makeTile(profile: p)
+        let r = profile(tile, eyeCol: 5.5, featCol: 40.5, featElev: 2000, camElev: 1001.6)
+        XCTAssertFalse(r.blocked)
+    }
+
     /// Concave approach (flat valley floor, then a steep final rise): the
     /// summit is genuinely visible — not blocked.
     func testClearSightlineOverConcaveGround() {

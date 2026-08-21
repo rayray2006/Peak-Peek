@@ -2917,6 +2917,39 @@ struct TerrainMetalView: UIViewRepresentable {
                         // is drawn in.
                         var bearing = atan2(east, north)
                         if bearing < 0 { bearing += 2 * .pi }
+                        // The anchor's depth-map texel — shared by the fast
+                        // reject here and the nearer-occluder test below.
+                        var mxA = 0, myA = 0
+                        if depthW > 0 {
+                            var uu = bearing / (2 * .pi)
+                            uu -= floor(uu)                              // wrap to [0,1)
+                            let elRad = sightAngle * .pi / 180
+                            let vv = 0.5 - 0.5 * elRad / panoElevMax
+                            mxA = min(depthW - 1, max(0, Int(uu * Double(depthW))))
+                            myA = min(depthH - 1, max(0, Int(vv * Double(depthH))))
+                        }
+                        // FAST REJECT, all ranges: the drawn image is the final
+                        // authority. If the pixel where this dot would sit (and
+                        // the one above it, so a sub-texel summit tip can't be
+                        // punished) shows terrain FAR nearer than the feature,
+                        // it is behind that terrain no matter what the samplers
+                        // below conclude — the summit-dome foreground at a
+                        // stand-on eye is the canonical case. One texel is the
+                        // whole test; the threshold is deliberately huge so
+                        // every fine call still goes to the march or the
+                        // nearer-occluder scan.
+                        if !isWater, depthW > 0 {
+                            let gross = horiz - max(500, horiz * 0.12)
+                            let dPix = Double(depth[myA * depthW + mxA])
+                            let dUp = Double(depth[max(0, myA - 1) * depthW + mxA])
+                            if dPix < gross, dUp < gross {
+                                watch(String(format:
+                                    "OCCLUDED (pixel): drawn terrain at %.0f m covers the anchor of a %.0f m feature",
+                                    dPix, horiz))
+                                verd[i] = Verdict.occluded.rawValue
+                                return
+                            }
+                        }
                         // NEAR features (≤30 km), peaks AND saddles: occlusion by
                         // EXACT sightline march — the same apparent-height math the
                         // renderer draws with, at sub-cell steps, so the verdict has
@@ -2971,74 +3004,109 @@ struct TerrainMetalView: UIViewRepresentable {
                         // (Water was judged above, candidate by candidate —
                         // depth pre-pass + exact march; see waterSurfaceCandidates.)
                         if !isWater, depthW > 0 {
-                            var uu = bearing / (2 * .pi)
-                            uu -= floor(uu)                                  // wrap to [0,1)
-                            let elRad = sightAngle * .pi / 180
-                            let vv = 0.5 - 0.5 * elRad / panoElevMax
-                            let mx = Int(uu * Double(depthW))
-                            let my = min(depthH - 1, max(0, Int(vv * Double(depthH))))
-                            var farthestTerrain: Float = 0
-                            var skyTouched = false
-                            for dy in -1...1 {
-                                let ry = min(depthH - 1, max(0, my + dy))
-                                for dx in -1...1 {
-                                    let rx = ((mx + dx) % depthW + depthW) % depthW
-                                    let d = depth[ry * depthW + rx]
-                                    if Double(d) >= skyDepth { skyTouched = true }
-                                    else { farthestTerrain = max(farthestTerrain, d) }
+                            // NEARER-OCCLUDER test against the render's own depth
+                            // panorama, replacing the old "support" search (3×3
+                            // farthest-terrain within an 8%-of-distance margin,
+                            // plus a 0.6°/15% rescue scan). A feature is hidden
+                            // iff DRAWN terrain at-or-above its angle, in its own
+                            // column, is NEARER than it — the literal definition
+                            // of what the picture shows. Under the old rule any
+                            // texel near the peak's DISTANCE vouched for it, so a
+                            // ridge 4.8 km in front of a 60 km peak could put its
+                            // dot on the occluder's crest ("points showing
+                            // through terrain"); and grazing summits needed the
+                            // rescue heuristic. Both classes fall out: a farther
+                            // mountain over the shoulder is simply irrelevant,
+                            // and a tip with no nearer occluder above it is
+                            // visible even where the bake under-resolved it.
+                            let mx = mxA, my = myA
+                            let rowsPerDeg = Double(depthH) / (2 * panoElevMax) * .pi / 180
+                            let slackOcc = peak.isSaddle
+                                ? max(250, horiz * 0.10)   // col walls legally graze
+                                : max(120, horiz * 0.04)   // own-body / snap offset
+                            // Nearest drawn terrain at-or-above the anchor's angle
+                            // in one column; stops at the silhouette (first sky).
+                            func nearestAbove(_ col: Int) -> Double {
+                                var nearest = Double.infinity
+                                var r = my
+                                while r >= 0 {
+                                    let d = Double(depth[r * depthW + col])
+                                    if d >= skyDepth { break }
+                                    nearest = min(nearest, d)
+                                    r -= 1
                                 }
+                                return nearest
                             }
-                            let margin = peak.isSaddle
-                                ? max(250, horiz * 0.18)
-                                : max(120, horiz * 0.08)
-                            if Double(farthestTerrain) < horiz - margin {
-                                // No rendered terrain reaches the peak's distance here.
-                                // A sky-touched neighborhood can still be a sub-texel
-                                // summit tip the bake missed — but ONLY if the terrain
-                                // just below is the peak's OWN body (depth ≈ its
-                                // distance), not a nearer occluder's slope. The below-
-                                // margin is looser: a gentle distant flank recedes fast
-                                // with each 0.2° step down.
-                                var rescued = false
-                                if skyTouched, !peak.isSaddle {
-                                    let belowMargin = max(margin, horiz * 0.15)
-                                    var dropDeg = 0.2
-                                    while dropDeg <= 0.6 {
-                                        let el = (sightAngle - dropDeg) * .pi / 180
-                                        let dvv = 0.5 - 0.5 * el / panoElevMax
-                                        let dmy = min(depthH - 1, max(0, Int(dvv * Double(depthH))))
-                                        let d = Double(depth[dmy * depthW + min(depthW - 1, max(0, mx))])
-                                        if d < skyDepth, d >= horiz - belowMargin {
-                                            rescued = true
-                                            break
-                                        }
-                                        dropDeg += 0.2
+                            let own = nearestAbove(mx)
+                            if own < horiz - slackOcc {
+                                // A nearer occluder stands above this anchor. One
+                                // texel is 0.044° of azimuth — at long range a
+                                // knife-edge can land in the wrong column — so if
+                                // EITHER adjacent column is clear, the exact march
+                                // arbitrates; a solid occluder (all three columns)
+                                // hides the feature outright.
+                                let left = ((mx - 1) % depthW + depthW) % depthW
+                                let right = (mx + 1) % depthW
+                                if nearestAbove(left) >= horiz - slackOcc
+                                    || nearestAbove(right) >= horiz - slackOcc {
+                                    let prof = Self.sightlineProfile(
+                                        eyeLat: refLat, eyeLon: refLon,
+                                        featLat: hi.lat, featLon: hi.lon,
+                                        horiz: horiz, apparentUp: apparentUp,
+                                        camElevMeters: camElevMeters, heightScale: heightScale,
+                                        curvatureK: curvatureK, dem: dem, far: far,
+                                        lowPoint: peak.isSaddle)
+                                    if prof.blocked {
+                                        watch(String(format:
+                                            "OCCLUDED (edge march): drawn occluder at %.0f m confirmed, crest %.0f m of %.0f",
+                                            own, prof.crestHoriz, horiz))
+                                        verd[i] = Verdict.occluded.rawValue
+                                        return
                                     }
-                                }
-                                if !rescued {
+                                    watch("shown: occluder in own column but the exact march threads past it")
+                                } else {
                                     if Self.labelDebug, horiz < 10_000 {
-                                        NSLog("labelDebug OCCLUDED %@ at %.0f m: render terrain reaches %.0f m in its direction",
-                                              peak.name, horiz, Double(farthestTerrain))
+                                        NSLog("labelDebug OCCLUDED %@ at %.0f m: drawn terrain at %.0f m stands above its anchor",
+                                              peak.name, horiz, own)
                                     }
-                                    watch(String(format: "OCCLUDED: horiz %.0f, sightAngle %.2f°, farthestTerrain %.0f, margin %.0f, skyTouched %@",
-                                                 horiz, sightAngle, Double(farthestTerrain), margin, skyTouched ? "yes" : "no"))
-                                    if watched {
-                                        // Second opinion for the log: the exact march.
-                                        let blocked = Self.waterSightlineOccluded(
-                                            eyeLat: refLat, eyeLon: refLon,
-                                            featLat: hi.lat, featLon: hi.lon,
-                                            horiz: horiz, apparentUp: apparentUp,
-                                            camElevMeters: camElevMeters, heightScale: heightScale,
-                                            curvatureK: curvatureK, dem: dem, far: far)
-                                        watch("exact march says: \(blocked ? "blocked" : "CLEAR — depth map disagrees with geometry")")
+                                    watch(String(format:
+                                        "OCCLUDED: drawn terrain %.0f m above the anchor of a %.0f m feature (slack %.0f)",
+                                        own, horiz, slackOcc))
+                                    verd[i] = Verdict.occluded.rawValue
+                                    return
+                                }
+                            } else if own == .infinity {
+                                // Open sky at and above the anchor. A tall grazing
+                                // tip the bake under-resolved still has its OWN
+                                // body drawn just below (depth ≈ its distance) —
+                                // that stays shown, the silhouette pin seats it.
+                                // First drawn terrain below decides: much nearer
+                                // = the feature is behind it (occluded); nothing
+                                // drawn at all = a floater.
+                                var below: Double?
+                                let maxDrop = max(2, Int(rowsPerDeg * 0.6))
+                                var r = my + 1
+                                while r <= min(depthH - 1, my + maxDrop) {
+                                    let d = Double(depth[r * depthW + mx])
+                                    if d < skyDepth { below = d; break }
+                                    r += 1
+                                }
+                                if let below {
+                                    if below < horiz - max(slackOcc, horiz * 0.15) {
+                                        watch(String(format:
+                                            "OCCLUDED: sky at the anchor; nearest body below is %.0f m — a nearer ridge, not this %.0f m feature",
+                                            below, horiz))
+                                        verd[i] = Verdict.occluded.rawValue
+                                        return
                                     }
-                                    // For the stats: all-sky with no supporting body =
-                                    // floater; otherwise nearer terrain occludes it.
-                                    verd[i] = (skyTouched && farthestTerrain == 0)
-                                        ? Verdict.floating.rawValue : Verdict.occluded.rawValue
+                                } else {
+                                    watch("floating: open sky with no drawn terrain within 0.6° below")
+                                    verd[i] = Verdict.floating.rawValue
                                     return
                                 }
                             }
+                            // else: terrain above the anchor exists but nothing
+                            // is nearer than the feature → visible.
                         }
                         verd[i] = Verdict.shown.rawValue
                         watch(String(format: "SHOWN: horiz %.0f, sightAngle %.2f°, bearing %.1f°",
@@ -3342,7 +3410,18 @@ struct TerrainMetalView: UIViewRepresentable {
             var crestTan = -Double.greatestFiniteMagnitude
             var crestS = 0.0
             var crestGround = 0.0
-            var d = 60.0                        // the eye's own crest is guaranteed clear
+            // Near field: start just past the eye's own post, at FINE steps.
+            // The old flat 60 m skip ("the eye's own crest is guaranteed
+            // clear") is true UPWARD — summitSnappedEye stands on a local
+            // max — but it also waived the DOWNWARD blocking that is real:
+            // on a summit, the ground at your feet (the dome edge 15–60 m
+            // out) is exactly what hides everything behind and below it.
+            // The blind gap let those features judge clear and draw their
+            // dots on the drawn foreground ("points coming through the
+            // ground"). 6 m steps to 150 m track the same bilinear surface
+            // the renderer draws, for ~25 extra samples; starting at 8 m
+            // keeps the eye's own post from self-occluding.
+            var d = 8.0
             guard stop > d else { return (false, 0, 0, 0) }
             while d < stop {
                 let f = d / horiz
@@ -3356,7 +3435,7 @@ struct TerrainMetalView: UIViewRepresentable {
                     let t = up / d
                     if t > crestTan { crestTan = t; crestS = d; crestGround = ground }
                 }
-                d += inNear ? 30 : 90           // ≤ a cell per tier
+                d += d < 150 ? 6 : (inNear ? 30 : 90)   // fine near field, ≤ a cell after
             }
             guard crestTan > summitTan + slack else { return (false, crestS, crestTan, 0) }
             // Deepest ground dip between the crest and the summit: the "is
@@ -3394,7 +3473,10 @@ struct TerrainMetalView: UIViewRepresentable {
             // sightline must not flip a genuinely visible lake to hidden.
             let slack = 8e-4
             let stop = horiz - 150
-            var d = 60.0
+            // Fine near-field steps from 8 m, exactly like sightlineProfile:
+            // the old 60 m skip was blind to the summit-dome foreground, so
+            // valley lakes behind the ground at your feet judged visible.
+            var d = 8.0
             guard stop > d else { return false }        // basically at the lake
             while d < stop {
                 let f = d / horiz
@@ -3407,7 +3489,7 @@ struct TerrainMetalView: UIViewRepresentable {
                         - curvatureK * d * d - camElevMeters
                     if up / d > sightSlope + slack { return true }
                 }
-                d += inNear ? 36 : 110                  // ≈ a cell per tier
+                d += d < 150 ? 6 : (inNear ? 36 : 110)  // fine near field, ≈ a cell after
             }
             return false
         }
