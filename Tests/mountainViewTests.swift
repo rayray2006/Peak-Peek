@@ -1,5 +1,6 @@
 import XCTest
 import Combine
+import Compression
 @testable import PeakPeek
 
 final class GeoMathTests: XCTestCase {
@@ -1012,5 +1013,214 @@ final class SightlineProfileTests: XCTestCase {
         let tile = makeTile(profile: p)
         let r = profile(tile, eyeCol: 5.5, featCol: 40.5, featElev: 1000, camElev: 101.6)
         XCTAssertFalse(r.blocked)
+    }
+}
+
+final class CopernicusDEMTests: XCTestCase {
+    // MARK: Synthetic COG builder — the exact layout the bucket serves
+    // (little-endian classic TIFF, float32, tiled, deflate + predictor 3),
+    // so the decoder is exercised against independently constructed bytes.
+
+    /// zlib-wrap raw deflate the way the real tiles are stored (2-byte
+    /// header; the decoder strips it and ignores the missing adler).
+    private func zlibCompress(_ bytes: [UInt8]) -> [UInt8] {
+        var dst = [UInt8](repeating: 0, count: bytes.count + 4096)
+        let n = compression_encode_buffer(&dst, dst.count, bytes, bytes.count,
+                                          nil, COMPRESSION_ZLIB)
+        XCTAssertGreaterThan(n, 0)
+        return [0x78, 0x9C] + dst[0..<n]
+    }
+
+    /// One tile's payload: floats → 4 byte planes (MSB first) per row,
+    /// horizontal byte differencing, deflate.
+    private func encodeTile(_ v: [Float], tileW: Int, tileH: Int) -> [UInt8] {
+        var raw = [UInt8](repeating: 0, count: tileW * tileH * 4)
+        for r in 0..<tileH {
+            let base = r * tileW * 4
+            for c in 0..<tileW {
+                let bits = v[r * tileW + c].bitPattern
+                raw[base + c] = UInt8(truncatingIfNeeded: bits >> 24)
+                raw[base + tileW + c] = UInt8(truncatingIfNeeded: bits >> 16)
+                raw[base + 2 * tileW + c] = UInt8(truncatingIfNeeded: bits >> 8)
+                raw[base + 3 * tileW + c] = UInt8(truncatingIfNeeded: bits)
+            }
+            for i in stride(from: tileW * 4 - 1, through: 1, by: -1) {
+                raw[base + i] = raw[base + i] &- raw[base + i - 1]
+            }
+        }
+        return zlibCompress(raw)
+    }
+
+    private func makeTIFF(width: Int, height: Int, tileW: Int, tileH: Int,
+                          values: [Float]) -> Data {
+        let across = (width + tileW - 1) / tileW
+        let down = (height + tileH - 1) / tileH
+        var tiles: [[UInt8]] = []
+        for t in 0..<(across * down) {
+            let rowLo = (t / across) * tileH, colLo = (t % across) * tileW
+            var v = [Float](repeating: 0, count: tileW * tileH)   // edge padding
+            for r in 0..<tileH where rowLo + r < height {
+                for c in 0..<tileW where colLo + c < width {
+                    v[r * tileW + c] = values[(rowLo + r) * width + colLo + c]
+                }
+            }
+            tiles.append(encodeTile(v, tileW: tileW, tileH: tileH))
+        }
+        var d = [UInt8](repeating: 0, count: 8)
+        d[0] = 0x49; d[1] = 0x49; d[2] = 42                       // II, magic
+        var offsets: [Int] = [], counts: [Int] = []
+        for t in tiles { offsets.append(d.count); counts.append(t.count); d += t }
+        func u32le(_ v: Int) -> [UInt8] {
+            let b0 = UInt8(v & 0xFF)
+            let b1 = UInt8((v >> 8) & 0xFF)
+            let b2 = UInt8((v >> 16) & 0xFF)
+            let b3 = UInt8((v >> 24) & 0xFF)
+            return [b0, b1, b2, b3]
+        }
+        let offArrayAt = d.count
+        for o in offsets { d += u32le(o) }
+        let cntArrayAt = d.count
+        for c in counts { d += u32le(c) }
+        let ifdAt = d.count
+        var entries: [[UInt8]] = []
+        func entry(_ tag: Int, _ typ: Int, _ cnt: Int, _ val: Int) {
+            var e: [UInt8] = [UInt8(tag & 0xFF), UInt8(tag >> 8), UInt8(typ), 0]
+            e += u32le(cnt)
+            e += u32le(val)
+            entries.append(e)
+        }
+        entry(256, 3, 1, width); entry(257, 3, 1, height)
+        entry(258, 3, 1, 32); entry(259, 3, 1, 8); entry(277, 3, 1, 1)
+        entry(317, 3, 1, 3); entry(322, 3, 1, tileW); entry(323, 3, 1, tileH)
+        entry(324, 4, offsets.count, offsets.count == 1 ? offsets[0] : offArrayAt)
+        entry(325, 4, counts.count, counts.count == 1 ? counts[0] : cntArrayAt)
+        entry(339, 3, 1, 3)
+        d += [UInt8(entries.count), 0]
+        for e in entries { d += e }
+        d += u32le(0)                                             // no next IFD
+        d[4] = UInt8(ifdAt & 0xFF); d[5] = UInt8((ifdAt >> 8) & 0xFF)
+        d[6] = UInt8((ifdAt >> 16) & 0xFF); d[7] = UInt8((ifdAt >> 24) & 0xFF)
+        return Data(d)
+    }
+
+    /// Multi-tile grid with edge-padded tiles decodes to the exact floats.
+    func testDecodeGridRoundTrip() throws {
+        let w = 6, h = 5                                          // 2×3 grid of 4×2 tiles
+        let values: [Float] = (0..<(w * h)).map { (i: Int) -> Float in
+            let cell: Int = (i / w) * 100 + (i % w)
+            return Float(cell) + 0.25
+        }
+        let tiff = makeTIFF(width: w, height: h, tileW: 4, tileH: 2, values: values)
+        let grid = try CopernicusDEM.decodeGrid(tiff: tiff)
+        XCTAssertEqual(grid.width, w)
+        XCTAssertEqual(grid.height, h)
+        XCTAssertEqual(grid.values, values)
+    }
+
+    /// A changed upstream layout (stripes, LZW, no predictor…) must throw,
+    /// never render garbage terrain.
+    func testDecodeGridRejectsUnknownLayout() {
+        let values = [Float](repeating: 1, count: 16)
+        var tiff = makeTIFF(width: 4, height: 4, tileW: 4, tileH: 4, values: values)
+        XCTAssertNoThrow(try CopernicusDEM.decodeGrid(tiff: tiff))
+        // Flip compression tag value 8 → 5 (LZW) in place. Entry bytes:
+        // tag 259 LE, type 3, count 1, value 8.
+        if let range = tiff.firstRange(of: Data([3, 1, 3, 0, 1, 0, 0, 0, 8, 0, 0, 0])) {
+            tiff[range.lowerBound + 8] = 5
+            XCTAssertThrowsError(try CopernicusDEM.decodeGrid(tiff: tiff))
+        } else {
+            XCTFail("compression entry not found")
+        }
+        XCTAssertThrowsError(try CopernicusDEM.decodeGrid(tiff: Data([0x49, 0x49, 42, 0])))
+    }
+
+    private func post(_ hgt: Data, _ r: Int, _ c: Int) -> Int16 {
+        let o = (r * 3601 + c) * 2
+        return Int16(bitPattern: UInt16(hgt[o]) << 8 | UInt16(hgt[o + 1]))
+    }
+
+    /// Longitude/latitude interpolation onto the 1″ post grid: decoded posts
+    /// land exactly, in-between posts are linear blends, the missing
+    /// south/east edge posts clamp to the last real post.
+    func testResampleInterpolatesAndClampsEdges() {
+        // 2×2 grid: NW 0, NE 100, SW 200, SE 300.
+        let hgt = CopernicusDEM.resampleToHGT([0, 100, 200, 300], width: 2, height: 2)
+        XCTAssertEqual(hgt.count, 3601 * 3601 * 2)
+        // 2 source rows/cols span the degree at 1800″ steps: post 1800 lands
+        // EXACTLY on source row/col 1 (Copernicus leaves the south/east
+        // half-degree… full-degree edge to the neighbouring tile).
+        XCTAssertEqual(post(hgt, 0, 0), 0)
+        XCTAssertEqual(post(hgt, 0, 1800), 100)     // x = 1800*2/3600 = col 1
+        XCTAssertEqual(post(hgt, 0, 900), 50)       // halfway NW→NE
+        XCTAssertEqual(post(hgt, 900, 0), 100)      // halfway NW→SW
+        XCTAssertEqual(post(hgt, 0, 3600), 100)     // east edge clamps to NE
+        XCTAssertEqual(post(hgt, 3600, 0), 200)     // south edge clamps to SW
+        XCTAssertEqual(post(hgt, 3600, 3600), 300)
+        XCTAssertEqual(post(hgt, 900, 900), 150)    // interior: bilinear blend
+    }
+
+    /// Non-finite / deep-negative source samples become the SRTM void
+    /// sentinel the stitcher's fillVoids already handles.
+    func testResampleMapsNodataToVoidSentinel() {
+        let hgt = CopernicusDEM.resampleToHGT([Float.nan, -32767, 5, 5],
+                                              width: 2, height: 2)
+        XCTAssertEqual(post(hgt, 0, 0), -32768)
+        XCTAssertEqual(post(hgt, 0, 3600), -32768)
+    }
+
+    /// The converter's gzip container must be readable by the same gunzip
+    /// every cached skadi tile goes through.
+    func testGzipRoundTripsThroughDEMFetcherGunzip() {
+        var bytes = Data(capacity: 70_000)
+        var seed: UInt32 = 0x2468ACE0
+        for _ in 0..<70_000 {                        // xorshift: incompressible-ish
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5
+            bytes.append(UInt8(truncatingIfNeeded: seed))
+        }
+        let gz = CopernicusDEM.gzip(bytes)
+        XCTAssertNotNil(gz)
+        XCTAssertEqual(DEMFetcher.gunzip(gz!), bytes)
+    }
+
+    /// Latitude gating and S3 object naming (incl. antimeridian wrap) —
+    /// exactly the tiles SRTM never covered go to Copernicus.
+    func testCoverageGateAndObjectNames() {
+        XCTAssertFalse(CopernicusDEM.coversTile(tLat: 59))   // Alps…Oslo: skadi
+        XCTAssertTrue(CopernicusDEM.coversTile(tLat: 60))    // 60–61°N band
+        XCTAssertTrue(CopernicusDEM.coversTile(tLat: 64))    // Iceland
+        XCTAssertFalse(CopernicusDEM.coversTile(tLat: -56))  // Tierra del Fuego: skadi
+        XCTAssertTrue(CopernicusDEM.coversTile(tLat: -57))
+        XCTAssertEqual(CopernicusDEM.objectName(tLat: 64, tLon: -18),
+                       "Copernicus_DSM_COG_10_N64_00_W018_00_DEM")
+        XCTAssertEqual(CopernicusDEM.objectName(tLat: -57, tLon: 170),
+                       "Copernicus_DSM_COG_10_S57_00_E170_00_DEM")
+        XCTAssertEqual(CopernicusDEM.objectName(tLat: 65, tLon: -181),
+                       "Copernicus_DSM_COG_10_N65_00_E179_00_DEM")
+        XCTAssertEqual(CopernicusDEM.objectName(tLat: 65, tLon: 180),
+                       "Copernicus_DSM_COG_10_N65_00_W180_00_DEM")
+    }
+
+    /// Converter provenance: our fixed gzip header marks a tile as
+    /// Copernicus-converted; skadi's server gzip (FNAME flag + real mtime,
+    /// as served by the mirror) must read as stale at high latitudes.
+    func testIsConvertedDistinguishesSkadiTiles() {
+        let converted = CopernicusDEM.gzip(Data(repeating: 7, count: 64))!
+        XCTAssertTrue(CopernicusDEM.isConverted(converted))
+        var skadiStyle = Data([0x1F, 0x8B, 8, 8, 0x73, 3, 0x1C, 0x57, 2, 0xFF])
+        skadiStyle.append(Data("N64W018.hgt\0".utf8))
+        skadiStyle.append(Data(repeating: 0, count: 32))
+        XCTAssertFalse(CopernicusDEM.isConverted(skadiStyle))
+        XCTAssertFalse(CopernicusDEM.isConverted(Data([0x1F, 0x8B])))
+    }
+
+    /// End-to-end: synthetic COG → convertToHGTGZ → gunzip → SRTM1 bytes.
+    func testConvertToHGTGZEndToEnd() throws {
+        let values: [Float] = [10, 20, 30, 40]
+        let tiff = makeTIFF(width: 2, height: 2, tileW: 2, tileH: 2, values: values)
+        let gz = try CopernicusDEM.convertToHGTGZ(tiff: tiff)
+        let hgt = DEMFetcher.gunzip(gz)
+        XCTAssertEqual(hgt?.count, 3601 * 3601 * 2)
+        XCTAssertEqual(post(hgt!, 0, 0), 10)
+        XCTAssertEqual(post(hgt!, 3600, 3600), 40)
     }
 }

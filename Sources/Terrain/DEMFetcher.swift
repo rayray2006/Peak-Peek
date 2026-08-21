@@ -8,6 +8,10 @@ import Compression
 ///
 /// Skadi tiles are 1°×1° SRTM1 (~30 m, the same resolution as the old AW3D30
 /// source), gzipped big-endian Int16, 3601×3601, row 0 = north, −32768 = void.
+/// Above 60°N / below 56°S — where SRTM never flew and skadi degrades to
+/// ~250 m GMTED — tiles come from the (equally keyless) Copernicus GLO-30
+/// bucket instead, converted into the identical format at the download
+/// boundary; see `CopernicusDEM`.
 /// The box around the eye usually spans 1–4 degree tiles; we download the covering
 /// tiles (keyless), stitch them into one `DEMTile` at native SRTM resolution, and
 /// cache. The renderer consumes a `DEMTile` exactly as before.
@@ -45,6 +49,9 @@ enum DEMFetcher {
         case decoded(Data)       // decoded-cache hit — no gz needed at all
         case ocean               // 404: genuinely no land here
         case failed              // transient: retryable, NOT flat ocean
+        case stale(Data)         // offline, only a pre-Copernicus coarse tile
+                                 // on disk: render it, but count as a failure
+                                 // so nothing caches/persists it as real
     }
 
     /// Per-degree raw `.hgt.gz` cache (shared across overlapping boxes, survives
@@ -89,6 +96,14 @@ enum DEMFetcher {
     private static let snapshotQueue = DispatchQueue(
         label: "com.peakpeek.demsnapshot", qos: .utility)
 
+    /// Marker written alongside the snapshot since the Copernicus supplement
+    /// shipped. A HIGH-LATITUDE snapshot without it was stitched from the
+    /// coarse pre-supplement skadi tiles and is ignored once (the normal
+    /// fetch that follows rebuilds it from Copernicus and stamps the marker).
+    private static var snapshotSourcesMarker: URL {
+        lastRegionDir.appendingPathComponent("sources-copernicus")
+    }
+
     static func saveLastRegion(near: DEMTile, far: DEMTile?) {
         let nearPath = lastRegionDir.appendingPathComponent("near.dembin").path
         let farPath = lastRegionDir.appendingPathComponent("far.dembin").path
@@ -96,6 +111,7 @@ enum DEMFetcher {
             try? near.saveBinary(to: nearPath)
             if let far { try? far.saveBinary(to: farPath) }
             else { try? FileManager.default.removeItem(atPath: farPath) }
+            try? Data().write(to: snapshotSourcesMarker)
         }
     }
 
@@ -108,6 +124,14 @@ enum DEMFetcher {
     static func loadLastRegion() -> (near: DEMTile, far: DEMTile?)? {
         let nearPath = lastRegionDir.appendingPathComponent("near.dembin").path
         guard let near = try? DEMTile.loadCached(binPath: nearPath) else { return nil }
+        // A high-latitude snapshot from before the Copernicus supplement is
+        // built from ~250 m terrain — skip it so launch takes the fetch path.
+        let north = near.yllcorner + Double(near.nrows) * near.cellsize
+        if north >= 60 || near.yllcorner <= -56,
+           !FileManager.default.fileExists(atPath: snapshotSourcesMarker.path) {
+            NSLog("DEM snapshot predates Copernicus supplement at high latitude — refetching")
+            return nil
+        }
         let far = try? DEMTile.loadCached(binPath: lastRegionDir.appendingPathComponent("far.dembin").path)
         return (despiked(near), far.map(despiked))
     }
@@ -268,6 +292,11 @@ enum DEMFetcher {
                 case .decoded(let raw): out.decoded["\(tLat),\(tLon)"] = raw
                 case .ocean: break
                 case .failed: out.failures += 1
+                case .stale(let data):
+                    // Renders, but the failure keeps `complete` false: the
+                    // coarse pre-Copernicus tile must not be cached as real.
+                    out.gz["\(tLat),\(tLon)"] = data
+                    out.failures += 1
                 }
                 onTileComplete?(tileName(tLat: tLat, tLon: tLon).name)
             }
@@ -543,35 +572,79 @@ enum DEMFetcher {
         }
     }
 
+    /// Download one degree tile from whichever source actually has ~30 m data
+    /// there: skadi SRTM inside SRTM's 60°N–56°S coverage, Copernicus GLO-30
+    /// beyond it (converted on the spot into the same `.hgt.gz` bytes — see
+    /// `CopernicusDEM`). Every caller downstream of this sees one format.
+    private static func downloadTile(tLat: Int, tLon: Int,
+                                     onProgress: (@Sendable (Double) -> Void)? = nil)
+        async -> TileLoad {
+        let useCopernicus = CopernicusDEM.coversTile(tLat: tLat)
+        let (folder, name) = tileName(tLat: tLat, tLon: tLon)
+        let url = useCopernicus
+            ? CopernicusDEM.url(tLat: tLat, tLon: tLon)
+            : URL(string: "https://elevation-tiles-prod.s3.amazonaws.com/skadi/\(folder)/\(name).hgt.gz")
+        guard let url else { return .failed }
+        NSLog("DEM tile download: %@ (%@)", name, useCopernicus ? "copernicus" : "srtm")
+        var req = URLRequest(url: url)
+        req.timeoutInterval = useCopernicus ? 120 : 60   // COGs run ~2× the bytes
+        // NOTE: concurrent requesters share the deduped task around this, so
+        // only the FIRST caller's progress closure streams — the other tier's
+        // copy of a shared tile still ticks its completion unit as ever.
+        guard let (data, resp) = await downloadReportingProgress(req, onProgress: onProgress) else {
+            return .failed                          // offline / timeout: retryable
+        }
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        if code == 404 { return .ocean }            // genuinely no land tile here
+        guard code == 200, !data.isEmpty else { return .failed }
+        if !useCopernicus { return .data(data) }
+        guard let converted = try? CopernicusDEM.convertToHGTGZ(tiff: data) else {
+            return .failed   // truncated/changed upstream: retryable, never cached
+        }
+        return .data(converted)
+    }
+
     private static func loadHGTData(tLat: Int, tLon: Int,
                                     onProgress: (@Sendable (Double) -> Void)? = nil)
         async -> TileLoad {
-        let (folder, name) = tileName(tLat: tLat, tLon: tLon)
-        // Downloaded offline regions first (persistent), then the runtime cache.
-        if let d = try? Data(contentsOf: regionStoreDir.appendingPathComponent("\(name).hgt.gz")) { return .data(d) }
+        let name = tileName(tLat: tLat, tLon: tLon).name
+        let regionURL = regionStoreDir.appendingPathComponent("\(name).hgt.gz")
         let cacheURL = hgtCacheDir.appendingPathComponent("\(name).hgt.gz")
-        if let cached = try? Data(contentsOf: cacheURL) { return .data(cached) }
+        // A cached HIGH-LATITUDE tile not written by the Copernicus converter
+        // is a coarse pre-supplement skadi file (Iceland as melted blobs) —
+        // treat it as a miss so it's refetched and overwritten, not served.
+        let needsCopernicus = CopernicusDEM.coversTile(tLat: tLat)
+        @Sendable func fresh(_ d: Data?) -> Data? {
+            guard let d else { return nil }
+            return !needsCopernicus || CopernicusDEM.isConverted(d) ? d : nil
+        }
+        // Downloaded offline regions first (persistent), then the runtime cache.
+        let regionData = try? Data(contentsOf: regionURL)
+        if let d = fresh(regionData) { return .data(d) }
+        let cacheData = try? Data(contentsOf: cacheURL)
+        if let d = fresh(cacheData) { return .data(d) }
+        // Kept only as the offline fallback below — coarse beats a void.
+        let staleData = regionData ?? cacheData
 
         return await inflight.load(for: name) {
             // Re-check inside the deduped task: a racing caller may have finished
             // (and written the cache) between our miss above and getting here.
-            if let cached = try? Data(contentsOf: cacheURL) { return .data(cached) }
-            guard let url = URL(string:
-                "https://elevation-tiles-prod.s3.amazonaws.com/skadi/\(folder)/\(name).hgt.gz") else { return .failed }
-            NSLog("DEM tile download: %@", name)
-            var req = URLRequest(url: url)
-            req.timeoutInterval = 60
-            // NOTE: concurrent requesters share this deduped task, so only the
-            // FIRST caller's progress closure streams — the other tier's copy
-            // of a shared tile still ticks its completion unit as ever.
-            guard let (data, resp) = await downloadReportingProgress(req, onProgress: onProgress) else {
-                return .failed                          // offline / timeout: retryable
+            if let cached = fresh(try? Data(contentsOf: cacheURL)) { return .data(cached) }
+            let load = await downloadTile(tLat: tLat, tLon: tLon, onProgress: onProgress)
+            switch load {
+            case .data(let data):
+                try? data.write(to: cacheURL)
+                // Heal a stale offline-region tile in place: the region keeps
+                // rendering offline, just with real 30 m terrain from now on.
+                if regionData != nil { try? data.write(to: regionURL) }
+            case .failed where staleData != nil:
+                // Offline with only a pre-supplement tile on disk: coarse
+                // terrain beats a void. `.stale` stitches like data but keeps
+                // `complete` false, so the next online visit still refetches.
+                return .stale(staleData!)
+            default: break
             }
-            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            if code == 404 { return .ocean }            // genuinely no land tile here
-            guard code == 200, !data.isEmpty else { return .failed }
-            try? data.write(to: cacheURL)
-            return .data(data)
+            return load
         }
     }
 
@@ -613,23 +686,29 @@ enum DEMFetcher {
     /// ocean/void tile that 404s — nothing to keep but still "done"), or nil on a
     /// transient failure (caller can retry). Promotes from the runtime cache if present.
     static func ensurePersistentTile(tLat: Int, tLon: Int) async -> Int? {
-        let (folder, name) = tileName(tLat: tLat, tLon: tLon)
+        let name = tileName(tLat: tLat, tLon: tLon).name
         let dest = regionStoreDir.appendingPathComponent("\(name).hgt.gz")
-        if let size = (try? FileManager.default.attributesOfItem(atPath: dest.path))?[.size] as? Int {
-            return size                                   // already downloaded
+        // Same freshness gate as loadHGTData: a high-latitude file that
+        // didn't come from the Copernicus converter is coarse pre-supplement
+        // skadi data — re-download instead of keeping/promoting it.
+        let needsCopernicus = CopernicusDEM.coversTile(tLat: tLat)
+        @Sendable func fresh(_ d: Data?) -> Data? {
+            guard let d else { return nil }
+            return !needsCopernicus || CopernicusDEM.isConverted(d) ? d : nil
         }
-        if let data = try? Data(contentsOf: hgtCacheDir.appendingPathComponent("\(name).hgt.gz")) {
+        if let existing = fresh(try? Data(contentsOf: dest, options: .alwaysMapped)) {
+            return existing.count                         // already downloaded
+        }
+        if let data = fresh(try? Data(contentsOf: hgtCacheDir.appendingPathComponent("\(name).hgt.gz"))) {
             try? data.write(to: dest); return data.count  // promote from runtime cache
         }
-        guard let url = URL(string:
-            "https://elevation-tiles-prod.s3.amazonaws.com/skadi/\(folder)/\(name).hgt.gz") else { return nil }
-        var req = URLRequest(url: url); req.timeoutInterval = 60
-        guard let (data, resp) = try? await tileSession.data(for: req) else { return nil }
-        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        if code == 404 { return 0 }                       // ocean tile — nothing to store
-        guard code == 200, !data.isEmpty else { return nil }
-        try? data.write(to: dest)
-        return data.count
+        switch await downloadTile(tLat: tLat, tLon: tLon) {
+        case .ocean: return 0                             // ocean tile — nothing to store
+        case .failed, .decoded, .stale: return nil
+        case .data(let data):
+            try? data.write(to: dest)
+            return data.count
+        }
     }
 
     /// Remove a downloaded tile from the persistent store (caller handles sharing).
@@ -665,7 +744,7 @@ enum DEMFetcher {
 
     // MARK: gzip (Compression speaks raw deflate, not the gzip wrapper)
 
-    private static func gunzip(_ data: Data) -> Data? {
+    static func gunzip(_ data: Data) -> Data? {
         guard data.count > 18, data[0] == 0x1F, data[1] == 0x8B, data[2] == 8 else { return nil }
         let flags = data[3]
         var offset = 10

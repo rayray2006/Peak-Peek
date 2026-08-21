@@ -271,10 +271,16 @@ struct RegionManagerView: View {
     }
 
     private var footer: some View {
-        HStack {
-            Text(store.regions.isEmpty ? "No regions downloaded" : "\(store.regions.count) region(s)")
-            Spacer()
-            Text("Storage: \(store.totalSizeText)")
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(store.regions.isEmpty ? "No regions downloaded" : "\(store.regions.count) region(s)")
+                Spacer()
+                Text("Storage: \(store.totalSizeText)")
+            }
+            // Required credit for the high-latitude source (Copernicus data
+            // license); SRTM/Mapzen appreciate one too.
+            Text("Elevation: NASA SRTM · Copernicus GLO-30 DEM © ESA/DLR · Mapzen")
+                .opacity(0.7)
         }
         .font(PPFont.mono(10))
         .foregroundStyle(TopoStyle.inkColor.opacity(0.45))
