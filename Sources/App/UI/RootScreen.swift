@@ -125,6 +125,7 @@ struct RootScreen: View {
             onSunTimes: { model.sunTimesResolved($0) },
             onStatus: { model.renderStatusChanged($0) },
             onEyeElevation: { model.eyeElevationResolved($0) },
+            onEyeCoordinate: { model.eyeLanded(latitude: $0, longitude: $1) },
             onForceManual: { manualAlignment = true },
             arRecenterToken: arRecenterToken,
             cancelMoveToken: model.moveCancelToken,
@@ -484,6 +485,7 @@ struct RootScreen: View {
             // inline bottom panel — see below.
             TeleportMapView(
                 currentViewpoint: model.viewpoint,
+                eyeCoordinate: model.standingEyeCoordinate,
                 isManualViewpoint: model.isManualViewpoint,
                 lists: peakLists,
                 visibility: { model.visibilityVerdict(for: $0) }
@@ -1037,7 +1039,9 @@ struct RootScreen: View {
                     // starts loading.
                     if let viewpoint = model.renderedViewpoint ?? model.viewpoint,
                        !(showActionMenu && isChromeLandscape) {
-                        MiniMapView(viewpoint: viewpoint, isManualViewpoint: model.isManualViewpoint) {
+                        MiniMapView(viewpoint: viewpoint,
+                                    eyeCoordinate: model.standingEyeCoordinate,
+                                    isManualViewpoint: model.isManualViewpoint) {
                             activeSheet = .map
                         }
                         .transition(.opacity)
@@ -1608,6 +1612,7 @@ struct RootScreen: View {
 /// load (first open, teleports, "Stand here") gets the same playful readout.
 private enum LoadingWhimsy {
     static let lines: [String] = [
+        
         
         "Stitching tiles",
         "Carving valleys",

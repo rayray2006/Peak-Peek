@@ -10,6 +10,10 @@ import SwiftUI
 /// friendly name is reverse-geocoded on confirm.
 struct TeleportMapView: View {
     let currentViewpoint: PanoramaViewModel.Viewpoint?
+    /// Where the eye ACTUALLY stands (renderer-reported): a "Stand here"
+    /// summit snap moves it onto the rendered apex, off the viewpoint's
+    /// catalog coordinate. The pin marks this when available.
+    var eyeCoordinate: CLLocationCoordinate2D? = nil
     /// When the eye follows GPS, the viewpoint IS the user's location — drawing
     /// both the blue GPS dot and the white viewpoint dot stacks two markers on
     /// the same spot, so the viewpoint marker only renders for manual viewpoints.
@@ -305,6 +309,9 @@ struct TeleportMapView: View {
     }
 
     private var currentCoordinate: CLLocationCoordinate2D {
+        // Prefer the renderer-reported standing position (post summit-snap);
+        // fall back to the requested catalog point until it lands.
+        if let eyeCoordinate { return eyeCoordinate }
         guard let currentViewpoint else {
             return CLLocationCoordinate2D(latitude: 0, longitude: 0)
         }
@@ -370,6 +377,9 @@ struct TeleportMapView: View {
 /// opens the full teleport map.
 struct MiniMapView: View {
     let viewpoint: PanoramaViewModel.Viewpoint
+    /// Renderer-reported standing position (post summit-snap) — see
+    /// TeleportMapView.eyeCoordinate. The pin marks it when available.
+    let eyeCoordinate: CLLocationCoordinate2D?
     /// GPS-following: the eye IS the user's location (the system puck marks
     /// both); manual: puck + white viewpoint pin are distinct places.
     let isManualViewpoint: Bool
@@ -380,8 +390,10 @@ struct MiniMapView: View {
     /// interrupt tile loading).
     @State private var position: MapCameraPosition
 
-    init(viewpoint: PanoramaViewModel.Viewpoint, isManualViewpoint: Bool, onTap: @escaping () -> Void) {
+    init(viewpoint: PanoramaViewModel.Viewpoint, eyeCoordinate: CLLocationCoordinate2D? = nil,
+         isManualViewpoint: Bool, onTap: @escaping () -> Void) {
         self.viewpoint = viewpoint
+        self.eyeCoordinate = eyeCoordinate
         self.isManualViewpoint = isManualViewpoint
         self.onTap = onTap
         _position = State(initialValue: .region(Self.region(for: viewpoint)))
@@ -426,7 +438,8 @@ struct MiniMapView: View {
     }
 
     private var center: CLLocationCoordinate2D {
-        CLLocationCoordinate2D(latitude: viewpoint.latitude, longitude: viewpoint.longitude)
+        eyeCoordinate
+            ?? CLLocationCoordinate2D(latitude: viewpoint.latitude, longitude: viewpoint.longitude)
     }
 
     private static func region(for viewpoint: PanoramaViewModel.Viewpoint) -> MKCoordinateRegion {

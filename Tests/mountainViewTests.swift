@@ -633,6 +633,24 @@ final class StandOnPeakTests: XCTestCase {
         XCTAssertNil(model.viewpoint?.summitTarget)
     }
 
+    /// The map pin marks where the eye ACTUALLY stands: the renderer reports
+    /// the (possibly summit-snapped) coordinate via eyeLanded, and a new
+    /// teleport clears it until the new eye lands — so the pin can never show
+    /// the previous mountain's apex on the next one.
+    func testEyeLandedDrivesThePinAndClearsOnTeleport() {
+        let model = PanoramaViewModel()
+        let peak = Peak(id: "n:12345", name: "K2", latitude: 35.8825, longitude: 76.5133,
+                        elevationMeters: 8611, prominenceMeters: 4020)
+        model.standOnPeak(annotated(peak))
+        XCTAssertNil(model.standingEyeCoordinate)   // nothing landed yet
+        model.eyeLanded(latitude: 35.8830, longitude: 76.5140)   // snapped apex
+        XCTAssertEqual(model.standingEyeCoordinate?.latitude, 35.8830)
+        XCTAssertEqual(model.standingEyeCoordinate?.longitude, 76.5140)
+        model.teleport(to: PanoramaViewModel.Viewpoint(
+            name: "Elsewhere", latitude: 47.0, longitude: -121.0), manual: true)
+        XCTAssertNil(model.standingEyeCoordinate)   // stale for the new eye
+    }
+
     /// The target survives the last-viewpoint round trip, so reopening the app
     /// stands you back on the apex — not on the catalog point.
     func testSummitTargetSurvivesTheLastViewpointRoundTrip() throws {

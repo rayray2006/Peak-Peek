@@ -97,6 +97,10 @@ struct TerrainMetalView: UIViewRepresentable {
     var onSunTimes: (PanoramaViewModel.SunTimes?) -> Void = { _ in }
     var onStatus: (PanoramaViewModel.Status) -> Void = { _ in }
     var onEyeElevation: (Double?) -> Void = { _ in }
+    /// Fired when the eye settles at its FINAL position — after any "Stand
+    /// here" summit snap, which can move it up to ~600 m off the requested
+    /// catalog point. (lat, lon): what the map pin should mark.
+    var onEyeCoordinate: (Double, Double) -> Void = { _, _ in }
     /// Fired when the view force-switches to manual (no IMU) so the HUD can match.
     var onForceManual: () -> Void = { }
     /// Incremented by the HUD's "Recenter" button to clear the AR drag calibration.
@@ -191,6 +195,7 @@ struct TerrainMetalView: UIViewRepresentable {
     func updateUIView(_ uiView: TerrainContainerView, context: Context) {
         context.coordinator.onStatus = onStatus
         context.coordinator.onEyeElevation = onEyeElevation
+        context.coordinator.onEyeCoordinate = onEyeCoordinate
         context.coordinator.onForceManual = onForceManual
         context.coordinator.onARAdjustedChanged = onARAdjustedChanged
         context.coordinator.onAlignmentNudged = onAlignmentNudged
@@ -337,6 +342,15 @@ struct TerrainMetalView: UIViewRepresentable {
         private weak var view: MTKView?
         var onStatus: (PanoramaViewModel.Status) -> Void
         var onEyeElevation: (Double?) -> Void
+        var onEyeCoordinate: (Double, Double) -> Void = { _, _ in }
+
+        /// Report the settled eye to the model: elevation for the HUD readout,
+        /// coordinate for the map pin (a summit snap stands the eye off the
+        /// catalog point — the pin marks where you actually stand).
+        private func reportEye() {
+            onEyeElevation(Double(groundElev) + 1.6)
+            onEyeCoordinate(refLat, refLon)
+        }
         var onForceManual: () -> Void = { }
 
         // Camera state.
@@ -649,7 +663,7 @@ struct TerrainMetalView: UIViewRepresentable {
                 standingOnPeakID = standingOnBeforeMove
                 lastRequested = requestBeforeMove
                 report(.ready)
-                onEyeElevation(Double(groundElev) + 1.6)
+                reportEye()
             } else if let pre = sceneBeforeMove, pre.demGen == demGeneration, dem != nil {
                 // The move retargeted the eye/sky scalars but the TILES (and
                 // the displayed panorama, which only swaps when its bake
@@ -681,7 +695,7 @@ struct TerrainMetalView: UIViewRepresentable {
                 rebuildLabelAnchors()
                 lastRequested = requestBeforeMove
                 report(.ready)
-                onEyeElevation(Double(groundElev) + 1.6)
+                reportEye()
             } else {
                 // The move already swapped tiles (fetch install, bake pending):
                 // the old scalars belong to evicted tiles, so the model's
@@ -1353,7 +1367,7 @@ struct TerrainMetalView: UIViewRepresentable {
                 bakeProgressive(progressFrom: 0) {
                     guard gen == self.moveGeneration else { return }   // cancelled
                     self.report(.ready)
-                    self.onEyeElevation(Double(ground) + 1.6)
+                    self.reportEye()
                     self.finishReload()
                 }
                 return
@@ -1497,7 +1511,7 @@ struct TerrainMetalView: UIViewRepresentable {
                     self.bakeProgressive(progressFrom: Self.loadShare) {
                         guard gen == self.moveGeneration else { return }        // cancelled
                         self.report(.ready)
-                        self.onEyeElevation(Double(ground) + 1.6)
+                        self.reportEye()
                         self.finishReload()
                     }
                 }

@@ -467,6 +467,7 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         self.viewpoint = viewpoint
         if !unchanged {
             self.eyeElevationMeters = nil
+            self.standingEyeCoordinate = nil  // stale for the new eye; renderer re-reports
             self.visibleFeatureIDs = nil      // stale for the new eye; renderer re-reports
             // A previous load's display sweep (or finish sweep) must not keep
             // publishing over the new load's bar — it made a cancelled move's
@@ -713,6 +714,19 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         shownProgress = 0
         lastPublishedPct = -1
         finishing = false
+    }
+
+    /// Where the eye ACTUALLY stands, as reported by the renderer once a move
+    /// settles. A "Stand here" summit snap moves the eye onto the RENDERED
+    /// apex — up to ~600 m from the catalog point the viewpoint records — and
+    /// the map pin should mark where you stand, not what you asked for.
+    /// Never persisted: the saved viewpoint keeps the catalog request, so a
+    /// relaunch re-runs the same deterministic snap instead of snapping from
+    /// a snap.
+    @Published private(set) var standingEyeCoordinate: CLLocationCoordinate2D?
+
+    func eyeLanded(latitude: Double, longitude: Double) {
+        standingEyeCoordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
     }
 
     func eyeElevationResolved(_ meters: Double?) {
