@@ -3083,6 +3083,21 @@ struct TerrainMetalView: UIViewRepresentable {
                             if !isBackdrop(Double(depth[row0 * depthW + cx])) {
                                 watch(String(format: "PIN: none — anchor row %d (%.3f°) already reads own-body terrain (depth %.0f m of %.0f)",
                                              row0, sightAngle, Double(depth[row0 * depthW + cx]), horiz))
+                                if Self.labelWatch != nil, watched {
+                                    // Debug survey: where is the drawn SILHOUETTE
+                                    // (first own-body-depth texel below sky) in the
+                                    // ±6 columns around the anchor? Reveals any
+                                    // systematic anchor-vs-render azimuth offset.
+                                    let rowsPerDeg = Double(depthH) / (2 * panoElevMax) * .pi / 180
+                                    var parts: [String] = []
+                                    for dx in -6...6 {
+                                        let col = ((cx + dx) % depthW + depthW) % depthW
+                                        var r = max(0, row0 - Int(rowsPerDeg * 4))
+                                        while r < depthH - 1, isBackdrop(Double(depth[r * depthW + col])) { r += 1 }
+                                        parts.append("\(dx):\(r - row0)")
+                                    }
+                                    watch("PINSCAN dCol:dRowOfCrest " + parts.joined(separator: " "))
+                                }
                             }
                             if isBackdrop(Double(depth[row0 * depthW + cx])) {
                                 // Cap the drop at ~3.5°: the occlusion pass vouched

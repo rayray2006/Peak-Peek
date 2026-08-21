@@ -182,9 +182,10 @@ static float terrainHeight(float2 xy, constant Uniforms& u,
 }
 
 static float3 terrainNormal(float2 xy, constant Uniforms& u,
-                            texture2d<float> dem, texture2d<float> demFar) {
-    float ex = max(8.0, u.cellSizeENU.x);
-    float ey = max(8.0, u.cellSizeENU.y);
+                            texture2d<float> dem, texture2d<float> demFar,
+                            float scale) {
+    float ex = max(8.0, u.cellSizeENU.x) * scale;
+    float ey = max(8.0, u.cellSizeENU.y) * scale;
     float hL = terrainHeight(xy - float2(ex, 0), u, dem, demFar);
     float hR = terrainHeight(xy + float2(ex, 0), u, dem, demFar);
     float hD = terrainHeight(xy - float2(0, ey), u, dem, demFar);
@@ -292,21 +293,36 @@ static float4 marchAndShade(float3 ro, float3 rd, constant Uniforms& u,
     float tHit = 0.5 * (tLo + tHi);
     float3 hitP = ro + rd * tHit;
 
-    float3 n = terrainNormal(hitP.xy, u, dem, demFar);
+    // Two normals, two jobs: the FINE normal (1× post spacing) carries rock
+    // texture; the BROAD normal (4×) carries the landform — ridge vs wall vs
+    // floor. Blending their sun response keeps micro-detail while whole
+    // valley walls hold a consistent tone, so adjacent surfaces separate
+    // instead of averaging into one gray (multi-scale relief shading).
+    float3 n  = terrainNormal(hitP.xy, u, dem, demFar, 1.0);
+    float3 nB = terrainNormal(hitP.xy, u, dem, demFar, 4.0);
     float3 sun = normalize(u.sunDir.xyz);
-    float diffuse = max(0.0, dot(n, sun));
+    float diffuse  = 0.6 * max(0.0, dot(n,  sun))
+                   + 0.4 * max(0.0, dot(nB, sun));
     float sky = 0.5 + 0.5 * n.z;                 // sky/ambient occlusion proxy
     // Relief tone curve. A low ambient floor + a wide sun term gives a broad
     // dynamic range; the gamma (>1) then deepens the shadows AND steepens the
     // highlights so subtle slope detail shows in the brighter, otherwise-flat
     // areas. Tunables: kAmbient (shadow floor — lower = darker), kSun (range),
     // kGamma (contrast — higher = darker darks + more highlight texture).
-    const float kAmbient = 0.16;
+    const float kAmbient = 0.14;
     const float kSky     = 0.10;
-    const float kSun     = 0.60;
-    const float kGamma   = 1.10;
+    const float kSun     = 0.62;
+    const float kGamma   = 1.40;
     float light = clamp(kAmbient + kSky * sky + kSun * diffuse, 0.0, 1.0);
     float shade = pow(light, kGamma);
+    // Sun-INDEPENDENT slope tone: steep faces ink darker than flats, so a
+    // fjord wall separates from the plateau above it even under a high sun
+    // that lights both equally (Hornstrandir read as one white sheet — the
+    // washed-out scene where dots correctly ON pale ridges looked like they
+    // floated in the sky). Broad normal on purpose: a slope band should
+    // shade as ONE surface, not per-cell noise. Flats (<~10°) stay paper.
+    float slope = clamp(1.0 - nB.z, 0.0, 1.0);   // 1 - cos(slope angle)
+    shade *= 1.0 - 0.35 * smoothstep(0.02, 0.5, slope);
     float3 color = float3(shade);
 
     // Aerial perspective: real distance reads as a pale, low-contrast haze, so far
