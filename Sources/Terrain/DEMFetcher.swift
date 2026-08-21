@@ -8,10 +8,11 @@ import Compression
 ///
 /// Skadi tiles are 1°×1° SRTM1 (~30 m, the same resolution as the old AW3D30
 /// source), gzipped big-endian Int16, 3601×3601, row 0 = north, −32768 = void.
-/// Above 60°N / below 56°S — where SRTM never flew and skadi degrades to
-/// ~250 m GMTED — tiles come from the (equally keyless) Copernicus GLO-30
-/// bucket instead, converted into the identical format at the download
-/// boundary; see `CopernicusDEM`.
+/// Above 60°N / below 56°S — where SRTM never flew, and skadi falls back to
+/// national sources where they exist (Norway is fine) but ~250 m GMTED where
+/// they don't (Iceland rendered as melted blobs) — tiles come from the
+/// (equally keyless) Copernicus GLO-30 bucket instead, converted into the
+/// identical format at the download boundary; see `CopernicusDEM`.
 /// The box around the eye usually spans 1–4 degree tiles; we download the covering
 /// tiles (keyless), stitch them into one `DEMTile` at native SRTM resolution, and
 /// cache. The renderer consumes a `DEMTile` exactly as before.
@@ -326,10 +327,30 @@ enum DEMFetcher {
                 let n = Int((Double(raw.count / 2)).squareRoot().rounded())
                 guard n > 1, raw.count == n * n * 2 else { return }
 
-                let gLatLo = max(rowS, t.tLat * samplesPerDegree)
+                // A tile's south-edge row and east-edge col duplicate the
+                // neighbouring tile's posts. For skadi tiles the duplicates
+                // are byte-identical; for converted Copernicus tiles they're
+                // CLAMPED approximations (GLO-30 doesn't ship the shared
+                // edge posts — the converter copies the adjacent row/col).
+                // Whenever the neighbour's data is part of this stitch,
+                // defer the shared posts to it: the true post always wins,
+                // and the formerly benign-race write order becomes
+                // deterministic. An absent neighbour (ocean 404, transient
+                // failure, box edge) keeps the clamp — better than a void.
+                func hasTile(_ la: Int, _ lo: Int) -> Bool {
+                    let k = "\(la),\(lo)"
+                    return preDecoded[k] != nil || gzData[k] != nil
+                }
+                var gLatLo = max(rowS, t.tLat * samplesPerDegree)
+                if hasTile(t.tLat - 1, t.tLon) {
+                    gLatLo = max(gLatLo, t.tLat * samplesPerDegree + 1)
+                }
                 let gLatHi = min(rowN, (t.tLat + 1) * samplesPerDegree)
                 let gLonLo = max(colMin, t.tLon * samplesPerDegree)
-                let gLonHi = min(colMax, (t.tLon + 1) * samplesPerDegree)
+                var gLonHi = min(colMax, (t.tLon + 1) * samplesPerDegree)
+                if hasTile(t.tLat, t.tLon + 1) {
+                    gLonHi = min(gLonHi, (t.tLon + 1) * samplesPerDegree - 1)
+                }
                 guard gLatLo <= gLatHi, gLonLo <= gLonHi else { return }
 
                 // Output rows/cols whose strided global index lands in this tile.
