@@ -63,6 +63,8 @@ struct RootScreen: View {
     /// Shown automatically ONCE, the first time the app ever reaches a
     /// rendered scene (see the shouldShowInitialLoading observer).
     @State private var showInfo = false
+    /// Info card flipped to the Data & licenses page (reset when the card closes).
+    @State private var showInfoCredits = false
     @AppStorage("infoCardSeen") private var infoCardSeen = false
     /// "Save Spot": names the current viewpoint and adds it to the Saved list.
     @State private var showSaveLocation = false
@@ -298,6 +300,7 @@ struct RootScreen: View {
             // case, so -openSheet can't reach it).
             if args.contains("-openSaveSpot") { debugPendingSaveSpot = true }
             if args.contains("-openInfo") { debugPendingInfo = true }
+            if args.contains("-openCredits") { debugPendingInfo = true; showInfoCredits = true }
             // Debug: force landscape (the simulator's rotate menu can't be driven
             // headlessly; the app asks the scene to rotate itself instead).
             // -landscapeDelay <s> delays the request, e.g. to rotate with a sheet up.
@@ -629,17 +632,29 @@ struct RootScreen: View {
         if showInfo {
             ZStack {
                 Color.black.opacity(0.25)
-                    .onTapGesture { showInfo = false }
+                    .onTapGesture { showInfo = false; showInfoCredits = false }
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("How to use Peak-Peek")
+                    Text(showInfoCredits ? "Data & licenses" : "How to use Peak-Peek")
                         .font(PPFont.ui(18, .semibold))
                         .foregroundStyle(TopoStyle.inkColor)
                         .padding(.trailing, 28)
                     // Portrait hugs its content (five terse tips clear the fold),
                     // so the card is only ever as tall as it needs to be. Only
                     // landscape — where the height truly can't exist — gets the
-                    // scroller (greedy, so it's capped).
-                    if isChromeLandscape {
+                    // scroller (greedy, so it's capped). The credits page always
+                    // scrolls: its license text is long by design.
+                    if showInfoCredits {
+                        ScrollView(.vertical, showsIndicators: false) { DataCreditsContent() }
+                            .frame(maxHeight: isChromeLandscape ? 260 : 460)
+                        Button {
+                            showInfoCredits = false
+                        } label: {
+                            Label("Back", systemImage: "chevron.left")
+                                .font(PPFont.ui(13, .medium))
+                                .foregroundStyle(TopoStyle.inkColor.opacity(0.6))
+                        }
+                        .buttonStyle(.plain)
+                    } else if isChromeLandscape {
                         ScrollView(.vertical, showsIndicators: false) { infoTips }
                             .frame(maxHeight: 260)
                     } else {
@@ -656,7 +671,7 @@ struct RootScreen: View {
                 )
                 .shadow(color: .black.opacity(0.18), radius: 22, y: 10)
                 .overlay(alignment: .topTrailing) {
-                    Button { showInfo = false } label: {
+                    Button { showInfo = false; showInfoCredits = false } label: {
                         Image(systemName: "xmark")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(TopoStyle.inkColor.opacity(0.5))
@@ -694,6 +709,18 @@ struct RootScreen: View {
                     "The mini-map opens a world map — drop a pin to view from anywhere. Use GPS brings you home.")
             infoTip("clock", "Scrub the day",
                     "The Time card moves the sun; the ↑ and ↓ tags mark when it clears your ridges.")
+            // Required attributions (OSM ODbL, GeoNames, HYG, OFL) live one
+            // quiet tap away — see DataCreditsContent.
+            Button {
+                showInfoCredits = true
+            } label: {
+                Text("Data & licenses")
+                    .font(PPFont.mono(11))
+                    .foregroundStyle(TopoStyle.inkColor.opacity(0.45))
+                    .underline()
+            }
+            .buttonStyle(.plain)
+            .padding(.top, 2)
         }
         .padding(.trailing, 4)
     }
@@ -1610,7 +1637,7 @@ struct RootScreen: View {
 /// version of something the pipeline really does. Shuffled once per launch.
 /// Shared by the initial loading screen AND the in-app status pill, so every
 /// load (first open, teleports, "Stand here") gets the same playful readout.
-private enum LoadingWhimsy {
+private  enum LoadingWhimsy {
     static let lines: [String] = [
         
         
