@@ -121,6 +121,10 @@ final class PeakLabelOverlayView: UIView {
         /// re-baked when tier/tint/theme changes.
         var nameString = ""
         var elevString = ""
+        /// The feature this node is currently configured for — lets a pool
+        /// rebuild keep the node (and its finished layers) when the same
+        /// feature is back in the new anchor set. nil = never configured.
+        var configuredID: String?
         /// Cache key of the currently baked text style — (theme generation,
         /// emphasized, tint). Re-baking happens only on a mismatch, never
         /// per frame.
@@ -257,6 +261,42 @@ final class PeakLabelOverlayView: UIView {
         // Precompute the angular-declutter inputs (parallel to `anchors`).
         unitDirs = anchors.map { simd_normalize($0.direction) }
         anchorAz = anchors.map { atan2($0.direction.x, $0.direction.y) }
+        // Re-key surviving nodes to their NEW index before configuring: a
+        // ~99%-identical reassignment (the ring top-up ~1 s after a move)
+        // then reconfigures as string-compare no-ops and completes
+        // synchronously — the dots never leave the screen. Without this the
+        // reset above blanked every dot for the few frames the pool took to
+        // stream back in ("labels flash right after the location swap").
+        if !pool.isEmpty {
+            var byID: [String: Node] = [:]
+            var spare: [Node] = []
+            for n in pool {
+                if let id = n.configuredID, byID[id] == nil { byID[id] = n }
+                else { spare.append(n) }
+            }
+            var newPool: [Node] = []
+            newPool.reserveCapacity(max(pool.count, anchors.count))
+            for a in anchors {
+                if let n = byID.removeValue(forKey: a.peak.id) {
+                    newPool.append(n)
+                } else if let n = spare.popLast() {
+                    n.configuredID = nil
+                    newPool.append(n)
+                } else {
+                    newPool.append(makeNode())
+                }
+            }
+            // Unmatched leftovers park at the tail (hidden just below).
+            newPool.append(contentsOf: byID.values)
+            newPool.append(contentsOf: spare)
+            pool = newPool
+            if Self.watchNeedle != nil {
+                let reused = zip(anchors, pool)
+                    .filter { $0.0.peak.id == $0.1.configuredID }.count
+                NSLog("labelWatch pool rebuild: %d anchors, %d nodes reused in place",
+                      anchors.count, reused)
+            }
+        }
         if pool.count > anchors.count {
             for i in anchors.count..<pool.count { pool[i].setHidden(true) }
         }
@@ -280,6 +320,14 @@ final class PeakLabelOverlayView: UIView {
             let node = pool[i]
             let displayName = a.peak.displayName
             let elev = a.peak.elevationMeters > 0 ? UnitText.elevation(meters: a.peak.elevationMeters) : ""
+            // Node already configured for this exact feature (id-keyed reuse
+            // in rebuildPool): everything below would be a no-op — its text,
+            // frames and width are the strings' pure function. Skip.
+            if node.configuredID == a.peak.id,
+               node.nameString == displayName, node.elevString == elev {
+                i += 1
+                continue
+            }
             let nameW: CGFloat
             let elevW: CGFloat
             if let m = measuredCache[a.peak.id], m.elevString == elev {
@@ -310,6 +358,7 @@ final class PeakLabelOverlayView: UIView {
                                          y: Self.vPad + Self.nameHeight + 1,
                                          width: elevW + 1, height: Self.elevHeight)
             node.styleKey = -1       // bake the text styles on first projection
+            node.configuredID = a.peak.id
             i += 1
         }
         configuredCount = i
