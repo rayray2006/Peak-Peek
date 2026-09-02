@@ -563,14 +563,6 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     /// is capped (+5 pts over the last real value, ≤97%) — it can trail reality
     /// slightly, never race ahead of it.
     func renderStatusChanged(_ status: Status) {
-        if status == .ready {
-            hasRenderedOnce = true
-            // The scene for the CURRENT viewpoint is now on screen — the
-            // mini-map tracks this, not `viewpoint`: a teleport retargets
-            // `viewpoint` the moment the load starts, and the map pin jumping
-            // while "Switching location" was still up read as already-arrived.
-            renderedViewpoint = viewpoint
-        }
         switch status {
         case let .preparingTerrain(progress?):
             setProgressTarget(progress, rendering: false)
@@ -581,6 +573,10 @@ final class PanoramaViewModel: NSObject, ObservableObject {
             // mid-flight. Sweep visibly TO the end, then lift the card — a
             // bar that vanishes at 70% reads as broken. ~75 pts/s: from
             // half-bar this holds the cover ~0.35 s, never more than ~0.7 s.
+            // `sceneArrived()` waits for the sweep too: flipping
+            // `hasRenderedOnce` here lifted the initial loading screen onto a
+            // still-`.rendering` status, flashing the corner "Switching
+            // location" card for the sweep's last half-second on launch.
             finishing = true
             targetProgress = 1.0
             inRenderingPhase = true
@@ -607,7 +603,21 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         default:
             stopProgressSmoothing()
             self.status = status
+            if status == .ready { sceneArrived() }
         }
+    }
+
+    /// The PUBLISHED status just became `.ready`: the scene for the current
+    /// viewpoint is on screen and every cover is entitled to lift in the same
+    /// beat. Called only where `status = .ready` actually lands (directly, or
+    /// after the finish sweep) — never off the renderer's raw report, so the
+    /// initial loading screen can't lift onto a still-loading footer.
+    private func sceneArrived() {
+        hasRenderedOnce = true
+        // The mini-map tracks this, not `viewpoint`: a teleport retargets
+        // `viewpoint` the moment the load starts, and the map pin jumping
+        // while "Switching location" was still up read as already-arrived.
+        renderedViewpoint = viewpoint
     }
 
     private var progressTimer: Timer?
@@ -653,6 +663,7 @@ final class PanoramaViewModel: NSObject, ObservableObject {
             if shownProgress >= 0.9995 {
                 stopProgressSmoothing()
                 status = .ready
+                sceneArrived()
                 return
             }
             shownProgress = min(1.0, shownProgress + 0.025)
