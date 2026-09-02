@@ -444,6 +444,100 @@ final class LinearPeakMergeTests: XCTestCase {
     }
 }
 
+final class GeoNamesShadowDedupTests: XCTestCase {
+    // Real records from peaks_global.bin: the main Kangchenjunga summit exists
+    // THREE times within 60 m — OSM's canonical node plus two GeoNames
+    // spellings — and no name comparison can see through the scripts. The
+    // shadow filter must collapse them by source + proximity while leaving
+    // the genuinely distinct sub-summits (832 m+ away) untouched.
+    private let osmMain = Peak(id: "osm-4462458037", name: "Kangchenjunga",
+                               latitude: 27.70301, longitude: 88.14748,
+                               elevationMeters: 8586, prominenceMeters: 3922)
+    private let gnMacron = Peak(id: "gn-1283259", name: "Kānchenjunga",
+                                latitude: 27.70314, longitude: 88.14739,
+                                elevationMeters: 8586, prominenceMeters: nil)
+    private let gnNepali = Peak(id: "gn-12249834", name: "Kañchanjaṅghā",
+                                latitude: 27.70268, longitude: 88.14744,
+                                elevationMeters: 8505, prominenceMeters: nil)
+    private let osmYalung = Peak(id: "osm-11867698454", name: "Yalung Kang",
+                                 latitude: 27.70517, longitude: 88.13778,
+                                 elevationMeters: 8505, prominenceMeters: 135)
+    private let osmCentral = Peak(id: "osm-12151324351", name: "Kangchenjunga Central",
+                                  latitude: 27.69634, longitude: 88.15083,
+                                  elevationMeters: 8473, prominenceMeters: nil)
+    private let osmSouth = Peak(id: "osm-12151324350", name: "Kangchenjunga South",
+                                latitude: 27.69228, longitude: 88.15401,
+                                elevationMeters: 8476, prominenceMeters: nil)
+    private let gnSouth = Peak(id: "gn-12249835", name: "Kañchanjaṅghā South",
+                               latitude: 27.69048, longitude: 88.15464,
+                               elevationMeters: 8393, prominenceMeters: nil)
+
+    func testCollapsesMultilingualTrioToTheOSMRecord() {
+        let out = Peak.dedupedKeepingFirst([osmMain, gnMacron, gnNepali])
+        XCTAssertEqual(out.map(\.id), ["osm-4462458037"])
+    }
+
+    func testShadowBeyondTheSameNameRadiusStillCollapses() {
+        // The South pair is 210 m apart — past the 200 m same-name radius, and
+        // differently spelled anyway. Only the source rule can catch it.
+        let out = Peak.dedupedKeepingFirst([osmSouth, gnSouth])
+        XCTAssertEqual(out.map(\.id), ["osm-12151324350"])
+    }
+
+    func testOSMWinsRegardlessOfArrivalOrder() {
+        let out = Peak.dedupedKeepingFirst([gnMacron, gnNepali, osmMain])
+        XCTAssertEqual(out.map(\.id), ["osm-4462458037"])
+    }
+
+    func testDistinctSubSummitsAllSurvive() {
+        let out = Peak.dedupedKeepingFirst(
+            [osmMain, gnMacron, gnNepali, osmYalung, osmCentral, osmSouth, gnSouth])
+        XCTAssertEqual(out.map(\.id),
+                       ["osm-4462458037", "osm-11867698454",
+                        "osm-12151324351", "osm-12151324350"])
+    }
+
+    func testGeoNamesSaddleBesideOSMPeakIsNotAShadow() {
+        let gap = Peak(id: "gn-777", name: "North Col",
+                       latitude: 27.70330, longitude: 88.14760,
+                       elevationMeters: 8100, prominenceMeters: nil, isSaddle: true)
+        let out = Peak.dedupedKeepingFirst([osmMain, gap])
+        XCTAssertEqual(out.count, 2)
+    }
+
+    func testGeoNamesOnlyPeakSurvivesWithoutANearbyOSMRecord() {
+        let lone = Peak(id: "gn-42", name: "Cerro Solo",
+                        latitude: -49.1, longitude: -73.0,
+                        elevationMeters: 2121, prominenceMeters: nil)
+        XCTAssertEqual(Peak.dedupedKeepingFirst([osmMain, lone]).count, 2)
+    }
+
+    func testDroppedShadowDonatesElevationToAnElevationlessOSMRecord() {
+        let bare = Peak(id: "osm-99", name: "Gimmigela Chuli",
+                        latitude: 27.74000, longitude: 88.15900,
+                        elevationMeters: 0, prominenceMeters: nil)
+        let gn = Peak(id: "gn-88", name: "गिम्मीगेला चुली",
+                      latitude: 27.74010, longitude: 88.15910,
+                      elevationMeters: 7350, prominenceMeters: nil)
+        let out = Peak.dedupedKeepingFirst([bare, gn])
+        XCTAssertEqual(out.map(\.id), ["osm-99"])
+        XCTAssertEqual(out[0].elevationMeters, 7350)
+    }
+
+    func testShadowAcrossACellEdgeIsStillSeen() {
+        // ~22 m apart but straddling a ~550 m grid-cell boundary (the cell
+        // edge sits at lat 45.9975: ·200 = 9199.48 vs 9199.52 round to
+        // different cells) — the 3×3 neighbour scan must catch it.
+        let osm = Peak(id: "osm-5", name: "Grenzgipfel",
+                       latitude: 45.99740, longitude: 7.87700,
+                       elevationMeters: 4618, prominenceMeters: nil)
+        let gn = Peak(id: "gn-6", name: "Пик Гренц",
+                      latitude: 45.99760, longitude: 7.87700,
+                      elevationMeters: 4618, prominenceMeters: nil)
+        XCTAssertEqual(Peak.dedupedKeepingFirst([osm, gn]).map(\.id), ["osm-5"])
+    }
+}
+
 final class RegionBoxTests: XCTestCase {
     private func box(_ s: Double, _ w: Double, _ n: Double, _ e: Double) -> RegionBox {
         RegionBox(south: s, west: w, north: n, east: e)

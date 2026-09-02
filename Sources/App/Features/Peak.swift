@@ -78,6 +78,12 @@ struct Peak: Identifiable, Codable, Hashable, Sendable {
     /// put the most trustworthy source FIRST: the global DB carries the
     /// saddle flag, and its copy of a gap must shadow a legacy pack's
     /// flag-less one, or "Stand here" summit-snaps the eye uphill.
+    ///
+    /// Runs AFTER the GeoNames-shadow filter below: a same-name test can never
+    /// merge one summit cataloged under different languages ("Kangchenjunga" /
+    /// "Kānchenjunga" / "Kañchanjaṅghā" are three records within 60 m), so
+    /// cross-catalog duplicates are collapsed by source + proximity first and
+    /// the name rule only has same-catalog leftovers to judge.
     nonisolated static func dedupedKeepingFirst(_ peaks: [Peak]) -> [Peak] {
         var merged: [Peak] = []
         var ids = Set<String>()
@@ -89,7 +95,7 @@ struct Peak: Identifiable, Codable, Hashable, Sendable {
             return "\(lat):\(lon)"
         }
 
-        for peak in peaks {
+        for peak in withoutGeoNamesShadows(peaks) {
             guard ids.insert(peak.id).inserted else { continue }
             let key = bucketKey(peak)
             let duplicate = buckets[key]?.contains(where: {
@@ -104,6 +110,74 @@ struct Peak: Identifiable, Codable, Hashable, Sendable {
             buckets[key, default: []].append(peak)
         }
         return merged
+    }
+
+    /// A GeoNames record this close to an OSM record of the same kind is the
+    /// same physical feature seen through GeoNames' fuzzier catalog (GeoNames
+    /// coordinates for peaks are routinely 50–250 m off the summit). 300 m
+    /// covers every observed shadow — the Kangchenjunga South pair sits 210 m
+    /// apart — while every genuinely distinct neighbour checked (Yalung Kang,
+    /// Kangchenjunga Central/South vs the main summit) is 800 m+ away.
+    private nonisolated static let geoNamesShadowMeters = 300.0
+
+    /// Drop "gn-" records shadowed by an "osm-" record: NAME-AGNOSTIC, because
+    /// the two catalogs spell one mountain differently (transliterations,
+    /// diacritics, languages) and no string comparison can see through that —
+    /// the duplicates then each demand their own rendered apex, scattering
+    /// labels onto shoulders and breaking the standing-on suppression. OSM
+    /// wins categorically: mapper-placed summit nodes carry the canonical name,
+    /// exact coordinates, and prominence. Order-independent (the OSM record
+    /// may arrive after the GeoNames one). Same kind only — a GeoNames gap
+    /// beside an OSM peak is a different feature, not a shadow. A dropped
+    /// shadow's elevation is adopted when its OSM record has none, so the
+    /// merge never knows less than either catalog did.
+    private nonisolated static func withoutGeoNamesShadows(_ peaks: [Peak]) -> [Peak] {
+        // ~550 m cells (the grid the name dedup below already uses), scanned
+        // 3×3 so a 300 m pair straddling a cell edge is still seen.
+        func cell(_ p: Peak) -> (la: Int, lo: Int) {
+            (Int((p.latitude * 200).rounded()), Int((p.longitude * 200).rounded()))
+        }
+        func key(_ la: Int, _ lo: Int) -> Int64 { Int64(la) &* 1_000_000 &+ Int64(lo) }
+
+        var osmCells: [Int64: [Int]] = [:]
+        for (i, p) in peaks.enumerated() where p.id.hasPrefix("osm-") {
+            let c = cell(p)
+            osmCells[key(c.la, c.lo), default: []].append(i)
+        }
+        guard !osmCells.isEmpty else { return peaks }
+
+        var adoptedElevation: [Int: Double] = [:]   // peaks index → elevation
+        let kept = peaks.filter { p in
+            guard p.id.hasPrefix("gn-") else { return true }
+            let c = cell(p)
+            for dla in -1...1 {
+                for dlo in -1...1 {
+                    for oi in osmCells[key(c.la + dla, c.lo + dlo)] ?? [] {
+                        let o = peaks[oi]
+                        guard o.isSaddle == p.isSaddle,
+                              GeoMath.distanceMeters(
+                                  fromLatitude: o.latitude, fromLongitude: o.longitude,
+                                  toLatitude: p.latitude, toLongitude: p.longitude
+                              ) < geoNamesShadowMeters else { continue }
+                        if o.elevationMeters <= 0, p.elevationMeters > 0 {
+                            adoptedElevation[oi] = max(adoptedElevation[oi] ?? 0,
+                                                       p.elevationMeters)
+                        }
+                        return false
+                    }
+                }
+            }
+            return true
+        }
+        guard !adoptedElevation.isEmpty else { return kept }
+        let patched = Dictionary(uniqueKeysWithValues: adoptedElevation.map { (peaks[$0.key].id, $0.value) })
+        return kept.map { p in
+            guard let elev = patched[p.id] else { return p }
+            return Peak(id: p.id, name: p.name,
+                        latitude: p.latitude, longitude: p.longitude,
+                        elevationMeters: elev,
+                        prominenceMeters: p.prominenceMeters, isSaddle: p.isSaddle)
+        }
     }
 
     /// Display name: a name in a non-Latin script gets a Latin transliteration
