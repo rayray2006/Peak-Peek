@@ -3234,7 +3234,16 @@ struct TerrainMetalView: UIViewRepresentable {
                         // saddle flag — this copy silently dropped it (init default
                         // false), so every ele-less pass lost its green dot and its
                         // no-summit-snap anchoring ("Easy Pass" bug).
-                        let labeled = peak.elevationMeters > 0 ? peak : Peak(
+                        // A catalog elevation far BELOW the anchor's DEM height is
+                        // junk-KNOWN, not known: GeoNames carries placeholder heights
+                        // (Eilífstindur in Hornstrandir: 1 m for a ~240 m sea cliff,
+                        // printed as "3 ft" on the label). The DEM only ever shaves
+                        // summits DOWN — no real surveyed height sits 120 m below the
+                        // DEM's own smoothing of it — so implausibly-low tags take the
+                        // DEM height too, the mirror of the +120 m junk-high bound on
+                        // `trueElev` below.
+                        let junkLow = peak.elevationMeters < Double(hi.elev) - 120
+                        let labeled = peak.elevationMeters > 0 && !junkLow ? peak : Peak(
                             id: peak.id, name: peak.name,
                             latitude: peak.latitude, longitude: peak.longitude,
                             elevationMeters: Double(hi.elev).rounded(),
