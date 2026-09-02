@@ -28,3 +28,6 @@ Tools/HorizonDEM/horizon_global.bin
 
 # Regenerable website bundle (web/ is the source of truth)
 mountainView-website.zip
+
+# Xcode Organizer export (archives / .ipa)
+PeakPeek */
