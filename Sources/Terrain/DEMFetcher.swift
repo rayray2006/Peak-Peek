@@ -118,10 +118,11 @@ enum DEMFetcher {
 
     /// Reload the last region's tiers if present. Returns nil on a first-ever launch
     /// (nothing saved) or if the cache is unreadable — caller then fetches normally.
-    /// Tiles are re-run through the spike filter: snapshots saved before the filter
-    /// existed persist the artifacts, and healing on load (~ms) keeps the instant
-    /// launch path instead of invalidating it. No-op for clean tiles — which is
-    /// every tile saved after the filter shipped.
+    /// Tiles are re-run through the full sanitize pass (range gate + spike filter):
+    /// snapshots saved before either filter existed persist the artifacts, and
+    /// healing on load (~ms) keeps the instant launch path instead of invalidating
+    /// it. No-op for clean tiles — which is every tile saved after the filters
+    /// shipped.
     static func loadLastRegion() -> (near: DEMTile, far: DEMTile?)? {
         let nearPath = lastRegionDir.appendingPathComponent("near.dembin").path
         guard let near = try? DEMTile.loadCached(binPath: nearPath) else { return nil }
@@ -134,19 +135,20 @@ enum DEMFetcher {
             return nil
         }
         let far = try? DEMTile.loadCached(binPath: lastRegionDir.appendingPathComponent("far.dembin").path)
-        return (despiked(near), far.map(despiked))
+        return (sanitized(near), far.map(sanitized))
     }
 
-    /// `despike` applied to an already-stitched tile (the last-region fast path).
+    /// `sanitize` applied to an already-stitched tile (the last-region fast path).
     /// Returns the tile unchanged when nothing was fixed; else rebuilds it so
     /// `maxElevation` — the raymarcher's curvature-envelope bound — drops back to
-    /// the real terrain max instead of a 4000 m artifact.
-    private static func despiked(_ tile: DEMTile) -> DEMTile {
+    /// the real terrain max instead of a 32767 m artifact.
+    private static func sanitized(_ tile: DEMTile) -> DEMTile {
         var e = tile.elevations
-        let fixed = despike(&e, ncols: tile.ncols, nrows: tile.nrows,
-                            thresholdMeters: despikeThreshold(cellMeters: tile.cellsize * 111_320.0))
-        guard fixed > 0 else { return tile }
-        NSLog("DEM despike: healed %d artifact posts in cached region", fixed)
+        let healed = sanitize(&e, ncols: tile.ncols, nrows: tile.nrows,
+                              cellMeters: tile.cellsize * 111_320.0)
+        guard healed.voided > 0 || healed.spikes > 0 else { return tile }
+        NSLog("DEM sanitize: healed cached region (%d impossible, %d spikes)",
+              healed.voided, healed.spikes)
         return DEMTile(ncols: tile.ncols, nrows: tile.nrows,
                        xllcorner: tile.xllcorner, yllcorner: tile.yllcorner,
                        cellsize: tile.cellsize, nodata: tile.nodata,
@@ -378,10 +380,12 @@ enum DEMFetcher {
             }
         }
 
-        fillVoids(&elevations, ncols: ncols, nrows: nrows)
-        let fixed = despike(&elevations, ncols: ncols, nrows: nrows,
-                            thresholdMeters: despikeThreshold(cellMeters: arcsec * 111_320.0 * Double(stride)))
-        if fixed > 0 { NSLog("DEM despike: removed %d artifact posts", fixed) }
+        let healed = sanitize(&elevations, ncols: ncols, nrows: nrows,
+                              cellMeters: arcsec * 111_320.0 * Double(stride))
+        if healed.voided > 0 || healed.spikes > 0 {
+            NSLog("DEM sanitize: voided %d impossible posts, despiked %d artifact posts",
+                  healed.voided, healed.spikes)
+        }
         let maxElev = elevations.max() ?? 0
         let tile = DEMTile(
             ncols: ncols, nrows: nrows,
@@ -435,6 +439,60 @@ enum DEMFetcher {
                 }
             }
         }
+    }
+
+    /// Bounds of physically possible Earth-surface elevation. Land tops out at
+    /// Everest's 8849 m; the mirror blends coastal bathymetry into some tiles,
+    /// so depths down to the deepest trench (−10,935 m) are data, not garbage.
+    /// Anything outside is corruption — the Florida marsh corridor east of
+    /// Orlando (N28W081) carries ~20k Int16-SATURATED posts (+32767 m) in runs
+    /// up to 39 long, which no neighbour-based spike test can heal: interior
+    /// posts of a run protect each other exactly like a real ridge line.
+    private static let maxPlausibleMeters: Float = 9000
+    private static let minPlausibleMeters: Float = -12000
+
+    /// The one entry point that turns a freshly stitched or snapshot-loaded
+    /// grid into renderable terrain, in the only order that works: impossible
+    /// values become voids FIRST (so they can't seed the fill), voids fill from
+    /// row neighbours, and the spike filter runs LAST (so neither the void
+    /// sentinel nor saturated posts can masquerade as terrain during its
+    /// neighbour tests).
+    static func sanitize(_ e: inout [Float], ncols: Int, nrows: Int,
+                         cellMeters: Double) -> (voided: Int, spikes: Int) {
+        let voided = voidImplausible(&e, ncols: ncols, nrows: nrows)
+        fillVoids(&e, ncols: ncols, nrows: nrows)
+        let spikes = despike(&e, ncols: ncols, nrows: nrows,
+                             thresholdMeters: despikeThreshold(cellMeters: cellMeters))
+        return (voided, spikes)
+    }
+
+    /// Rewrite posts outside the possible Earth-surface range as voids, to be
+    /// refilled from their row neighbours. Unlike `despike` this needs no
+    /// neighbourhood consensus, so clustered corruption — runs, blobs, whole
+    /// swaths of saturated posts — dissolves in one pass with zero false
+    /// positives anywhere on Earth.
+    private static func voidImplausible(_ e: inout [Float], ncols: Int, nrows: Int) -> Int {
+        var rowFixes = [Int](repeating: 0, count: nrows)
+        rowFixes.withUnsafeMutableBufferPointer { fixes in
+            e.withUnsafeMutableBufferPointer { buf in
+                DispatchQueue.concurrentPerform(iterations: nrows) { r in
+                    let base = r * ncols
+                    var fixed = 0
+                    for c in 0..<ncols {
+                        let v = buf[base + c]
+                        // Inverted form: also catches NaN (any comparison with
+                        // NaN is false), which would otherwise sail through a
+                        // `>` / `<` pair and poison the raymarcher.
+                        if !(v >= minPlausibleMeters && v <= maxPlausibleMeters) {
+                            buf[base + c] = voidSentinel
+                            fixed += 1
+                        }
+                    }
+                    fixes[r] = fixed
+                }
+            }
+        }
+        return rowFixes.reduce(0, +)
     }
 
     /// Minimum height a post must tower over (or sink under) its EVERY neighbour

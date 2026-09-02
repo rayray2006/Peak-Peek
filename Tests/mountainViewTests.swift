@@ -819,6 +819,98 @@ final class DEMDespikeTests: XCTestCase {
     }
 }
 
+final class DEMSanitizeTests: XCTestCase {
+    // The Florida corruption (N28W081, the marsh corridor east of Orlando):
+    // ~20k Int16-SATURATED posts (+32767 m) in runs up to 39 long and 2-D
+    // blobs. Neighbour-consensus despiking can't heal a run's interior —
+    // adjacent saturated posts protect each other exactly like a real ridge —
+    // which is how the far tier rendered a forest of 32 km spires from Disney
+    // World and chopped the sun arc at every poked horizon bin.
+
+    func testHealsSaturationRun() {
+        // A 40-post saturated run amid 2 m marsh — longer than 4 despike
+        // passes could ever erode end-first.
+        let ncols = 60, nrows = 9
+        var e = [Float](repeating: 2, count: ncols * nrows)
+        for c in 10..<50 { e[4 * ncols + c] = 32767 }
+        let healed = DEMFetcher.sanitize(&e, ncols: ncols, nrows: nrows, cellMeters: 30)
+        XCTAssertEqual(healed.voided, 40)
+        for c in 10..<50 { XCTAssertEqual(e[4 * ncols + c], 2) }
+    }
+
+    func testHealsSaturationBlob() {
+        // 2-D cluster: every interior post has 8 saturated neighbours.
+        let n = 20
+        var e = [Float](repeating: 3, count: n * n)
+        for r in 7..<13 { for c in 7..<13 { e[r * n + c] = 32767 } }
+        let healed = DEMFetcher.sanitize(&e, ncols: n, nrows: n, cellMeters: 30)
+        XCTAssertEqual(healed.voided, 36)
+        XCTAssertTrue(e.allSatisfy { $0 == 3 })
+    }
+
+    func testEverestSummitSurvives() {
+        // The highest real terrain on Earth is inside the plausible range —
+        // the gate must never touch it. A 3×3 summit plateau also gives every
+        // post same-height neighbours, so despike leaves it too.
+        let n = 9
+        var e = [Float](repeating: 8700, count: n * n)
+        for r in 3...5 { for c in 3...5 { e[r * n + c] = 8849 } }
+        let before = e
+        let healed = DEMFetcher.sanitize(&e, ncols: n, nrows: n, cellMeters: 30)
+        XCTAssertEqual(healed.voided, 0)
+        XCTAssertEqual(healed.spikes, 0)
+        XCTAssertEqual(e, before)
+    }
+
+    func testCoastalBathymetrySurvives() {
+        // The mirror blends real bathymetry into coastal tiles (the Atlantic
+        // shelf east of Florida deepens smoothly to ~-500 m). Depths above the
+        // deepest trench are data, not corruption.
+        let ncols = 50, nrows = 5
+        var e = [Float](repeating: 0, count: ncols * nrows)
+        for r in 0..<nrows { for c in 0..<ncols { e[r * ncols + c] = Float(c) * -10 } }
+        let before = e
+        let healed = DEMFetcher.sanitize(&e, ncols: ncols, nrows: nrows, cellMeters: 30)
+        XCTAssertEqual(healed.voided, 0)
+        XCTAssertEqual(e, before)
+    }
+
+    func testImpossibleDepthAndNaNAreVoidedAndRefilled() {
+        // Below-trench garbage and NaN (nothing today produces NaN, but a
+        // corrupt snapshot float must not poison the raymarcher) both refill
+        // from row neighbours.
+        let ncols = 7, nrows = 3
+        var e = [Float](repeating: 5, count: ncols * nrows)
+        e[1 * ncols + 2] = -20000
+        e[1 * ncols + 4] = .nan
+        let healed = DEMFetcher.sanitize(&e, ncols: ncols, nrows: nrows, cellMeters: 30)
+        XCTAssertEqual(healed.voided, 2)
+        XCTAssertTrue(e.allSatisfy { $0 == 5 })
+    }
+
+    func testSaturationRunBesideRealTerrainRefillsFromTheLand() {
+        // Refill must come from the surviving row neighbours, not smear the
+        // saturated value: land at 30 m west of a saturated stretch, marsh at
+        // 1 m east — healed posts take a real neighbour's height, and despike
+        // then has nothing left to do (a step from 30 to 1 m is real terrain).
+        let ncols = 12, nrows = 5
+        var e = [Float](repeating: 1, count: ncols * nrows)
+        for r in 0..<nrows {
+            e[r * ncols + 0] = 30; e[r * ncols + 1] = 30
+            for c in 2..<6 { e[r * ncols + c] = 32767 }
+        }
+        let healed = DEMFetcher.sanitize(&e, ncols: ncols, nrows: nrows, cellMeters: 30)
+        XCTAssertEqual(healed.voided, 20)
+        for r in 0..<nrows {
+            for c in 2..<6 {
+                let v = e[r * ncols + c]
+                XCTAssertTrue(v == 30 || v == 1, "healed post should take a real neighbour height, got \(v)")
+            }
+        }
+        XCTAssertFalse(e.contains { $0 > 9000 })
+    }
+}
+
 
 final class SightlineOcclusionTests: XCTestCase {
     /// Real 30 m SRTM window (N48W121, rows 1742..1786 x cols 763..814) spanning
