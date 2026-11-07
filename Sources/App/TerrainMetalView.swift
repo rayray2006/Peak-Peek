@@ -1722,7 +1722,10 @@ struct TerrainMetalView: UIViewRepresentable {
         /// hundred meters away. Elevation agreement (overshoot penalized 2×)
         /// also subsumes the old "45% of the distance to the nearest other
         /// peak" cap: a labelled false summit matches its OWN bump, never the
-        /// higher main summit next door.
+        /// higher main summit next door. Overshoot is CAPPED, though (see
+        /// DEMTile.summitOvershootToleranceMeters), so a stale catalog height
+        /// can't strand you below the top on a lower nub either — that was the
+        /// Mount Olympus East Peak bug.
         ///
         /// Fallbacks, in order: no catalog height (nothing to agree with) or no
         /// local maximum in reach (a gendarme inside a bigger mass) → the old
@@ -2717,7 +2720,9 @@ struct TerrainMetalView: UIViewRepresentable {
             //    agreement + prominence despite its distance, no 600 m rescue
             //    scan needed — the search radius is just 600 for everyone;
             //  · shoulder peaks (Pic Tyndall) can't steal the apex: the main
-            //    summit claims first, and overshoot is penalized 2×;
+            //    summit claims first, and overshoot is penalized 2× (up to the
+            //    tolerance past which a catalog height is simply wrong — see
+            //    DEMTile.summitOvershootToleranceMeters);
             //  · a subordinate 157 m out (Épaule de Furggen) can't shrink the
             //    dominant's reach — there are no per-peak radii to shrink.
             let effElev: [Double] = peaks.map { $0.elevationMeters }
@@ -2776,22 +2781,53 @@ struct TerrainMetalView: UIViewRepresentable {
                             metersPerDegLat: mLat, metersPerDegLon: mLon)
                         if best == nil || score > best!.score { best = (score, s) }
                     }
+                    // The peak's OTHER option: stay at its catalog point. Scored
+                    // by the same rule (DEMTile.stayPutScore), it turns the
+                    // leftovers into a real choice — because "best UNCLAIMED
+                    // maximum" is not the same thing as "a maximum worth having".
+                    // Once the DEM's one top for this mountain is taken (two
+                    // catalog records for one summit, or two named tops the 30 m
+                    // grid can't resolve), the runner-up used to take whatever
+                    // was left, however far and however flat: Columbia Crest
+                    // walked 691 m off Rainier onto a 9 m-prominence nub. The
+                    // node is the honest answer there — the DEM says its own
+                    // height already agrees — and the silhouette pin settles it
+                    // onto the drawn crest.
+                    //
+                    // This only ever RELEASES apexes: a refused peak claims
+                    // nothing, so the peaks after it see strictly more choice
+                    // (measured: it lifts match accuracy, not just tidiness).
+                    // Who wins an apex is still settled above, by claim order.
+                    // The eye's `matchedSummit` deliberately skips this: it has
+                    // no claims to lose to, so it has no leftovers to refuse.
+                    let inNear = dem.contains(lat: p.latitude, lon: p.longitude)
+                    let tile = inNear ? dem : (far ?? dem)
+                    let stayPut = DEMTile.stayPutScore(
+                        demElevationAtPoint: tile.elevation(lat: p.latitude, lon: p.longitude),
+                        catalogLat: p.latitude, catalogLon: p.longitude,
+                        catalogElevationMeters: target)
+                    let credible = best.map {
+                        DEMTile.acceptsMatch(score: $0.score, stayPut: stayPut)
+                    } ?? false
                     if let needle = Self.labelWatch, p.name.lowercased().contains(needle) {
-                        if let best {
+                        if let best, credible {
                             NSLog("labelWatch %@: MATCHED summit %.5f,%.5f elev %.0f prom %.0f (of %d candidates, score %.0f)",
                                   p.name, best.s.lat, best.s.lon, Double(best.s.elev),
                                   Double(best.s.prominence), candidates[i].count, best.score)
+                        } else if let best {
+                            NSLog("labelWatch %@: REFUSED leftover summit %.5f,%.5f elev %.0f prom %.0f — score %.0f vs %.0f for staying at the catalog point; anchoring there",
+                                  p.name, best.s.lat, best.s.lon, Double(best.s.elev),
+                                  Double(best.s.prominence), best.score, stayPut)
                         } else {
                             NSLog("labelWatch %@: UNMATCHED — all %d candidate summits claimed; anchoring at catalog point",
                                   p.name, candidates[i].count)
                         }
                     }
-                    guard let best else { continue }
+                    guard let best, credible else { continue }
                     snappedCell[i] = (best.s.lat, best.s.lon, best.s.elev)
                     // Claim the apex plus a one-cell halo, so two labels can
                     // never land a single cell apart on one bump.
-                    let inNear = dem.contains(lat: p.latitude, lon: p.longitude)
-                    let halo = (inNear ? dem : (far ?? dem)).cellsize
+                    let halo = tile.cellsize
                     for dla in -1...1 {
                         for dlo in -1...1 {
                             claimed.insert(claimKey(best.s.lat + Double(dla) * halo,

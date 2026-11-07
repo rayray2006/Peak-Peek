@@ -683,6 +683,28 @@ final class CancelMoveTests: XCTestCase {
         XCTAssertFalse(model.canCancelMove)
     }
 
+    /// ✕ during the move's BAKE phase (renderer reporting `.rendering`): the
+    /// revert-teleport must NOT re-capture the abandoned target as the scene
+    /// to go back to — it never reached the screen. Doing so kept the ✕ alive
+    /// pointing at the dead move, so the card never lifted and every further
+    /// tap ping-ponged full reloads (fetch + bake pile-up → jetsam crash).
+    func testCancelDuringBakeRetiresTheXAndStaysReverted() {
+        let model = PanoramaViewModel()
+        let home = PanoramaViewModel.Viewpoint(name: "Home", latitude: 48.5, longitude: -121.0)
+        let away = PanoramaViewModel.Viewpoint(name: "Away", latitude: 46.85, longitude: -121.76)
+        model.teleport(to: home, manual: true)
+        model.renderStatusChanged(.ready)                 // home actually rendered
+        model.teleport(to: away, manual: true)            // move begins
+        model.renderStatusChanged(.rendering(progress: 0.5))  // bake phase, away NOT on screen
+        model.cancelLocationChange()
+        XCTAssertEqual(model.viewpoint, home)
+        XCTAssertFalse(model.canCancelMove)               // away must not become "last good"
+        let token = model.moveCancelToken
+        model.cancelLocationChange()                      // a straggler tap on a stale ✕
+        XCTAssertEqual(model.viewpoint, home)             // no ping-pong back into the move
+        XCTAssertEqual(model.moveCancelToken, token)      // and no renderer churn
+    }
+
     /// A first-ever load has no previous scene: cancel must be a no-op and
     /// the card must not offer the ✕.
     func testCancelUnavailableOnFirstLoad() {
@@ -1130,6 +1152,69 @@ final class LocalSummitTests: XCTestCase {
         XCTAssertEqual(apex?.lon ?? 0, tile.xllcorner + (12 + 0.5) * tile.cellsize, accuracy: 1e-9)
     }
 
+    /// A STALE catalog height must not strand the peak below its own top.
+    /// Mount Olympus East Peak: OSM tags 2324 m, the DEM's apex 9 m from the
+    /// node reads 2367 m (98 m of prominence) and a 19 m-prominence ripple
+    /// 246 m WNW reads 2311. Under the old unbounded 2×/m overshoot penalty
+    /// the ripple's better "agreement" beat the apex by 18 points, so the
+    /// label — and "Stand here" — sat on a nub between the East and Middle
+    /// summits. Overshoot past the tolerance is now flat: the catalog number
+    /// is wrong, and distance + prominence decide.
+    func testMatchedSummitIgnoresAStaleCatalogHeightThatIsTooLow() {
+        var g = [[Float]](repeating: [Float](repeating: 2100, count: 40), count: 40)
+        // The true apex: a 2367 m dome at the catalog node.
+        for r in 19...21 { for c in 19...21 { g[r][c] = 2340 } }
+        g[20][20] = 2367
+        // A 2300 m ridge running west off it, with an 11 m ripple on its end
+        // ~240 m out — reading 2311, i.e. all but exactly the stale tag.
+        for c in 10...18 { g[20][c] = 2300 }
+        g[20][10] = 2311
+        let tile = makeTile(g)
+        let catalog = (lat: tile.yllcorner + (Double(40 - 1 - 20) + 0.5) * tile.cellsize,
+                       lon: tile.xllcorner + (20 + 0.5) * tile.cellsize)
+        let apex = tile.matchedSummit(lat: catalog.lat, lon: catalog.lon,
+                                      catalogElevationMeters: 2324)
+        XCTAssertEqual(apex?.elev, 2367)
+        XCTAssertEqual(apex?.lon ?? 0, tile.xllcorner + (20 + 0.5) * tile.cellsize,
+                       accuracy: 1e-9)
+    }
+
+    /// The cap is on OVERSHOOT only. A DEM that reads LOW is the expected
+    /// failure (smoothing, void fill), so undershoot stays unbounded and the
+    /// least-undershooting candidate still wins — this is what lets a
+    /// void-filled summit's real apex be reached a few hundred meters away
+    /// (the K2 case above) instead of the shoulder under the catalog point.
+    func testUndershootPenaltyStaysUnboundedSoTheLeastLowApexWins() {
+        let mLat = 111_320.0, mLon = 111_320.0 * cos(45 * .pi / 180)
+        let near = DEMTile.LocalSummit(lat: 45.0, lon: -120.0, elev: 7500, prominence: 100)
+        let far = DEMTile.LocalSummit(lat: 45.0, lon: -120.0 + 400 / mLon,
+                                      elev: 8500, prominence: 100)
+        func score(_ s: DEMTile.LocalSummit) -> Double {
+            DEMTile.summitMatchScore(s, catalogLat: 45.0, catalogLon: -120.0,
+                                     catalogElevationMeters: 8611,
+                                     metersPerDegLat: mLat, metersPerDegLon: mLon)
+        }
+        XCTAssertGreaterThan(score(far), score(near))
+    }
+
+    /// Overshoot past the tolerance is FLAT: 200 m too high scores the same as
+    /// 30 m too high, so a wildly wrong catalog height can't rank one wrong
+    /// bump above another. (Below the tolerance it still discriminates, 2× per
+    /// meter — that is what keeps a labelled false summit on its own bump.)
+    func testOvershootPenaltySaturatesAtTheTolerance() {
+        let mLat = 111_320.0, mLon = 111_320.0 * cos(45 * .pi / 180)
+        func score(elev: Float) -> Double {
+            DEMTile.summitMatchScore(
+                DEMTile.LocalSummit(lat: 45.0, lon: -120.0, elev: elev, prominence: 50),
+                catalogLat: 45.0, catalogLon: -120.0, catalogElevationMeters: 1000,
+                metersPerDegLat: mLat, metersPerDegLon: mLon)
+        }
+        let tol = DEMTile.summitOvershootToleranceMeters
+        XCTAssertEqual(score(elev: 1000 + Float(tol) + 5),
+                       score(elev: 1000 + Float(tol) + 200), accuracy: 1e-9)
+        XCTAssertLessThan(score(elev: Float(1000 + tol)), score(elev: 1000))
+    }
+
     /// No catalog height (an OSM peak with no `ele` tag): nothing to agree
     /// with, so the higher candidate wins.
     func testMatchedSummitWithoutACatalogHeightPrefersTheHigherBump() {
@@ -1143,6 +1228,64 @@ final class LocalSummitTests: XCTestCase {
                        lon: tile.xllcorner + (12 + 0.5) * tile.cellsize)
         XCTAssertEqual(tile.matchedSummit(lat: catalog.lat, lon: catalog.lon,
                                           catalogElevationMeters: nil)?.elev, 900)
+    }
+
+    // MARK: The leftover gate — a match must beat staying at the catalog point
+
+    /// Two catalog records for one summit (Rainier/Columbia Crest), or two named
+    /// tops the 30 m grid can't resolve: one claims the apex and the other used
+    /// to take whatever maximum was left, however far and however flat —
+    /// Columbia Crest walked 691 m onto a 9 m-prominence nub. The runner-up's
+    /// own node is the honest anchor when the DEM says its height already
+    /// agrees. (Cathedral Rocks, from the measured corpus: tag 3026 m, node
+    /// reads 3027 m, only leftover an 8 m-prominence nub 250 m away.)
+    func testAClaimedApexLeavesThePeakAtItsNodeInsteadOfAWanderingLeftover() {
+        let mLat = 111_320.0, mLon = 111_320.0 * cos(46.8 * .pi / 180)
+        let leftover = DEMTile.LocalSummit(lat: 46.8, lon: -121.76 + 250 / mLon,
+                                           elev: 3123, prominence: 8)
+        let score = DEMTile.summitMatchScore(
+            leftover, catalogLat: 46.8, catalogLon: -121.76,
+            catalogElevationMeters: 3026,
+            metersPerDegLat: mLat, metersPerDegLon: mLon)
+        let stayPut = DEMTile.stayPutScore(
+            demElevationAtPoint: 3027, catalogLat: 46.8, catalogLon: -121.76,
+            catalogElevationMeters: 3026)
+        XCTAssertFalse(DEMTile.acceptsMatch(score: score, stayPut: stayPut))
+    }
+
+    /// The margin is NOT "the node wins ties": a node is a flank cell and a
+    /// bump is a top, so a real apex nearby is still worth walking to even when
+    /// the node's own height already agrees with the catalog. Refusing these
+    /// would undo the summit snap itself.
+    func testANearbyApexIsStillTakenWhenTheNodeAlreadyAgrees() {
+        let mLat = 111_320.0, mLon = 111_320.0 * cos(46.8 * .pi / 180)
+        let apex = DEMTile.LocalSummit(lat: 46.8, lon: -121.76 + 40 / mLon,
+                                       elev: 1005, prominence: 60)
+        let score = DEMTile.summitMatchScore(
+            apex, catalogLat: 46.8, catalogLon: -121.76,
+            catalogElevationMeters: 1000,
+            metersPerDegLat: mLat, metersPerDegLon: mLon)
+        let stayPut = DEMTile.stayPutScore(
+            demElevationAtPoint: 1000, catalogLat: 46.8, catalogLon: -121.76,
+            catalogElevationMeters: 1000)
+        XCTAssertTrue(DEMTile.acceptsMatch(score: score, stayPut: stayPut))
+    }
+
+    /// A badly placed node (the void-fill / K2 case: it reads 1100 m below the
+    /// surveyed height) makes staying put terrible, so the distant apex that
+    /// agrees is still taken — the gate must not strand a peak on a shoulder.
+    func testAVoidFilledApexIsStillReachedFromABadNode() {
+        let mLat = 111_320.0, mLon = 111_320.0 * cos(35.88 * .pi / 180)
+        let apex = DEMTile.LocalSummit(lat: 35.88, lon: 76.51 + 400 / mLon,
+                                       elev: 8500, prominence: 100)
+        let score = DEMTile.summitMatchScore(
+            apex, catalogLat: 35.88, catalogLon: 76.51,
+            catalogElevationMeters: 8611,
+            metersPerDegLat: mLat, metersPerDegLon: mLon)
+        let stayPut = DEMTile.stayPutScore(
+            demElevationAtPoint: 7500, catalogLat: 35.88, catalogLon: 76.51,
+            catalogElevationMeters: 8611)
+        XCTAssertTrue(DEMTile.acceptsMatch(score: score, stayPut: stayPut))
     }
 
     /// Flat ground has no local maximum to stand on — the caller falls back to

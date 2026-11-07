@@ -452,13 +452,33 @@ struct DEMTile {
     /// Rise that separates a real bump from grid ripple.
     static let summitMinProminence: Float = 8
 
+    /// Beyond this much overshoot the catalog height stops being evidence.
+    /// A 30 m grid SMOOTHS summits down, it never invents height, so a maximum
+    /// this far ABOVE the surveyed figure says the catalog number is wrong —
+    /// not that the bump belongs to a taller mountain. Catalog heights are
+    /// wrong far more often than the reach of this search: measured over 1792
+    /// unambiguous peaks (a dominant apex right at the catalog point), the DEM
+    /// apex overshoots by ≤14 m at p90 and ≤32 m at p95, but the tail runs to
+    /// hundreds of meters — Mount Hopper's OSM `ele` is 100 m low, Mount
+    /// Olympus East Peak's 43 m. With the old UNBOUNDED 2×/m penalty those
+    /// tails outweighed everything: East Peak's true apex 9 m away (2367 m,
+    /// 98 m of prominence) lost to a 19 m-prominence ripple 246 m off that
+    /// happened to read 2311, so both its label AND "Stand here" landed on a
+    /// nub between the East and Middle summits.
+    static let summitOvershootToleranceMeters: Double = 25
+
     /// How well a local maximum describes the RENDERED apex of a catalog peak.
     /// Elevation agreement dominates; overshoot (a cell higher than the
-    /// surveyed summit) is someone else's mountain, penalized 2×. The distance
-    /// term keeps a peak from wandering to a look-alike bump across the cirque;
-    /// the small prominence bonus breaks near-ties toward the massif apex over
-    /// a shoulder ripple. `catalogElevationMeters` nil = the catalog has no
-    /// height, so prefer the higher candidate.
+    /// surveyed summit) is someone else's mountain, penalized 2× — but only up
+    /// to `summitOvershootToleranceMeters`, past which the penalty holds flat
+    /// and the geometry decides (see that constant). Undershoot stays
+    /// unbounded: a DEM that reads LOW is the expected failure (smoothing,
+    /// void fill), and the least-undershooting candidate is the apex — that is
+    /// what reaches a void-filled summit displaced a few hundred meters. The
+    /// distance term keeps a peak from wandering to a look-alike bump across
+    /// the cirque; the small prominence bonus breaks near-ties toward the
+    /// massif apex over a shoulder ripple. `catalogElevationMeters` nil = the
+    /// catalog has no height, so prefer the higher candidate.
     ///
     /// This is the ONLY place the rule lives: the label pass scores with it to
     /// assign one apex per peak, and the eye scores with it to stand on the
@@ -472,11 +492,45 @@ struct DEMTile {
         var score = -0.15 * dist + 0.25 * Double(min(s.prominence, 100))
         if let target = catalogElevationMeters, target > 0 {
             let dh = Double(s.elev) - target
-            score -= dh > 0 ? 2 * dh : -dh
+            score -= dh > 0 ? 2 * min(dh, Self.summitOvershootToleranceMeters) : -dh
         } else {
             score += Double(s.elev) * 0.2       // unknown height: prefer higher
         }
         return score
+    }
+
+    /// How much worse than staying at the catalog point a match may score and
+    /// still be worth taking. Not zero: a real apex is worth walking to even
+    /// when the node already reads the right height, because a node is a flank
+    /// cell and the drawn top is a top — that is the whole reason for the snap.
+    /// Past this margin the "best unclaimed maximum" is a fiction. Calibrated
+    /// on 5502 catalog peaks in 12 DEM tiles: at 60 the refusals are the
+    /// wanderers (470 of 507 were matches beyond 300 m) and NOT ONE match with
+    /// a candidate inside 100 m was refused; the behaviour is flat from 40 to
+    /// 80, so it is not a knife edge.
+    static let summitMatchCredibilityMargin: Double = 60
+
+    /// Take the best available match, or anchor at the catalog point instead?
+    /// One place, so the label pass and its tests can't drift apart.
+    static func acceptsMatch(score: Double, stayPut: Double) -> Bool {
+        score >= stayPut - summitMatchCredibilityMargin
+    }
+
+    /// The "no snap" option, on the SAME scale as `summitMatchScore`: the
+    /// catalog point itself — zero distance, zero prominence (it is a flank
+    /// cell, not a top), and the DEM's surface height there to agree or
+    /// disagree with the catalog height. The label pass compares its best
+    /// leftover against this before accepting it, so a peak whose own top was
+    /// claimed by a neighbour stays put instead of inventing a summit.
+    static func stayPutScore(demElevationAtPoint elev: Float,
+                             catalogLat: Double, catalogLon: Double,
+                             catalogElevationMeters: Double?) -> Double {
+        // Distance is 0, so the meters-per-degree scales cannot matter.
+        summitMatchScore(
+            LocalSummit(lat: catalogLat, lon: catalogLon, elev: elev, prominence: 0),
+            catalogLat: catalogLat, catalogLon: catalogLon,
+            catalogElevationMeters: catalogElevationMeters,
+            metersPerDegLat: 1, metersPerDegLon: 1)
     }
 
     /// The rendered apex of ONE catalog peak — the best-scoring local maximum

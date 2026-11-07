@@ -412,6 +412,13 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     /// never rendered.
     private var lastGoodViewpoint: (viewpoint: Viewpoint, manual: Bool)?
     private var failedMoveRevertTask: Task<Void, Never>?
+    /// The viewpoint whose scene the renderer has actually delivered (raw
+    /// `.ready`, ahead of the display finish sweep). Gates the lastGood
+    /// capture in `teleport`: a move's bake phase reports `.rendering` with
+    /// `viewpoint` already retargeted, and capturing that never-rendered
+    /// target made ✕ revert INTO the abandoned move — the card never lifted
+    /// and repeated taps ping-ponged full reloads until a jetsam kill.
+    private var arrivedViewpoint: Viewpoint?
 
     /// The viewpoint whose scene is actually rendered on screen (set on every
     /// `.ready`). UI that depicts "where you ARE" (the mini-map) binds to this;
@@ -457,8 +464,11 @@ final class PanoramaViewModel: NSObject, ObservableObject {
         }()
         // Leaving a rendered scene: remember it (with the mode flags as they
         // are NOW, before this move mutates them) so a failed load can return.
-        // Chained moves mid-load keep the original good scene.
-        if healthy, let current = self.viewpoint, current != viewpoint {
+        // Chained moves mid-load keep the original good scene. `arrivedViewpoint`
+        // (not just a healthy status) is required: `.rendering` is also a move's
+        // bake phase, where `viewpoint` is a target that never reached the screen.
+        if healthy, let current = self.viewpoint, current != viewpoint,
+           current == arrivedViewpoint {
             lastGoodViewpoint = (current, isManualViewpoint)
         }
         if manual { isManualViewpoint = true; location.stopUpdatingLocation() }
@@ -577,6 +587,10 @@ final class PanoramaViewModel: NSObject, ObservableObject {
             // `hasRenderedOnce` here lifted the initial loading screen onto a
             // still-`.rendering` status, flashing the corner "Switching
             // location" card for the sweep's last half-second on launch.
+            // The scene itself IS on screen already — record the arrival now
+            // so a teleport during the sweep still remembers this scene as
+            // the one to come back to.
+            arrivedViewpoint = viewpoint
             finishing = true
             targetProgress = 1.0
             inRenderingPhase = true
@@ -614,6 +628,7 @@ final class PanoramaViewModel: NSObject, ObservableObject {
     /// initial loading screen can't lift onto a still-loading footer.
     private func sceneArrived() {
         hasRenderedOnce = true
+        arrivedViewpoint = viewpoint
         // The mini-map tracks this, not `viewpoint`: a teleport retargets
         // `viewpoint` the moment the load starts, and the map pin jumping
         // while "Switching location" was still up read as already-arrived.
