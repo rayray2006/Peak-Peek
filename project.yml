@@ -43,8 +43,13 @@ targets:
           - SpaceGrotesk-Bold.ttf
           - IBMPlexMono-Regular.ttf
           - IBMPlexMono-Medium.ttf
+        # All four: the unfolded iPhone Duo has no natural "top" with the hinge
+        # horizontal, and without PortraitUpsideDown the interface stays put
+        # while the body flips, so the IMU-driven horizon renders inverted.
+        # (Classic Face ID iPhones never rotate to upside-down anyway.)
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
     settings:
@@ -55,9 +60,9 @@ targets:
         # (DEM caches, saved lists, viewpoint reset) — a one-time cost; simulator
         # tooling that launches by bundle id must use this value now.
         PRODUCT_BUNDLE_IDENTIFIER: com.weemotes.peekpeak
-        # iPhone-only (1). Universal (the default "1,2") makes App Store validation
-        # demand all four orientations for iPad multitasking, including
-        # PortraitUpsideDown — this AR/camera app ships portrait + landscape only.
+        # iPhone-only (1). Universal (the default "1,2") would make App Store
+        # validation demand iPad multitasking support as well; the app now
+        # declares all four orientations anyway (for the unfolded Duo, above).
         TARGETED_DEVICE_FAMILY: 1
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor

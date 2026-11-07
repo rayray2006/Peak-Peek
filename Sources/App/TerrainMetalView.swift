@@ -67,6 +67,10 @@ struct TerrainMetalView: UIViewRepresentable {
     var mode: TerrainViewMode = .threeD
     /// Manual alignment: look around by dragging instead of moving the phone.
     var manualAlignment: Bool = false
+    /// The closed phone is upside down with the interface left in portrait
+    /// (`DisplayChrome.isBodyFlipped`): the window-following compass tape
+    /// turns 180° with the rest of the chrome.
+    var bodyFlipped: Bool = false
     /// Peak/lake label density (Labels menu item: All / Sparse / Saved / None).
     var labelDensity: LabelDensity = .all
     /// Saved-list membership for the Saved density (green/orange label tints).
@@ -204,6 +208,7 @@ struct TerrainMetalView: UIViewRepresentable {
         context.coordinator.setDisplayDate(displayDate)
         context.coordinator.setDisplayTimeZone(displayTimeZone)
         context.coordinator.setManualAlignment(manualAlignment)
+        uiView.bodyFlipped = bodyFlipped
         context.coordinator.setMode(mode)
         context.coordinator.setARRecenterToken(arRecenterToken)
         context.coordinator.onEmptyTap = onEmptyTap
@@ -262,6 +267,165 @@ struct TerrainMetalView: UIViewRepresentable {
 
         required init?(coder: NSCoder) { fatalError("init(coder:) not implemented") }
 
+        /// The window sits on a foldable's unfolded inner panel: a phone-idiom
+        /// screen whose SHORT side is still tablet-wide (Duo inner 669×951 vs.
+        /// outer 466×678; an iPad in compatibility mode stays phone-sized).
+        private var isInnerFoldDisplay: Bool { window?.isInnerFoldDisplay ?? false }
+
+        /// See `TerrainMetalView.bodyFlipped`.
+        var bodyFlipped = false {
+            didSet { if bodyFlipped != oldValue { setNeedsLayout() } }
+        }
+
+        /// Extra quarter turns for the inner panel (see layoutSubviews). Debug
+        /// `-innerTurns <0-3>` overrides it so the sign can be checked on a
+        /// device without a rebuild.
+        private static let innerDisplayTurns: Int = {
+            let args = ProcessInfo.processInfo.arguments
+            if let i = args.firstIndex(of: "-innerTurns"), i + 1 < args.count,
+               let n = Int(args[i + 1]), (0...3).contains(n) { return n }
+            // Verified by eye on a Duo (2026-11-06): +1 rendered the open screen
+            // upside down in every posture, +3 levels the horizon.
+            return 3
+        }()
+
+        /// What the counter-rotation was last laid out for.
+        private var appliedRotation: (orientation: UIInterfaceOrientation, inner: Bool, size: CGSize)?
+
+        /// Same-size rotations — landscapeLeft ↔ landscapeRight, portrait ↔
+        /// upside-down, both everyday turns on the open Duo — change the
+        /// interface orientation without changing this view's bounds, so no
+        /// layout pass runs and the render stack stays 180° stale until the
+        /// next size-changing turn ("randomly upside down"). The render loop
+        /// polls this each frame and forces the layout when it drifts.
+        /// Drives `syncCounterRotationIfNeeded` every display frame, independent
+        /// of the Metal view's cadence (on-demand without a gyro).
+        private var orientationLink: CADisplayLink?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            orientationLink?.invalidate()
+            orientationLink = nil
+            stopDeviceOrientationWatch()
+            guard window != nil else { return }
+            let link = CADisplayLink(target: self, selector: #selector(orientationTick))
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+            link.add(to: .main, forMode: .common)
+            orientationLink = link
+            startDeviceOrientationWatch()
+        }
+
+        deinit {
+            orientationLink?.invalidate()
+            NotificationCenter.default.removeObserver(self)
+        }
+
+        @objc private func orientationTick() { syncCounterRotationIfNeeded() }
+
+        func syncCounterRotationIfNeeded() {
+            guard let scene = window?.windowScene, let applied = appliedRotation else { return }
+            if applied.orientation == scene.interfaceOrientation, applied.inner == isInnerFoldDisplay { return }
+            setNeedsLayout()
+        }
+
+        // MARK: Same-size flip cover
+        //
+        // A same-size flip (landscapeLeft ↔ landscapeRight, portrait ↔
+        // upside-down — everyday turns on the open Duo) is animated by the
+        // SYSTEM, which spins the app's live output as one bitmap: there is no
+        // viewWillTransition to disable it in, no in-process animation to
+        // strip, and by the time this view lays out for the new orientation
+        // the spin is already under way — so the world swung through 180°.
+        // Cover it instead: the body's half turn is known from the device
+        // orientation BEFORE the interface follows, so a black view goes over
+        // the whole window right then, stays through the layout and the
+        // system's turn, and dissolves to reveal everything at its new place.
+        // If no interface flip follows (orientation unsupported), it times out.
+
+        /// Bumped per arm so a stale fade-out can't land on a newer cover.
+        private var flipCoverToken = 0
+        private var flipCover: UIView?
+        private var lastDeviceOrientation: UIDeviceOrientation?
+
+        private func startDeviceOrientationWatch() {
+            UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(deviceOrientationChanged),
+                name: UIDevice.orientationDidChangeNotification, object: nil)
+            let o = UIDevice.current.orientation
+            lastDeviceOrientation = (o.isPortrait || o.isLandscape) ? o : nil
+        }
+
+        private func stopDeviceOrientationWatch() {
+            NotificationCenter.default.removeObserver(self, name: UIDevice.orientationDidChangeNotification, object: nil)
+            UIDevice.current.endGeneratingDeviceOrientationNotifications()
+        }
+
+        @objc private func deviceOrientationChanged() {
+            let o = UIDevice.current.orientation
+            guard o.isPortrait || o.isLandscape else { return }   // face up/down: keep the last real one
+            let prev = lastDeviceOrientation
+            lastDeviceOrientation = o
+            guard let prev, Self.isHalfTurn(prev, o) else { return }
+            // A portrait flip of the CLOSED phone never rotates the interface
+            // (compact windows don't go upside-down), so there is no system
+            // spin to hide: the chrome turns itself (DisplayChrome.isBodyFlipped)
+            // over the live, IMU-upright terrain.
+            if o.isPortrait, !isInnerFoldDisplay { return }
+            #if DEBUG
+            NSLog("PPGEO half turn %d → %d: arming flip cover", prev.rawValue, o.rawValue)
+            #endif
+            showFlipCover(for: 1.0)
+        }
+
+        private static func isHalfTurn(_ a: UIDeviceOrientation, _ b: UIDeviceOrientation) -> Bool {
+            switch (a, b) {
+            case (.portrait, .portraitUpsideDown), (.portraitUpsideDown, .portrait),
+                 (.landscapeLeft, .landscapeRight), (.landscapeRight, .landscapeLeft):
+                return true
+            default:
+                return false
+            }
+        }
+
+        /// Puts (or keeps) the black cover over the window and schedules its
+        /// dissolve `seconds` from now; re-arming moves the dissolve later.
+        private func showFlipCover(for seconds: Double) {
+            guard let window else { return }
+            flipCoverToken &+= 1
+            let token = flipCoverToken
+            let cover = flipCover ?? {
+                let v = UIView()
+                v.backgroundColor = .black
+                v.isUserInteractionEnabled = false
+                v.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+                return v
+            }()
+            cover.layer.removeAllAnimations()
+            cover.alpha = 1
+            cover.frame = window.bounds
+            if cover.superview !== window { window.addSubview(cover) } else { window.bringSubviewToFront(cover) }
+            flipCover = cover
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+                guard let self, token == self.flipCoverToken else { return }
+                UIView.animate(withDuration: 0.3, animations: { cover.alpha = 0 }) { _ in
+                    if token == self.flipCoverToken {
+                        cover.removeFromSuperview()
+                        self.flipCover = nil
+                    }
+                }
+            }
+        }
+
+        /// The interface flip has laid out: hold the cover for the system's
+        /// turn, then dissolve.
+        private func coverSameSizeFlip() {
+            #if DEBUG
+            NSLog("PPGEO same-size flip laid out (cover \(flipCover == nil ? "NOT " : "")up)")
+            #endif
+            showFlipCover(for: 0.5)
+        }
+
         /// Counter-rotation that pins the RENDER SUBVIEWS (metal, sky, labels,
         /// camera preview) to the device-portrait frame the attitude mapping was
         /// verified in, while the window rotates natively around them. Done HERE,
@@ -273,14 +437,33 @@ struct TerrainMetalView: UIViewRepresentable {
         override func layoutSubviews() {
             super.layoutSubviews()
             let orientation = window?.windowScene?.interfaceOrientation ?? .portrait
-            let counterAngle: CGFloat
+            // Quarter turns of the interface away from THIS DISPLAY's native
+            // portrait (landscapeLeft = +90°, landscapeRight = −90°).
+            var turns: Int
             switch orientation {
-            case .landscapeLeft: counterAngle = .pi / 2
-            case .landscapeRight: counterAngle = -.pi / 2
-            case .portraitUpsideDown: counterAngle = .pi
-            default: counterAngle = 0
+            case .landscapeLeft: turns = 1
+            case .portraitUpsideDown: turns = 2
+            case .landscapeRight: turns = 3
+            default: turns = 0
             }
-            let landscape = orientation.isLandscape
+            // A foldable's inner panel is mounted a quarter turn off the device
+            // BODY the IMU reports in (iPhone Duo: the inner screen's native
+            // portrait is 669×951 with the hinge horizontal, while body-portrait —
+            // the closed phone upright — shows it 951 wide, reported as
+            // landscapeRight). Fold that turn in so the render stack still lands
+            // in the body frame; without it the horizon stood vertical in every
+            // open orientation, and with the wrong sign it stood upside down.
+            let inner = isInnerFoldDisplay
+            if inner { turns = (turns + Self.innerDisplayTurns) % 4 }
+            // Same orientation family, same bounds, different orientation: a
+            // system-animated flip (quarter turns arrive with new bounds).
+            if let applied = appliedRotation, applied.orientation != orientation,
+               applied.inner == inner, applied.size == bounds.size {
+                coverSameSizeFlip()
+            }
+            appliedRotation = (orientation, inner, bounds.size)
+            let counterAngle: CGFloat = [0, .pi / 2, .pi, -.pi / 2][turns]
+            let landscape = turns % 2 == 1
             // Device-portrait-shaped bounds for the render stack.
             let devBounds = landscape
                 ? CGRect(x: 0, y: 0, width: bounds.height, height: bounds.width)
@@ -306,8 +489,15 @@ struct TerrainMetalView: UIViewRepresentable {
                                            width: devBounds.height, height: devBounds.width)
             arDisplayLayer.position = mid
             arDisplayLayer.setAffineTransform(CGAffineTransform(rotationAngle: counterAngle + .pi / 2))
+            // Window-following chrome — except when the closed phone is held
+            // upside down with the interface still in portrait: then it turns
+            // 180° with the SwiftUI chrome, keeping its top edge (where the
+            // tape sits) off the home indicator that now lies up there.
             compassZoom.transform = .identity
-            compassZoom.frame = bounds                 // window-following chrome
+            compassZoom.frame = bodyFlipped
+                ? CGRect(x: 0, y: 0, width: bounds.width, height: bounds.height - safeAreaInsets.bottom)
+                : bounds
+            if bodyFlipped { compassZoom.transform = CGAffineTransform(rotationAngle: .pi) }
             if let conn = previewLayer.connection, conn.isVideoRotationAngleSupported(90) {
                 conn.videoRotationAngle = 90    // lock preview to portrait
             }
@@ -4185,4 +4375,12 @@ struct TerrainMetalView: UIViewRepresentable {
         /// the per-frame draw path.
         private static let baseTanHalf60 = tanf(60.0 * .pi / 360)
     }
+}
+
+/// The chrome's hide-then-dissolve around an interface rotation snap. Posted
+/// by RootScreen's RotationAnimationDisabler for size-changing turns and by
+/// TerrainContainerView for the same-size flips UIKit animates on its own.
+enum TerrainRotationSnap {
+    static let willRotate = Notification.Name("pp.rotation.will")
+    static let didRotate = Notification.Name("pp.rotation.did")
 }

@@ -82,6 +82,15 @@ struct RootScreen: View {
     /// Landscape (short vertical axis): caps the action menu height (see actionRail).
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     private var isChromeLandscape: Bool { verticalSizeClass == .compact }
+    /// Wide chrome: phone landscape, or the unfolded Duo's inner screen in
+    /// either orientation (regular width) — the bottom cards cap their width
+    /// instead of spanning a 950 pt screen.
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    private var isWideChrome: Bool { isChromeLandscape || horizontalSizeClass == .regular }
+    /// What the system reserves along the display's edges (iPhone Duo outer
+    /// screen: the vertical status bar strip on the trailing edge, camera
+    /// inside it). The chrome spans that strip and the ☰ lives in it.
+    @State private var displayChrome = DisplayChrome()
     /// The footer + mini-map hide while an overlay panel occupies their region.
     private var hideBottomChrome: Bool {
         activeSheet != nil && activeSheet != .map
@@ -98,6 +107,7 @@ struct RootScreen: View {
             displayTimeZone: model.displayTimeZone,
             mode: mode,
             manualAlignment: manualAlignment,
+            bodyFlipped: displayChrome.isBodyFlipped,
             labelDensity: labelDensity,
             climbedPeakIDs: peakLists.climbedIDs,
             bookmarkedPeakIDs: peakLists.bookmarkedIDs,
@@ -172,6 +182,7 @@ struct RootScreen: View {
                 .ignoresSafeArea()
                 .background(.black)
                 .background(RotationAnimationDisabler())
+                .background(DisplayChromeProbe(chrome: $displayChrome))
 
             if shouldShowInitialLoading {
                 InitialLoadingScreen(
@@ -199,6 +210,26 @@ struct RootScreen: View {
                     saveSpotPanel
                     infoPanel
                 }
+                // The Duo's vertical status-bar strip is a safe-area inset the
+                // system would otherwise keep the whole HUD out of; with the
+                // status bar hidden it's dead space, so the chrome uses the
+                // full width (footer, mini-map, cards, panels) and the action
+                // rail moves into the strip.
+                // Body flipped on the closed Duo (interface left in portrait,
+                // see DisplayChrome.isBodyFlipped): lay the chrome out for the
+                // mirrored geometry the probe published — the system insets
+                // are all on the wrong edges for a turned-around layout, so
+                // they're ignored and the mirrored vertical ones re-applied —
+                // then turn it 180°. The terrain underneath follows the IMU
+                // and never moves.
+                .padding(.top, displayChrome.isBodyFlipped ? displayChrome.safeTop : 0)
+                .padding(.bottom, displayChrome.isBodyFlipped ? displayChrome.safeBottom : 0)
+                // INSIDE ignoresSafeArea: the turn pivots on the centre of the
+                // frame the effect sees, and outside it that is the parent's
+                // safe-area frame (bar strip excluded), which left the turned
+                // chrome a bar-width off to one side.
+                .rotationEffect(.degrees(displayChrome.isBodyFlipped ? 180 : 0))
+                .ignoresSafeArea(.container, edges: displayChrome.isBodyFlipped ? .all : displayChrome.ignoredEdges)
                 .opacity(chromeVisible ? 1 : 0)
             }
         }
@@ -311,6 +342,35 @@ struct RootScreen: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                     (UIApplication.shared.connectedScenes.first as? UIWindowScene)?
                         .requestGeometryUpdate(.iOS(interfaceOrientations: .landscapeRight))
+                }
+            }
+            // Debug: force portrait (the Duo simulator boots its outer screen in
+            // landscape, and the old Simulator's rotate menu only turns the window).
+            if args.contains("-portrait") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                    (UIApplication.shared.connectedScenes.first as? UIWindowScene)?
+                        .requestGeometryUpdate(.iOS(interfaceOrientations: .portrait)) { err in
+                            NSLog("PPGEO portrait request failed: \(err)")
+                        }
+                }
+            }
+            // Debug: -flip180 <s> turns the interface 180° after s seconds (the
+            // same-size rotation UIKit animates on its own — see
+            // TerrainContainerView.syncCounterRotationIfNeeded).
+            if let i = args.firstIndex(of: "-flip180"), i + 1 < args.count,
+               let delay = Double(args[i + 1]) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else { return }
+                    let flipped: UIInterfaceOrientationMask
+                    switch scene.interfaceOrientation {
+                    case .landscapeLeft: flipped = .landscapeRight
+                    case .landscapeRight: flipped = .landscapeLeft
+                    case .portraitUpsideDown: flipped = .portrait
+                    default: flipped = .portraitUpsideDown
+                    }
+                    scene.requestGeometryUpdate(.iOS(interfaceOrientations: flipped)) { err in
+                        NSLog("PPGEO flip180 request failed: \(err)")
+                    }
                 }
             }
             if args.contains("-night") {   // simulate 11 PM so stars/Milky Way + moon show
@@ -986,6 +1046,9 @@ struct RootScreen: View {
         VStack {
             HStack(alignment: .top) {
                 topLeftControls
+                    // Clear of a leading vertical-bar strip (Duo outer screen
+                    // in one landscape) and the camera cutout at its top.
+                    .padding(.leading, displayChrome.topLeftInset)
                 Spacer()
             }
             Spacer()
@@ -1027,7 +1090,7 @@ struct RootScreen: View {
                     // fixedSize: the card's adaptive rows (ViewThatFits) need
                     // a real width proposal — under fixedSize's ideal-size
                     // query they collapsed to their narrowest variant.)
-                    .frame(maxWidth: isChromeLandscape ? 400 : .infinity, alignment: .leading)
+                    .frame(maxWidth: isWideChrome ? 400 : .infinity, alignment: .leading)
                     // Arrive from the bottom edge (mirroring the search panel's
                     // exit) so pick-from-search reads as one handoff motion.
                     .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -1049,7 +1112,7 @@ struct RootScreen: View {
                         },
                         onDismiss: { showLocationCard = false }
                     )
-                    .frame(maxWidth: isChromeLandscape ? 400 : .infinity, alignment: .leading)
+                    .frame(maxWidth: isWideChrome ? 400 : .infinity, alignment: .leading)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                     Spacer(minLength: 0)
                 } else if !hideBottomChrome {
@@ -1058,19 +1121,23 @@ struct RootScreen: View {
                     // terrain — not chrome — behind them.
                     footer
                     Spacer()
-                    // In landscape the OPEN action menu reaches down into the
+                    // In landscape (and on short screens like the Duo's outer
+                    // display) the OPEN action menu reaches down into the
                     // mini-map's corner — yield it while the menu is up rather
                     // than stacking the two.
                     // `renderedViewpoint`, not `viewpoint`: the map pin moves
                     // when the scene actually swaps, not the moment a move
                     // starts loading.
                     if let viewpoint = model.renderedViewpoint ?? model.viewpoint,
-                       !(showActionMenu && isChromeLandscape) {
+                       !(showActionMenu && menuIsCapped) {
                         MiniMapView(viewpoint: viewpoint,
                                     eyeCoordinate: model.standingEyeCoordinate,
                                     isManualViewpoint: model.isManualViewpoint) {
                             activeSheet = .map
                         }
+                        // Off the camera cutout at the bottom of a trailing
+                        // bar strip (closed Duo, curve down).
+                        .padding(.trailing, displayChrome.bottomTrailingInset)
                         .transition(.opacity)
                     }
                 }
@@ -1091,8 +1158,16 @@ struct RootScreen: View {
         // compass TRACK line (safe-area top + 12 + 27 in CompassZoomOverlayView
         // vs. the button's 15 pt half-height) — at 16 it floated awkwardly
         // between the heading text and the line.
+        // On the Duo's outer screen the rail sits INSIDE the vertical bar strip
+        // (☰ centred in it, below the camera cutout); the open menu hangs off
+        // the button leftwards, over the terrain, exactly as elsewhere.
         .overlay(alignment: .topTrailing) {
-            actionRail.padding(.horizontal, 20).padding(.bottom, 16).padding(.top, 24)
+            actionRail
+                .padding(.leading, 20)
+                .padding(.trailing, displayChrome.railInBar
+                         ? displayChrome.railInset(glyph: 30) : 20)
+                .padding(.bottom, 16)
+                .padding(.top, displayChrome.railTopPadding)
         }
         // Pin the HUD to the TRUE bottom. Without this the bottom row avoids the
         // keyboard, so picking a search result made the info card appear
@@ -1168,10 +1243,16 @@ struct RootScreen: View {
     /// animations for the transition makes the whole rotation a single-frame snap —
     /// the terrain pixels never move; only the chrome jumps to its new layout.
     private struct RotationAnimationDisabler: UIViewControllerRepresentable {
-        static let willRotate = Notification.Name("pp.rotation.will")
-        static let didRotate = Notification.Name("pp.rotation.did")
+        static let willRotate = TerrainRotationSnap.willRotate
+        static let didRotate = TerrainRotationSnap.didRotate
 
         final class VC: UIViewController {
+            /// Snap bookkeeping: each transition gets a token; whichever of the
+            /// coordinator's completion or the fallback timer lands first ends
+            /// it, and the other is a no-op.
+            private var snapToken = 0
+            private var finishedSnap = 0
+
             override func viewWillTransition(to size: CGSize,
                                              with coordinator: UIViewControllerTransitionCoordinator) {
                 super.viewWillTransition(to: size, with: coordinator)
@@ -1180,12 +1261,27 @@ struct RootScreen: View {
                 // the single-frame snap and dissolves back in at its new
                 // positions (RootScreen listens) — a hard teleporting cut was
                 // the jarring part.
+                snapToken &+= 1
+                let token = snapToken
                 NotificationCenter.default.post(name: RotationAnimationDisabler.willRotate, object: nil)
                 UIView.setAnimationsEnabled(false)
-                coordinator.animate(alongsideTransition: nil) { _ in
-                    UIView.setAnimationsEnabled(true)
-                    NotificationCenter.default.post(name: RotationAnimationDisabler.didRotate, object: nil)
+                coordinator.animate(alongsideTransition: nil) { [weak self] _ in
+                    self?.finishSnap(token)
                 }
+                // The iPhone Duo's outer screen fired this at launch with a
+                // coordinator whose completion never came (the HUD stayed
+                // hidden until the next rotation) — a short fallback restores
+                // the chrome either way.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+                    self?.finishSnap(token)
+                }
+            }
+
+            private func finishSnap(_ token: Int) {
+                guard token > finishedSnap else { return }
+                finishedSnap = token
+                UIView.setAnimationsEnabled(true)
+                NotificationCenter.default.post(name: RotationAnimationDisabler.didRotate, object: nil)
             }
         }
         func makeUIViewController(context: Context) -> VC { VC() }
@@ -1353,13 +1449,28 @@ struct RootScreen: View {
                     }
                 }
                 }
-                .frame(maxHeight: isChromeLandscape ? 290 : .infinity)
-                .fixedSize(horizontal: false, vertical: !isChromeLandscape)
+                .frame(maxHeight: menuMaxHeight)
+                .fixedSize(horizontal: false, vertical: !menuIsCapped)
                 // Grow out of the ☰ button (top-trailing corner, right above
                 // this menu) rather than sliding in from the screen's top edge.
                 .transition(.scale(scale: 0.1, anchor: .topTrailing).combined(with: .opacity))
             }
         }
+    }
+
+    /// The open menu is height-capped (scrolls, mini-map yields) wherever the
+    /// short axis can't hold all twelve rows: phone landscape, and the Duo's
+    /// screens (678 / 466 / 669 pt tall).
+    private var menuIsCapped: Bool { isChromeLandscape || displayChrome.isShort }
+
+    /// What's left for the menu below the ☰: the window minus the rail's top
+    /// offset, the button, and the bottom margin + home indicator.
+    private var menuMaxHeight: CGFloat {
+        guard menuIsCapped else { return .infinity }
+        let h = displayChrome.windowSize.height
+        guard h > 0 else { return 290 }
+        let rail = displayChrome.safeTop + displayChrome.railTopPadding + 30 + 6
+        return max(200, h - rail - 16 - displayChrome.safeBottom - 16)
     }
 
     /// The template's short trailing-aligned hairline between menu rows.
@@ -1866,7 +1977,10 @@ private struct InitialLoadingScreen: View {
             if !isCompact {
                 VStack {
                     Spacer()
-                    PPMicroLabel(text: "v1.0", opacity: 0.3)
+                    // The bundle's marketing version (MARKETING_VERSION in
+                    // project.yml), so the label can't drift from the build.
+                    PPMicroLabel(text: "v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?")",
+                                 opacity: 0.3)
                         .padding(.bottom, 34)
                 }
             }
